@@ -1,0 +1,114 @@
+plugins {
+    id 'java'
+    id 'net.fabricmc.fabric-loom' version "${loom_version}"
+}
+
+// ----------------------------------------------------------
+// Solidus - Advanced Server-Side Economy & Commerce Engine
+// Minecraft 26.1.x | Fabric Loader 0.19.2+ | Java 25
+// ----------------------------------------------------------
+//
+// IMPORTANT: MINECRAFT 26.1.x UNOBFUSCATED BUILD
+// ----------------------------------------------------------
+// Starting with Minecraft 26.1, Mojang no longer obfuscates
+// the game JAR. This means:
+//
+// - NO mappings dependency is needed (Yarn is retired)
+// - The Loom plugin ID changed from 'fabric-loom' (remapping)
+//   to 'net.fabricmc.fabric-loom' (no remapping)
+// - Use standard Gradle dependency configurations:
+//     modImplementation -> implementation
+//     modCompileOnly    -> compileOnly
+//     remapJar          -> jar
+// - Minecraft source code uses Mojang's official names directly
+// - Mixin method/field references use the real (unobfuscated) names
+//
+// Build pipeline (simplified from pre-26.1):
+//   Development: Mojang names -> compile -> JAR (no remapping needed)
+//   Production:  JAR as-is, runs directly on unobfuscated Minecraft
+// ----------------------------------------------------------
+
+import org.gradle.jvm.toolchain.JavaLanguageVersion
+
+java {
+    toolchain {
+        languageVersion = JavaLanguageVersion.of(25)
+        // Auto-download the correct JDK if the user doesn't have it locally.
+        // Requires Gradle to be configured with a toolchain repository; Gradle
+        // 9+ uses Foojay by default. This makes the build self-contained.
+        vendor = org.gradle.jvm.toolchain.JvmVendorSpec.ADOPTIUM
+    }
+    sourceCompatibility = JavaVersion.VERSION_25
+    targetCompatibility = JavaVersion.VERSION_25
+}
+
+version = project.mod_version
+group = project.maven_group
+
+repositories {
+    mavenCentral()
+    // Loom adds the essential Maven repositories to download
+    // Minecraft and libraries from automatically.
+}
+
+dependencies {
+    // Minecraft (unobfuscated since 26.1 — no mappings needed)
+    minecraft "com.mojang:minecraft:${project.minecraft_version}"
+
+    // Fabric Loader & API — use standard 'implementation' (not modImplementation)
+    // because Loom no longer remaps in the unobfuscated environment
+    implementation "net.fabricmc:fabric-loader:${project.loader_version}"
+    implementation "net.fabricmc.fabric-api:fabric-api:${project.fabric_api_version}"
+
+    // Standard dependencies
+    implementation "com.google.code.gson:gson:2.12.1"
+    implementation "org.xerial:sqlite-jdbc:3.47.2.0"
+
+    // Include sqlite-jdbc in the final JAR for server-side database access
+    include "org.xerial:sqlite-jdbc:3.47.2.0"
+
+    // ── Testing ──────────────────────────────────────────
+    testImplementation "org.junit.jupiter:junit-jupiter:5.10.2"
+    testImplementation "org.mockito:mockito-core:5.11.0"
+    testImplementation "org.mockito:mockito-junit-jupiter:5.11.0"
+    testRuntimeOnly "org.junit.platform:junit-platform-launcher"
+    testRuntimeOnly "org.slf4j:slf4j-simple:2.0.12"
+}
+
+test {
+    useJUnitPlatform()
+    testLogging {
+        events "passed", "skipped", "failed"
+        showStandardStreams = false
+        exceptionFormat = "full"
+    }
+}
+
+tasks.withType(JavaCompile).configureEach {
+    options.encoding = "UTF-8"
+    options.release = 25
+}
+
+jar {
+    from("LICENSE") {
+        rename { "${it}_${project.archives_base_name}" }
+    }
+    manifest {
+        attributes([
+            "Implementation-Title": project.archives_base_name,
+            "Implementation-Version": project.version
+        ])
+    }
+}
+
+processResources {
+    inputs.property "version", project.version
+    inputs.property "minecraft_version", project.minecraft_version
+    inputs.property "loader_version", project.loader_version
+
+    filesMatching("fabric.mod.json") {
+        expand "version": project.version,
+               "minecraft_version": project.minecraft_version,
+               "loader_version": project.loader_version
+    }
+}

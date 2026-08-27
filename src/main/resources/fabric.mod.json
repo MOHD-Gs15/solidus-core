@@ -1,0 +1,34 @@
+{
+  "schemaVersion": 1,
+  "id": "solidus",
+  "version": "${version}",
+  "name": "Solidus",
+  "description": "Advanced Server-Side Economy & Commerce Engine for Minecraft",
+  "authors": ["MOHD_Gs"],
+  "contact": {
+    "homepage": "https://modrinth.com/user/MOHD_Gs",
+    "sources": "https://github.com/mohd-gs/solidus-core"
+  },
+  "license": "MIT",
+  "environment": "*",
+  "entrypoints": {
+    "server": [
+      "com.solidus.SolidusMod"
+    ]
+  },
+  "mixins": [
+    "solidus.mixins.json"
+  ],
+  "depends": {
+    "fabricloader": ">=0.19.2",
+    "minecraft": "~26.1.2",
+    "java": ">=25",
+    "fabric-api": "*"
+  },
+  "provides": [
+    "solidus-api"
+  ],
+  "suggests": {
+    "combatkeep": "*"
+  }
+}
