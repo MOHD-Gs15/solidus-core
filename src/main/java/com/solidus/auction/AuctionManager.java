@@ -20,6 +20,7 @@ import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.sql.Statement;
 import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
 import java.util.UUID;
@@ -482,6 +483,11 @@ public class AuctionManager {
                                         buyer.level().getServer()
                                     );
 
+                                    // Housekeeping: the sale is fully settled (money moved both
+                                    // ways, item delivered). Delete the SOLD row so the table
+                                    // cannot grow unbounded; TransactionLog retains the audit trail.
+                                    deleteSettledListing(entry.listingId());
+
                                     // Success notification
                                     buyer.sendSystemMessage(
                                         TextUtil.success("Purchased " + entry.quantity() + "x " + entry.materialName() + " for ")
@@ -594,11 +600,37 @@ public class AuctionManager {
     /**
      * Processes expired listings and returns items to their sellers.
      * Should be called periodically by a scheduled task.
+     *
+     * <p>SECURITY REWRITE (cross-flow TOCTOU dupe): the old flow marked rows
+     * status=2 asynchronously, then handed out items and deleted rows in LATER
+     * hops on other threads. In the window between mark and delete the row was
+     * visible to {@code /ah collect} (which matches every status=2 row of the
+     * seller), letting a seller withdraw the SAME expired item twice. Two
+     * overlapping sweep runs also reused stale SELECT snapshots, double-handing
+     * items even without /ah collect.</p>
+     *
+     * <p>Every claim is now ATOMIC inside one serialized executor step:
+     * online sellers get their row DELETED here (direct hand-out follows on the
+     * main thread); offline sellers get a condition-guarded flip to status=2,
+     * recoverable only via /ah collect - which itself claims-by-delete BEFORE
+     * paying out. Each statement carries "AND status = 0" so no row can ever be
+     * claimed twice, even by a stale overlapping sweep.</p>
      */
     public void processExpiredListings() {
+        MinecraftServer currentServer = this.server;
+        if (currentServer == null) return;
+
+        // Snapshot the online sellers ONCE on the calling thread. This method runs
+        // from END_SERVER_TICK (main server thread), so reading the player list here
+        // is safe; the DB-worker below must NOT touch live player lists.
+        Set<UUID> onlineSellers = new HashSet<>();
+        for (ServerPlayer online : currentServer.getPlayerList().getPlayers()) {
+            onlineSellers.add(online.getUUID());
+        }
+
         CompletableFuture.supplyAsync(() -> {
-            String sql = "SELECT * FROM auction_listings WHERE status = 0 AND expire_timestamp <= ?";
             List<AuctionEntry> expired = new ArrayList<>();
+            String sql = "SELECT * FROM auction_listings WHERE status = 0 AND expire_timestamp <= ?";
             try (PreparedStatement ps = persistentConnection.prepareStatement(sql)) {
                 ps.setLong(1, System.currentTimeMillis());
                 try (ResultSet rs = ps.executeQuery()) {
@@ -608,44 +640,53 @@ public class AuctionManager {
                 }
             } catch (SQLException e) {
                 SolidusMod.LOGGER.error("Failed to query expired listings", e);
+                return new ArrayList<AuctionEntry>();
             }
-            return expired;
-        }, asyncExecutor).thenAccept(expired -> {
-            MinecraftServer currentServer = this.server;
-            if (currentServer == null) return;
 
+            List<AuctionEntry> toReturnDirectly = new ArrayList<>();
             for (AuctionEntry entry : expired) {
-                // Mark expired listings as status=2 (EXPIRED) instead of leaving at status=0
-                // This prevents them from reappearing in active listings
-                markAsExpired(entry.listingId());
+                boolean sellerOnline = onlineSellers.contains(entry.sellerUuid());
 
-                // Return items to online sellers immediately
-                currentServer.execute(() -> {
-                    ServerPlayer seller = currentServer.getPlayerList().getPlayer(entry.sellerUuid());
-                    if (seller != null) {
-                        ItemStack returnedItem = deserializeItemStack(
-                            entry.itemNbt(), entry.materialName(), entry.quantity());
-                        if (!seller.getInventory().add(returnedItem)) {
-                            seller.drop(returnedItem, false);
-                        }
-                        seller.sendSystemMessage(
-                            TextUtil.warning("Your auction listing for " + entry.quantity() + "x " +
-                                entry.materialName() + " has expired and been returned to you."));
+                boolean claimed = sellerOnline
+                    ? claimExpiredRowForReturn(entry.listingId())
+                    : markExpiredRowCollectible(entry.listingId());
+                if (!claimed) continue; // another flow already settled this row
 
-                        // SECURITY FIX (dupe prevention): previously the row was left at
-                        // status=2 EXPIRED after the physical return, so the seller could
-                        // ALSO run /ah collect and receive a SECOND copy of the same item.
-                        // The listing is fully settled now - delete the row so collect can
-                        // never double-return it.
-                        deleteSettledListing(entry.listingId());
-                    }
-                    // Offline sellers: items are marked as expired (status=2)
-                    // and retrieved via /ah collect on next login
-                });
+                economyEngine.getTransactionLog().log(
+                    TransactionLog.Type.AUCTION_EXPIRED,
+                    entry.sellerUuid(), entry.sellerName(),
+                    null, null,
+                    0, entry.materialName(), entry.quantity(),
+                    sellerOnline
+                        ? "Listing expired - item returned to seller"
+                        : "Listing expired - waiting for /ah collect");
 
-                SolidusMod.LOGGER.info("Expired listing processed: seller={}, item={}",
-                    entry.sellerName(), entry.materialName());
+                SolidusMod.LOGGER.info("Expired listing settled: seller={}, item={}, directReturn={}",
+                    entry.sellerName(), entry.materialName(), sellerOnline);
+
+                if (sellerOnline) {
+                    toReturnDirectly.add(entry);
+                }
             }
+            return toReturnDirectly;
+        }, asyncExecutor).thenAccept(toReturn -> {
+            if (toReturn.isEmpty()) return;
+
+            currentServer.execute(() -> {
+                for (AuctionEntry entry : toReturn) {
+                    ServerPlayer seller = currentServer.getPlayerList().getPlayer(entry.sellerUuid());
+                    if (seller == null) continue; // disconnected in the meantime - harmless
+
+                    ItemStack returnedItem = deserializeItemStack(
+                        entry.itemNbt(), entry.materialName(), entry.quantity());
+                    if (!seller.getInventory().add(returnedItem)) {
+                        seller.drop(returnedItem, false);
+                    }
+                    seller.sendSystemMessage(
+                        TextUtil.warning("Your auction listing for " + entry.quantity() + "x " +
+                            entry.materialName() + " has expired and been returned to you."));
+                }
+            });
         });
     }
 
@@ -696,19 +737,36 @@ public class AuctionManager {
     }
 
     /**
-     * Marks a listing as expired (status=2) to distinguish from active (0) and purchased (1).
-     * Expired items can be retrieved by the seller via a future /ah collect command.
+     * Claims an ACTIVE expired row for DIRECT return to an online seller by
+     * deleting it inside the caller's serialized executor step.
+     * Returns true only when THIS call performed the claim (exactly-once
+     * semantics enforced by the "AND status = 0" guard).
      */
-    private void markAsExpired(UUID listingId) {
-        CompletableFuture.runAsync(() -> {
-            String sql = "UPDATE auction_listings SET status = 2 WHERE listing_id = ?";
-            try (PreparedStatement ps = persistentConnection.prepareStatement(sql)) {
-                ps.setString(1, listingId.toString());
-                ps.executeUpdate();
-            } catch (SQLException e) {
-                SolidusMod.LOGGER.error("Failed to mark listing as expired: {}", listingId, e);
-            }
-        }, asyncExecutor);
+    private boolean claimExpiredRowForReturn(UUID listingId) {
+        String sql = "DELETE FROM auction_listings WHERE listing_id = ? AND status = 0";
+        try (PreparedStatement ps = persistentConnection.prepareStatement(sql)) {
+            return ps.executeUpdate() > 0;
+        } catch (SQLException e) {
+            SolidusMod.LOGGER.error("Failed to claim expired listing {}: {}", listingId, e.getMessage());
+            return false;
+        }
+    }
+
+    /**
+     * Claims an ACTIVE expired row for an OFFLINE seller by flipping it to
+     * status=2 (collectible later via /ah collect) inside the caller's
+     * serialized executor step.
+     * Returns true only when THIS call performed the claim (exactly-once
+     * semantics enforced by the "AND status = 0" guard).
+     */
+    private boolean markExpiredRowCollectible(UUID listingId) {
+        String sql = "UPDATE auction_listings SET status = 2 WHERE listing_id = ? AND status = 0";
+        try (PreparedStatement ps = persistentConnection.prepareStatement(sql)) {
+            return ps.executeUpdate() > 0;
+        } catch (SQLException e) {
+            SolidusMod.LOGGER.error("Failed to mark listing {} collectible: {}", listingId, e.getMessage());
+            return false;
+        }
     }
 
     private AuctionEntry mapResultSetToEntry(ResultSet rs) throws SQLException {
@@ -905,11 +963,21 @@ public class AuctionManager {
                     return "NOT_OWNER";
                 }
 
-                // Mark as EXPIRED (status=2) to remove from active listings
-                String updateSql = "UPDATE auction_listings SET status = 2 WHERE listing_id = ?";
-                try (PreparedStatement ps = persistentConnection.prepareStatement(updateSql)) {
+                // SECURITY FIX (guaranteed dupe): cancellation used to flip the row
+                // to status=2 EXPIRED and leave it in the database while the item was
+                // handed back. The leftover row matched /ah collect's query (every
+                // status=2 row of this seller), so collecting afterwards paid out a
+                // SECOND copy of the exact same stack - trivially repeatable, no
+                // timing required. The row is now DELETED (claimed) inside this same
+                // serialized executor step; the hand-out follows on the server thread.
+                String deleteSql = "DELETE FROM auction_listings WHERE listing_id = ? AND status = 0";
+                try (PreparedStatement ps = persistentConnection.prepareStatement(deleteSql)) {
                     ps.setString(1, listingId.toString());
-                    ps.executeUpdate();
+                    if (ps.executeUpdate() == 0) {
+                        // A buy, expiry sweep or another cancel consumed the listing
+                        // between our SELECT and DELETE - nothing was changed.
+                        return "NOT_FOUND";
+                    }
                 }
 
                 return entry;
