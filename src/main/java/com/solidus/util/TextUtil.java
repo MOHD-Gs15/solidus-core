@@ -151,10 +151,11 @@ public final class TextUtil {
      * </ul>
      */
     public static String formatCurrency(double amount) {
+        String symbol = CurrencyUtil.getCurrencySymbol();
         if (amount == (long) amount) {
-            return String.format("%,d", (long) amount) + " S$";
+            return String.format("%,d", (long) amount) + " " + symbol;
         }
-        return String.format("%,.1f", amount) + " S$";
+        return String.format("%,.1f", amount) + " " + symbol;
     }
 
     /**

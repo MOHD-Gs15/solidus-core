@@ -15,8 +15,6 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
@@ -134,14 +132,6 @@ public class TransactionLog {
     private final Connection persistentConnection;
     private final ExecutorService asyncExecutor;
 
-    /**
-     * In-memory cache of pending notifications, keyed by player UUID.
-     * Uses CopyOnWriteArrayList for thread-safe concurrent access:
-     * queueNotification() may be called from executor completion callbacks
-     * while deliverPendingNotifications() runs on the server tick thread.
-     */
-    private final ConcurrentHashMap<UUID, CopyOnWriteArrayList<String>> notificationCache = new ConcurrentHashMap<>();
-
     public TransactionLog(Connection persistentConnection, ExecutorService asyncExecutor) {
         this.persistentConnection = persistentConnection;
         this.asyncExecutor = asyncExecutor;
@@ -160,8 +150,9 @@ public class TransactionLog {
             LOGGER.error("Failed to initialize transaction log tables!", e);
         }
 
-        // Load pending notifications into memory
-        loadPendingNotifications();
+        // FIX v2: pending notifications are now purely database-driven.
+        // The old in-memory mirror (loaded here at startup) could diverge from
+        // the database and caused deliveries to wipe freshly queued rows.
     }
 
     /**
@@ -257,11 +248,8 @@ public class TransactionLog {
             }
         }
 
-        // Player is offline - store notification
-        // CopyOnWriteArrayList ensures thread-safe add() even when multiple
-        // executor callbacks race for the same player UUID
-        notificationCache.computeIfAbsent(playerUuid, k -> new CopyOnWriteArrayList<>()).add(message);
-
+        // Player is offline - store the notification in the database; it will be
+        // delivered on next login. (Single source of truth: the database.)
         CompletableFuture.runAsync(() -> {
             String sql = "INSERT INTO pending_notifications (timestamp, player_uuid, message) VALUES (?, ?, ?)";
             try (PreparedStatement ps = persistentConnection.prepareStatement(sql)) {
@@ -279,102 +267,80 @@ public class TransactionLog {
      * Delivers all pending notifications for a player who just logged in.
      * Called from the player join event handler.
      *
+     * <p>FIX v2 (notification loss): previously delivery emptied an in-memory
+     * cache first and then deleted ALL database rows for the player, destroying
+     * any notification queued in between. Delivery now selects EXACT rows,
+     * sends them, and deletes only those rows by id.</p>
+     *
      * @param player The player who just connected
      */
     public void deliverPendingNotifications(net.minecraft.server.level.ServerPlayer player) {
         UUID playerUuid = player.getUUID();
 
-        // Step 1: Deliver in-memory cache immediately (synchronous)
-        List<String> cached = notificationCache.remove(playerUuid);
-
-        if (cached != null && !cached.isEmpty()) {
-            // Deliver cached notifications
-            for (String msg : cached) {
-                player.sendSystemMessage(com.solidus.util.TextUtil.styled(
-                    "[Solidus] " + msg, net.minecraft.ChatFormatting.AQUA));
-            }
-
-            // Delete ALL DB notifications for this player (async, fire-and-forget).
-            // Since the in-memory cache mirrors the DB for the current session,
-            // any notification in the cache is also in the DB. Deleting all DB
-            // rows for this player prevents duplicate delivery on next login.
-            deletePendingNotifications(playerUuid);
-
-            // No need to query DB - the cache contains everything for the
-            // current server session. DB is only queried if the cache was
-            // empty (edge case: server restarted and cache wasn't populated).
-            return;
-        }
-
-        // Step 2: Cache was empty - check DB for notifications that survived
-        // a server restart (i.e., persisted to DB before crash but not loaded
-        // into cache because loadPendingNotifications runs during initialize()).
         CompletableFuture.supplyAsync(() -> {
-            List<String> messages = new ArrayList<>();
-            String sql = "SELECT message FROM pending_notifications WHERE player_uuid = ? ORDER BY timestamp ASC";
+            List<PendingNotificationRow> rows = new ArrayList<>();
+            String sql = "SELECT id, message FROM pending_notifications WHERE player_uuid = ? ORDER BY timestamp ASC";
             try (PreparedStatement ps = persistentConnection.prepareStatement(sql)) {
                 ps.setString(1, playerUuid.toString());
                 try (ResultSet rs = ps.executeQuery()) {
                     while (rs.next()) {
-                        messages.add(rs.getString("message"));
+                        rows.add(new PendingNotificationRow(rs.getLong("id"), rs.getString("message")));
                     }
                 }
             } catch (SQLException e) {
-                LOGGER.error("Failed to load pending notifications for: {}", player.getName().getString(), e);
+                LOGGER.error("Failed to load pending notifications for: {}",
+                    player.getName().getString(), e);
             }
-            return messages;
-        }, asyncExecutor).thenAccept(messages -> {
-            if (!messages.isEmpty()) {
-                // Verify the player is still online before sending
-                net.minecraft.server.MinecraftServer server = player.level().getServer();
-                if (server == null) return;
+            return rows;
+        }, asyncExecutor).thenAccept(rows -> {
+            if (rows.isEmpty()) return;
 
-                server.execute(() -> {
-                    // Double-check player is still connected
-                    if (server.getPlayerList().getPlayer(playerUuid) == null) return;
+            net.minecraft.server.MinecraftServer server = player.level().getServer();
+            if (server == null) return;
 
-                    for (String msg : messages) {
-                        player.sendSystemMessage(com.solidus.util.TextUtil.styled(
-                            "[Solidus] " + msg, net.minecraft.ChatFormatting.AQUA));
-                    }
-                    // Delete delivered notifications from DB
-                    deletePendingNotifications(playerUuid);
-                });
-            }
+            server.execute(() -> {
+                // Double-check the player is still connected before sending
+                if (server.getPlayerList().getPlayer(playerUuid) == null) return;
+
+                for (PendingNotificationRow row : rows) {
+                    player.sendSystemMessage(com.solidus.util.TextUtil.styled(
+                        "[Solidus] " + row.message(), net.minecraft.ChatFormatting.AQUA));
+                }
+
+                // Delete ONLY the rows that were just delivered - newer
+                // notifications queued after our snapshot remain untouched.
+                deletePendingNotificationsByIds(playerUuid,
+                    rows.stream().mapToLong(PendingNotificationRow::id).toArray());
+            });
         });
     }
 
+    /** A pending notification row captured for targeted delivery/deletion. */
+    private record PendingNotificationRow(long id, String message) {}
+
     // -- Internal Helpers ----------------------------------
 
-    private void loadPendingNotifications() {
-        try (Statement stmt = persistentConnection.createStatement()) {
-            String sql = "SELECT player_uuid, message FROM pending_notifications ORDER BY timestamp ASC";
-            try (ResultSet rs = stmt.executeQuery(sql)) {
-                while (rs.next()) {
-                    UUID uuid = UUID.fromString(rs.getString("player_uuid"));
-                    String message = rs.getString("message");
-                    notificationCache.computeIfAbsent(uuid, k -> new CopyOnWriteArrayList<>()).add(message);
-                }
-            }
-        } catch (SQLException e) {
-            LOGGER.error("Failed to load pending notifications from database", e);
-        }
-
-        if (!notificationCache.isEmpty()) {
-            LOGGER.info("Loaded {} pending notifications for {} players.",
-                notificationCache.values().stream().mapToInt(List::size).sum(),
-                notificationCache.size());
-        }
-    }
-
-    private void deletePendingNotifications(UUID playerUuid) {
+    /**
+     * Deletes exactly the delivered notification rows (by id).
+     * Never touches notifications queued after the delivery snapshot.
+     */
+    private void deletePendingNotificationsByIds(UUID playerUuid, long[] ids) {
+        if (ids.length == 0) return;
         CompletableFuture.runAsync(() -> {
-            String sql = "DELETE FROM pending_notifications WHERE player_uuid = ?";
-            try (PreparedStatement ps = persistentConnection.prepareStatement(sql)) {
+            StringBuilder sql = new StringBuilder(
+                "DELETE FROM pending_notifications WHERE player_uuid = ? AND id IN (");
+            for (int i = 0; i < ids.length; i++) {
+                sql.append(i == 0 ? "?" : ", ?");
+            }
+            sql.append(")");
+            try (PreparedStatement ps = persistentConnection.prepareStatement(sql.toString())) {
                 ps.setString(1, playerUuid.toString());
+                for (int i = 0; i < ids.length; i++) {
+                    ps.setLong(i + 2, ids[i]);
+                }
                 ps.executeUpdate();
             } catch (SQLException e) {
-                LOGGER.error("Failed to delete pending notifications for: {}", playerUuid, e);
+                LOGGER.error("Failed to delete delivered notifications for: {}", playerUuid, e);
             }
         }, asyncExecutor);
     }

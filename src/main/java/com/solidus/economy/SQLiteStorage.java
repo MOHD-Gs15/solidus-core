@@ -242,12 +242,12 @@ public class SQLiteStorage {
             }
 
             // Optimistic cache write - putIfAbsent prevents overwriting if raced
-            balanceCache.putIfAbsent(uuid, CurrencyUtil.DEFAULT_STARTING_BALANCE);
+            balanceCache.putIfAbsent(uuid, CurrencyUtil.getStartingBalance());
 
             // Persist new player directly (we're already on the executor thread)
-            persistNewPlayerDirect(uuid, playerName, CurrencyUtil.DEFAULT_STARTING_BALANCE);
+            persistNewPlayerDirect(uuid, playerName, CurrencyUtil.getStartingBalance());
 
-            return CurrencyUtil.DEFAULT_STARTING_BALANCE;
+            return CurrencyUtil.getStartingBalance();
         }, asyncExecutor);
     }
 
@@ -349,7 +349,7 @@ public class SQLiteStorage {
         final double roundedAmount = CurrencyUtil.round(amount);
 
         return CompletableFuture.supplyAsync(() -> {
-            double currentBalance = balanceCache.getOrDefault(uuid, CurrencyUtil.DEFAULT_STARTING_BALANCE);
+            double currentBalance = balanceCache.getOrDefault(uuid, CurrencyUtil.getStartingBalance());
             double newBalance = CurrencyUtil.round(currentBalance + roundedAmount);
 
             if (!CurrencyUtil.isValidBalance(newBalance)) {
@@ -383,7 +383,7 @@ public class SQLiteStorage {
         final double roundedAmount = CurrencyUtil.round(amount);
 
         return CompletableFuture.supplyAsync(() -> {
-            double currentBalance = balanceCache.getOrDefault(uuid, CurrencyUtil.DEFAULT_STARTING_BALANCE);
+            double currentBalance = balanceCache.getOrDefault(uuid, CurrencyUtil.getStartingBalance());
 
             if (currentBalance < roundedAmount) {
                 return -1.0;

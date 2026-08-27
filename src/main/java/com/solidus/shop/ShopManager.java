@@ -6,6 +6,7 @@ import com.google.gson.JsonParser;
 import com.mojang.serialization.DataResult;
 import com.mojang.serialization.JsonOps;
 import com.solidus.SolidusMod;
+import com.solidus.auction.AuctionEntry;
 import com.solidus.economy.BalanceManager;
 import com.solidus.economy.EconomyEngine;
 import com.solidus.economy.TransactionLog;
@@ -88,6 +89,11 @@ public class ShopManager {
 
         try {
             JsonObject root = JsonParser.parseString(content).getAsJsonObject();
+
+            // Apply optional global economy settings (keys documented in the
+            // README that were previously ignored - see applyGlobalSettings).
+            applyGlobalSettings(root);
+
             JsonObject sectionsObj = root.getAsJsonObject("sections");
 
             sections.clear();
@@ -105,6 +111,41 @@ public class ShopManager {
 
         } catch (Exception e) {
             SolidusMod.LOGGER.error("Failed to parse shop.json!", e);
+        }
+    }
+
+    /**
+     * Applies optional top-level economy settings documented in the README:
+     * <ul>
+     *   <li>{@code "startingBalance"} / {@code "starting_balance"} - starting wallet for new players</li>
+     *   <li>{@code "currency"}  - displayed currency symbol</li>
+     *   <li>{@code "listingFee"} - auction listing fee in whole percent (e.g. 2 = 2%)</li>
+     * </ul>
+     * Missing keys keep the current values. These keys were previously
+     * advertised in the README but silently ignored by the loader.
+     */
+    private void applyGlobalSettings(JsonObject root) {
+        try {
+            if (root.has("startingBalance") || root.has("starting_balance")) {
+                JsonElement el = root.has("startingBalance")
+                    ? root.get("startingBalance")
+                    : root.get("starting_balance");
+                CurrencyUtil.setStartingBalance(el.getAsDouble());
+                SolidusMod.LOGGER.info("Applied shop.json startingBalance override.");
+            }
+
+            if (root.has("currency") && root.get("currency").isJsonPrimitive()) {
+                CurrencyUtil.setCurrencySymbol(root.get("currency").getAsString());
+                SolidusMod.LOGGER.info("Applied shop.json currency symbol override.");
+            }
+
+            if (root.has("listingFee") && root.get("listingFee").isJsonPrimitive()) {
+                // Config uses whole-percent units: 2 => 0.02
+                AuctionEntry.setListingFeePercent(root.get("listingFee").getAsDouble() / 100.0);
+                SolidusMod.LOGGER.info("Applied shop.json listingFee override.");
+            }
+        } catch (Exception e) {
+            SolidusMod.LOGGER.warn("Ignored invalid global setting in shop.json: {}", e.getMessage());
         }
     }
 
@@ -252,6 +293,16 @@ public class ShopManager {
             return;
         }
 
+        // SECURITY FIX: validate that the material resolves to a real registry
+        // item BEFORE charging any money. Previously a typo'd or removed
+        // material deducted the price first and then produced an EMPTY stack -
+        // money gone, nothing delivered.
+        if (resolveItem(material) == null) {
+            SolidusMod.LOGGER.error("Shop buy blocked - unknown material in shop.json: {}", material);
+            player.sendSystemMessage(TextUtil.error("This item cannot be purchased."));
+            return;
+        }
+
         // Prevent double-buy race condition
         UUID playerId = player.getUUID();
         if (!pendingBuys.add(playerId)) {
@@ -278,6 +329,16 @@ public class ShopManager {
 
                     // Spawn item into player's inventory
                     net.minecraft.world.item.ItemStack itemStack = createItemStack(material, quantity);
+                    if (itemStack.isEmpty()) {
+                        // Should be impossible now (validated before charging), but we
+                        // NEVER keep money without delivering goods. Refund immediately.
+                        SolidusMod.LOGGER.error(
+                            "Buy produced an empty stack for material '{}'! Refunding {}.",
+                            material, totalCost);
+                        balanceManager.addBalance(player, totalCost);
+                        player.sendSystemMessage(TextUtil.error("Purchase failed. You have been refunded."));
+                        return;
+                    }
                     if (!player.getInventory().add(itemStack)) {
                         // Inventory full - drop at player's feet
                         player.drop(itemStack, false);
@@ -321,9 +382,11 @@ public class ShopManager {
      * .thenAccept() and server-thread callbacks via player.level().getServer().execute(),
      * preventing any server tick thread blocking.
      *
-     * FIX: Balance is added BEFORE removing items to prevent item loss
-     * if the balance operation fails. Items are only removed after confirming
-     * the balance was successfully credited.
+     * FIX v3 (payout-before-removal TOCTOU): the items are removed
+     * SYNCHRONOUSLY first, and only then is the balance credited - for exactly
+     * the amount actually removed. If the credit fails, the items are restored.
+     * This closes the window where a cheat client could move/drop part of the
+     * stack during the async payout and still get paid the full amount.
      *
      * @param player     The selling player
      * @param material   The Minecraft material name
@@ -349,45 +412,40 @@ public class ShopManager {
             return;
         }
 
-        // Check if player has the item
-        if (!hasItemInInventory(player, material, quantity)) {
+        // SECURITY FIX (payout-before-removal TOCTOU): previously the balance
+        // was credited FIRST and the items removed afterwards, so a player
+        // could move/drop part of the stack during the async credit window and
+        // still get paid the full pre-checked amount.
+        //
+        // New flow: remove the items SYNCHRONOUSLY first, then pay for exactly
+        // what was actually removed. If crediting fails, the items are restored
+        // to the player. Nothing can be duplicated and nothing gets lost.
+        int removedCount = removeItemFromInventory(player, material, quantity);
+        if (removedCount <= 0) {
             pendingSells.remove(playerId);
             player.sendSystemMessage(TextUtil.error("You don't have " + quantity + "x " + material + " in your inventory."));
             return;
         }
 
-        // Calculate sell price
-        double totalValue = CurrencyUtil.round(item.sellPrice() * quantity);
+        // Pay for exactly what was removed
+        double totalValue = CurrencyUtil.round(item.sellPrice() * removedCount);
 
-        // Add balance FIRST - if this fails, items are NOT removed (prevents item loss)
-        // FIX: Previously items were removed before balance add, causing item loss on failure
         BalanceManager balanceManager = economyEngine.getBalanceManager();
         balanceManager.addBalance(player, totalValue).thenAccept(newBalance -> {
             player.level().getServer().execute(() -> {
                 try {
                     if (newBalance < 0) {
-                        // Balance add failed - items remain in inventory, no data loss
-                        SolidusMod.LOGGER.error("Sell balance add failed for {}! Items not removed.",
-                            player.getName().getString());
-                        player.sendSystemMessage(TextUtil.error("Transaction error. Your items are safe. Please try again."));
+                        // Balance add failed - give the items back so nothing is lost.
+                        SolidusMod.LOGGER.error("Sell balance add failed for {}! Restoring {}x {}.",
+                            player.getName().getString(), removedCount, material);
+                        restoreItemsToPlayer(player, material, removedCount);
+                        player.sendSystemMessage(TextUtil.error(
+                            "Transaction error. Your items have been returned. Please try again."));
                         return;
                     }
 
-                    // Balance added successfully - now safe to remove items.
-                    // Re-verify the inventory still has the items (they may have been
-                    // moved/dropped between the pre-check and now), and only remove
-                    // what's actually present. The player already received the money,
-                    // so we log any shortfall as a warning for admin investigation.
-                    int actuallyRemoved = removeItemFromInventory(player, material, quantity);
-                    if (actuallyRemoved < quantity) {
-                        SolidusMod.LOGGER.warn(
-                            "Sell item count mismatch for {}: expected {}x {} but only removed {}x. " +
-                            "Player may have moved items during the async balance operation.",
-                            player.getName().getString(), quantity, material, actuallyRemoved);
-                    }
-
                     // Success notification
-                    MutableComponent message = TextUtil.success("Sold " + quantity + "x " + material + " for ")
+                    MutableComponent message = TextUtil.success("Sold " + removedCount + "x " + material + " for ")
                         .append(TextUtil.currency(CurrencyUtil.format(totalValue)));
 
                     // Log transaction
@@ -395,8 +453,8 @@ public class ShopManager {
                         TransactionLog.Type.SHOP_SELL,
                         player.getUUID(), player.getName().getString(),
                         null, null,
-                        totalValue, material, quantity,
-                        "Sold " + quantity + "x " + material + " to shop"
+                        totalValue, material, removedCount,
+                        "Sold " + removedCount + "x " + material + " to shop"
                     );
 
                     player.sendSystemMessage(message.append(
@@ -409,6 +467,29 @@ public class ShopManager {
                 }
             });
         });
+    }
+
+    /**
+     * Restores previously-removed sell items when the balance credit failed.
+     * Re-adds stacks using each item's real max stack size; whatever does not
+     * fit into the inventory is dropped at the player's feet so no value can
+     * ever be silently destroyed.
+     */
+    private void restoreItemsToPlayer(ServerPlayer player, String material, int count) {
+        net.minecraft.world.item.Item resolvedItem = resolveItem(material);
+        if (resolvedItem == null) {
+            SolidusMod.LOGGER.error("Cannot restore {}x {} - material unresolvable!", count, material);
+            return;
+        }
+        int remaining = count;
+        while (remaining > 0) {
+            int chunk = Math.min(resolvedItem.getDefaultMaxStackSize(), remaining);
+            remaining -= chunk;
+            net.minecraft.world.item.ItemStack stack = new net.minecraft.world.item.ItemStack(resolvedItem, chunk);
+            if (!player.getInventory().add(stack)) {
+                player.drop(stack, false);
+            }
+        }
     }
 
     // -- Helpers -------------------------------------------
@@ -428,15 +509,30 @@ public class ShopManager {
         return null;
     }
 
-    private net.minecraft.world.item.ItemStack createItemStack(String material, int quantity) {
+    /**
+     * Resolves a shop.json material name to a registry Item.
+     * Returns {@code null} when the material does not exist. Shared by the
+     * pre-charge validation in processBuy and stack creation so both sides
+     * can never disagree about whether an item exists.
+     */
+    private static net.minecraft.world.item.Item resolveItem(String material) {
+        if (material == null || material.isBlank()) return null;
         try {
-            net.minecraft.world.item.Item item = net.minecraft.core.registries.BuiltInRegistries.ITEM
+            return net.minecraft.core.registries.BuiltInRegistries.ITEM
                 .get(net.minecraft.resources.Identifier.tryParse(material.toLowerCase()))
                 .map(net.minecraft.core.Holder::value).orElse(null);
-            if (item == null) {
-                SolidusMod.LOGGER.error("Unknown material: {}", material);
-                return net.minecraft.world.item.ItemStack.EMPTY;
-            }
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    private net.minecraft.world.item.ItemStack createItemStack(String material, int quantity) {
+        net.minecraft.world.item.Item item = resolveItem(material);
+        if (item == null) {
+            SolidusMod.LOGGER.error("Unknown material: {}", material);
+            return net.minecraft.world.item.ItemStack.EMPTY;
+        }
+        try {
             return new net.minecraft.world.item.ItemStack(item, quantity);
         } catch (Exception e) {
             SolidusMod.LOGGER.error("Failed to create ItemStack for material: {}", material, e);
@@ -451,25 +547,6 @@ public class ShopManager {
      */
     private String getMaterialName(net.minecraft.world.item.ItemStack stack) {
         return TextUtil.getMaterialName(stack);
-    }
-
-    /**
-     * Checks if the player has enough of a specific item in their main inventory.
-     * Armor slots (36-39) are excluded to prevent accidental armor sales.
-     * Offhand (slot 40) is excluded from shop sells for safety - players
-     * can use /sell commands if they want to sell offhand items.
-     */
-    private boolean hasItemInInventory(ServerPlayer player, String material, int quantity) {
-        int count = 0;
-        // getContainerSize() = 41 (36 main + 4 armor + 1 offhand)
-        // Only count items in main inventory (slots 0-35)
-        for (int i = 0; i < 36; i++) {
-            net.minecraft.world.item.ItemStack stack = player.getInventory().getItem(i);
-            if (!stack.isEmpty() && getMaterialName(stack).equalsIgnoreCase(material)) {
-                count += stack.getCount();
-            }
-        }
-        return count >= quantity;
     }
 
     /**

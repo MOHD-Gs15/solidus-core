@@ -37,14 +37,24 @@ public class AuctionScreenHandler extends AbstractContainerMenu {
     private final int currentPage;
     private final boolean myItemsView;
 
+    /**
+     * FIX: the active sort order is remembered so PREV/NEXT page navigation
+     * re-fetches listings with the SAME ordering instead of silently falling
+     * back to NEWEST (which reset /ah sort as soon as you changed page).
+     */
+    private final AuctionManager.SortOrder sortOrder;
+
     private final Map<Integer, GuiSlot> slotMap = new HashMap<>();
 
     /**
      * Opens a new auction screen for the player.
+     *
+     * @param sortOrder the active sort order for this view (nullable = NEWEST)
      */
     public static void openScreen(ServerPlayer player, Component title,
                                    List<GuiSlot> slots, AuctionManager auctionManager,
-                                   int page, boolean myItems) {
+                                   int page, boolean myItems,
+                                   AuctionManager.SortOrder sortOrder) {
         player.openMenu(new net.minecraft.world.MenuProvider() {
             @Override
             public Component getDisplayName() {
@@ -54,20 +64,22 @@ public class AuctionScreenHandler extends AbstractContainerMenu {
             @Override
             public AbstractContainerMenu createMenu(int syncId, Inventory playerInventory, Player player) {
                 return new AuctionScreenHandler(syncId, playerInventory,
-                    (ServerPlayer) player, slots, auctionManager, page, myItems);
+                    (ServerPlayer) player, slots, auctionManager, page, myItems, sortOrder);
             }
         });
     }
 
     private AuctionScreenHandler(int syncId, Inventory playerInventory,
                                   ServerPlayer player, List<GuiSlot> slots,
-                                  AuctionManager auctionManager, int page, boolean myItems) {
+                                  AuctionManager auctionManager, int page, boolean myItems,
+                                  AuctionManager.SortOrder sortOrder) {
         super(MenuType.GENERIC_9x6, syncId);
         this.player = player;
         this.auctionManager = auctionManager;
         this.guiSlots = slots;
         this.currentPage = page;
         this.myItemsView = myItems;
+        this.sortOrder = sortOrder;
 
         // Build slot map
         for (GuiSlot guiSlot : slots) {
@@ -144,6 +156,9 @@ public class AuctionScreenHandler extends AbstractContainerMenu {
         player.closeContainer();
         if (myItemsView) {
             AuctionGUI.openMyListings(player, auctionManager);
+        } else if (sortOrder != null) {
+            // Keep the active sort when refreshing a sorted view
+            AuctionGUI.openAuctionSorted(player, auctionManager, sortOrder);
         } else {
             AuctionGUI.openAuction(player, auctionManager);
         }
@@ -165,6 +180,8 @@ public class AuctionScreenHandler extends AbstractContainerMenu {
         String action = slot.actionKey();
         if (action == null) return;
 
+        AuctionManager.SortOrder navOrder = (sortOrder != null) ? sortOrder : AuctionManager.SortOrder.NEWEST;
+
         switch (action) {
             case "PREV" -> {
                 // TODO: 26.1.x - Verify player.closeContainer() still exists (not renamed to closeMenu)
@@ -175,10 +192,10 @@ public class AuctionScreenHandler extends AbstractContainerMenu {
                             AuctionGUI.buildAndOpenAuctionScreen(player, auctionManager, listings, currentPage - 1, true));
                     });
                 } else {
-                    // Re-fetch active listings and open previous page
-                    auctionManager.getActiveListings().thenAccept(listings -> {
+                    // Re-fetch active listings keeping the active sort order (FIX)
+                    auctionManager.getActiveListings(navOrder).thenAccept(listings -> {
                         player.level().getServer().execute(() ->
-                            AuctionGUI.buildAndOpenAuctionScreen(player, auctionManager, listings, currentPage - 1, false));
+                            AuctionGUI.buildAndOpenAuctionScreen(player, auctionManager, listings, currentPage - 1, false, navOrder));
                     });
                 }
             }
@@ -191,10 +208,10 @@ public class AuctionScreenHandler extends AbstractContainerMenu {
                             AuctionGUI.buildAndOpenAuctionScreen(player, auctionManager, listings, currentPage + 1, true));
                     });
                 } else {
-                    // Re-fetch active listings and open next page
-                    auctionManager.getActiveListings().thenAccept(listings -> {
+                    // Re-fetch active listings keeping the active sort order (FIX)
+                    auctionManager.getActiveListings(navOrder).thenAccept(listings -> {
                         player.level().getServer().execute(() ->
-                            AuctionGUI.buildAndOpenAuctionScreen(player, auctionManager, listings, currentPage + 1, false));
+                            AuctionGUI.buildAndOpenAuctionScreen(player, auctionManager, listings, currentPage + 1, false, navOrder));
                     });
                 }
             }

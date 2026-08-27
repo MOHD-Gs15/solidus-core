@@ -34,7 +34,13 @@ import java.util.UUID;
 public final class AuctionGUI {
 
     private static final int INVENTORY_SIZE = 54;
-    private static final int ITEMS_PER_PAGE = 45;
+    /**
+     * FIX: was 45, which overlapped the PREV/NEXT/CLOSE navigation slots
+     * (48/50/53) - listings landing on those slots were overwritten by the
+     * nav buttons and became unpurchasable while still counted in the header.
+     * We now reserve those three slots and place at most 42 listings per page.
+     */
+    private static final int ITEMS_PER_PAGE = 42;
     private static final int ITEMS_START = 9;
     private static final int REFRESH_BUTTON_SLOT = 7;
     private static final int MY_ITEMS_BUTTON_SLOT = 8;
@@ -118,13 +124,14 @@ public final class AuctionGUI {
             TextUtil.loreLine("View your own listings"));
         slots.add(new GuiSlot(MY_ITEMS_BUTTON_SLOT, myItemsItem, GuiSlot.Type.MY_ITEMS, "MY_ITEMS"));
 
-        // Listings with pagination
+        // Listings with pagination - placed ONLY on free (non-navigation) slots
         int startIndex = page * ITEMS_PER_PAGE;
         int endIndex = Math.min(startIndex + ITEMS_PER_PAGE, listings.size());
 
-        for (int i = startIndex; i < endIndex; i++) {
+        java.util.List<Integer> slotLayout = listingSlots();
+        for (int i = startIndex, pos = 0; i < endIndex && pos < slotLayout.size(); i++, pos++) {
             AuctionEntry entry = listings.get(i);
-            int slot = ITEMS_START + (i - startIndex);
+            int slot = slotLayout.get(pos);
             ItemStack displayItem = createAuctionItemDisplay(entry);
             slots.add(new GuiSlot(slot, displayItem, GuiSlot.Type.AUCTION_ITEM, entry.listingId().toString()));
         }
@@ -154,10 +161,24 @@ public final class AuctionGUI {
         // Fill empty slots
         fillEmptySlots(slots, INVENTORY_SIZE);
 
-        // Open screen handler
+        // Open screen handler - the active sort order is passed through so page
+        // navigation and refresh keep it (previously sort was silently lost).
         AuctionScreenHandler.openScreen(player,
             TextUtil.shopTitle("Auction House"),
-            slots, auctionManager, page, myItems);
+            slots, auctionManager, page, myItems, sortOrder);
+    }
+
+    /**
+     * Slot indices available for listing displays (9..53 minus the reserved
+     * navigation slots PREV/NEXT/CLOSE).
+     */
+    private static java.util.List<Integer> listingSlots() {
+        java.util.List<Integer> slots = new ArrayList<>(ITEMS_PER_PAGE);
+        for (int s = ITEMS_START; s < INVENTORY_SIZE; s++) {
+            if (s == PREV_PAGE_SLOT || s == NEXT_PAGE_SLOT || s == CLOSE_BUTTON_SLOT) continue;
+            slots.add(s);
+        }
+        return slots;
     }
 
     /**

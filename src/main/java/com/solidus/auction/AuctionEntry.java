@@ -51,11 +51,34 @@ public record AuctionEntry(
     public static final double MAX_LISTING_PRICE = 10_000_000.0;
 
     /**
-     * Listing fee percentage (2% of the listed price).
+     * Listing fee percentage (2% of the listed price) - the DEFAULT value.
      * This fee is deducted from the seller's balance when listing
      * to discourage spam listings and stabilize the economy.
+     * The effective runtime value lives in {@link #listingFeePercent} and can
+     * be overridden via shop.json ({@code "listingFee": 2} = 2%).
      */
     public static final double LISTING_FEE_PERCENT = 0.02;
+
+    /** Effective runtime listing fee percentage (overridable via config). */
+    private static volatile double listingFeePercent = LISTING_FEE_PERCENT;
+
+    /** The currently active listing fee percentage. */
+    public static double listingFeePercent() {
+        return listingFeePercent;
+    }
+
+    /**
+     * Sets the listing fee percentage at runtime. Values outside [0%, 25%]
+     * are ignored to protect the economy from bad configuration.
+     *
+     * @param percent fee as a fraction (0.02 = 2%)
+     */
+    public static void setListingFeePercent(double percent) {
+        if (!Double.isNaN(percent) && !Double.isInfinite(percent)
+                && percent >= 0.0 && percent <= 0.25) {
+            listingFeePercent = percent;
+        }
+    }
 
     /**
      * Creates a new AuctionEntry with auto-generated IDs and timestamps.
@@ -97,6 +120,6 @@ public record AuctionEntry(
      * Calculates the listing fee for a given price.
      */
     public static double calculateListingFee(double price) {
-        return Math.max(1.0, price * LISTING_FEE_PERCENT);
+        return Math.max(1.0, price * listingFeePercent());
     }
 }

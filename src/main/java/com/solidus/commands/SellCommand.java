@@ -151,17 +151,27 @@ public class SellCommand {
                 if (result.itemsSold > 0) {
                     // Update the shulker box with remaining items
                     if (result.allItemsSold) {
-                        // All items in the shulker were sold
+                        // All items in the shulker were sold. Decide the fate of the box itself.
                         // Check if the shulker box itself is sellable too
                         String shulkerMaterial = getMaterialName(stack);
                         ShopManager.ShopItem shulkerShopItem = shopManager.findItem(shulkerMaterial);
-                        if (shulkerShopItem != null && shulkerShopItem.sellPrice() > 0 && targetMaterial == null) {
-                            // Sell the shulker box too if selling all
+                        boolean sellBoxToo = targetMaterial == null
+                            && shulkerShopItem != null && shulkerShopItem.sellPrice() > 0;
+
+                        if (sellBoxToo) {
+                            // Sell the emptied shulker box too (full /sell all run)
                             totalEarnings += shulkerShopItem.sellPrice();
                             totalItemsSold += 1;
                             player.getInventory().setItem(i, ItemStack.EMPTY);
+                        } else {
+                            // SECURITY FIX (dupe prevention): previously this branch left the
+                            // ORIGINAL stack untouched, meaning the player was paid for the
+                            // contents while keeping a shulker box still holding ALL of its
+                            // items - an infinite money duplication loop via /sell all <item>
+                            // (or /sell all with an unlisted shulker type). Always write back
+                            // the emptied box so the sold contents are really gone.
+                            player.getInventory().setItem(i, result.updatedShulkerBox);
                         }
-                        // If not sellable, keep the empty shulker box
                     } else {
                         // Some items remain - update the shulker box in place
                         player.getInventory().setItem(i, result.updatedShulkerBox);

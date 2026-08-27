@@ -54,7 +54,7 @@ public class EconomyEngine {
         initialized = true;
         SolidusMod.LOGGER.info("Solidus Economy Engine initialized successfully.");
         SolidusMod.LOGGER.info("Starting balance: {} | Currency: {}",
-            com.solidus.util.CurrencyUtil.DEFAULT_STARTING_BALANCE,
+            com.solidus.util.CurrencyUtil.getStartingBalance(),
             com.solidus.util.CurrencyUtil.CURRENCY_NAME);
     }
 

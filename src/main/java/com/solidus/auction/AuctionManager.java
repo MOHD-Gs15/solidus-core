@@ -213,18 +213,23 @@ public class AuctionManager {
             return;
         }
 
-        // Calculate listing fee
-        double listingFee = AuctionEntry.calculateListingFee(price);
-        BalanceManager balanceManager = economyEngine.getBalanceManager();
-
-        // Capture item details NOW (before any async hops) to prevent
-        // the player swapping items in their hand during the async chain.
-        // Use registry path name for reliable material matching - getItem().toString()
-        // is unreliable (may include namespace prefixes or vary by mapping).
+        // Capture item details NOW, and SECURITY FIX (TOCTOU item duplication):
+        // previously the item stayed in the player's hand while the fee deduction
+        // and the database save ran asynchronously - a cheat client could deposit,
+        // drop or spend the very stack being listed during that window and keep a
+        // marketable copy. We now remove the stack from the hand SYNCHRONOUSLY
+        // (before any async hop), and every failure path below returns it.
         String materialName = TextUtil.getMaterialName(heldItem);
         int quantity = heldItem.getCount();
         String itemNbt = serializeItemStack(heldItem);
         int selectedSlot = player.getInventory().getSelectedSlot();
+        final ItemStack capturedStack = heldItem.copy();
+
+        player.getInventory().setItem(selectedSlot, ItemStack.EMPTY);
+
+        // Calculate listing fee
+        double listingFee = AuctionEntry.calculateListingFee(price);
+        BalanceManager balanceManager = economyEngine.getBalanceManager();
 
         // TOCTOU Fix: Skip the separate getBalance check and go directly to
         // subtractBalance, which atomically checks-and-deducts on the
@@ -232,77 +237,87 @@ public class AuctionManager {
         // the player could spend money elsewhere between check and deduction.
         balanceManager.subtractBalance(player, listingFee).thenAccept(newBalance -> {
             player.level().getServer().execute(() -> {
-                try {
-                    if (newBalance < 0) {
-                        // Insufficient funds or failure - no money was deducted
-                        player.sendSystemMessage(TextUtil.error(
-                            "Listing fee is " + CurrencyUtil.format(listingFee) +
-                            ". Insufficient funds!"));
-                        return;
-                    }
-
-                    // Create the listing
-                    AuctionEntry entry = AuctionEntry.create(
-                        player.getUUID(), player.getName().getString(),
-                        materialName, quantity, itemNbt, price
-                    );
-
-                    // Save to database first, THEN remove item from player's hand
-                    // This prevents item loss if the database save fails
-                    saveListing(entry).thenAccept(success -> {
-                        player.level().getServer().execute(() -> {
-                            try {
-                                if (success) {
-                                    // Item saved successfully - now safe to remove from player
-                                    player.getInventory().setItem(selectedSlot, ItemStack.EMPTY);
-
-                                    // Log transaction
-                                    economyEngine.getTransactionLog().log(
-                                        TransactionLog.Type.AUCTION_LIST,
-                                        player.getUUID(), player.getName().getString(),
-                                        null, null,
-                                        listingFee, materialName, quantity,
-                                        "Listed " + quantity + "x " + materialName + " for " + CurrencyUtil.format(price)
-                                    );
-
-                                    player.sendSystemMessage(
-                                        TextUtil.success("Item listed on the Auction House for ")
-                                            .append(TextUtil.currency(CurrencyUtil.format(price)))
-                                            .append(TextUtil.styled(" (Fee: " + CurrencyUtil.format(listingFee) + ")", ChatFormatting.GRAY))
-                                    );
-                                } else {
-                                    // CRITICAL: Listing save failed after fee deduction - attempt refund
-                                    SolidusMod.LOGGER.error("CRITICAL: Auction listing save failed for {}! Refunding fee.",
-                                        player.getName().getString());
-                                    balanceManager.addBalance(player, listingFee).thenAccept(refundBalance -> {
-                                        player.level().getServer().execute(() -> {
-                                            if (refundBalance < 0) {
-                                                SolidusMod.LOGGER.error(
-                                                    "CATASTROPHIC: Listing fee refund also failed for {}! Amount: {}",
-                                                    player.getName().getString(), listingFee);
-                                                player.sendSystemMessage(TextUtil.error(
-                                                    "Critical error: listing fee refund failed. Please contact an admin."));
-                                            } else {
-                                                player.sendSystemMessage(TextUtil.error(
-                                                    "Failed to list item. Listing fee has been refunded."));
-                                            }
-                                        });
-                                    });
-                                }
-                            } finally {
-                                pendingListings.remove(playerId);
-                            }
-                        });
-                    });
-                } finally {
-                    // Release the pending guard for non-saveListing paths
-                    // (saveListing path releases in its own finally block)
-                    if (newBalance < 0) {
-                        pendingListings.remove(playerId);
-                    }
+                if (newBalance < 0) {
+                    // Insufficient funds or failure - no money was deducted.
+                    // Give the captured item straight back; nothing was listed.
+                    returnCapturedItem(player, capturedStack);
+                    pendingListings.remove(playerId);
+                    player.sendSystemMessage(TextUtil.error(
+                        "Listing fee is " + CurrencyUtil.format(listingFee) +
+                        ". Insufficient funds!"));
+                    return;
                 }
+
+                // Create the listing
+                AuctionEntry entry = AuctionEntry.create(
+                    player.getUUID(), player.getName().getString(),
+                    materialName, quantity, itemNbt, price
+                );
+
+                // Save to database first; the physical item was already taken out
+                // of the player's hand, so on save failure we refund the fee AND
+                // return the item to keep both sides of the transaction intact.
+                saveListing(entry).thenAccept(success -> {
+                    player.level().getServer().execute(() -> {
+                        try {
+                            if (success) {
+                                // Listing saved successfully.
+
+                                // Log transaction
+                                economyEngine.getTransactionLog().log(
+                                    TransactionLog.Type.AUCTION_LIST,
+                                    player.getUUID(), player.getName().getString(),
+                                    null, null,
+                                    listingFee, materialName, quantity,
+                                    "Listed " + quantity + "x " + materialName + " for " + CurrencyUtil.format(price)
+                                );
+
+                                player.sendSystemMessage(
+                                    TextUtil.success("Item listed on the Auction House for ")
+                                        .append(TextUtil.currency(CurrencyUtil.format(price)))
+                                        .append(TextUtil.styled(" (Fee: " + CurrencyUtil.format(listingFee) + ")", ChatFormatting.GRAY))
+                                );
+                            } else {
+                                // CRITICAL: Listing save failed after fee deduction - refund fee
+                                SolidusMod.LOGGER.error("CRITICAL: Auction listing save failed for {}! Refunding fee and returning item.",
+                                    player.getName().getString());
+                                balanceManager.addBalance(player, listingFee).thenAccept(refundBalance -> {
+                                    player.level().getServer().execute(() -> {
+                                        if (refundBalance < 0) {
+                                            SolidusMod.LOGGER.error(
+                                                "CATASTROPHIC: Listing fee refund also failed for {}! Amount: {}",
+                                                player.getName().getString(), listingFee);
+                                            player.sendSystemMessage(TextUtil.error(
+                                                "Critical error: listing fee refund failed. Please contact an admin."));
+                                        } else {
+                                            player.sendSystemMessage(TextUtil.error(
+                                                "Failed to list item. Listing fee has been refunded."));
+                                        }
+                                        // In BOTH cases return the captured item - it never
+                                        // became part of a successful listing.
+                                        returnCapturedItem(player, capturedStack);
+                                    });
+                                });
+                            }
+                        } finally {
+                            pendingListings.remove(playerId);
+                        }
+                    });
+                });
             });
         });
+    }
+
+    /**
+     * Returns a previously captured listing item to the player's inventory.
+     * If the inventory is full, the item is dropped at the player's feet so it
+     * can never be destroyed.
+     */
+    private void returnCapturedItem(ServerPlayer player, ItemStack stack) {
+        if (stack == null || stack.isEmpty()) return;
+        if (!player.getInventory().add(stack)) {
+            player.drop(stack, false);
+        }
     }
 
     // -- Purchase Operations -------------------------------
@@ -616,9 +631,16 @@ public class AuctionManager {
                         seller.sendSystemMessage(
                             TextUtil.warning("Your auction listing for " + entry.quantity() + "x " +
                                 entry.materialName() + " has expired and been returned to you."));
+
+                        // SECURITY FIX (dupe prevention): previously the row was left at
+                        // status=2 EXPIRED after the physical return, so the seller could
+                        // ALSO run /ah collect and receive a SECOND copy of the same item.
+                        // The listing is fully settled now - delete the row so collect can
+                        // never double-return it.
+                        deleteSettledListing(entry.listingId());
                     }
                     // Offline sellers: items are marked as expired (status=2)
-                    // A future /ah collect command could retrieve these
+                    // and retrieved via /ah collect on next login
                 });
 
                 SolidusMod.LOGGER.info("Expired listing processed: seller={}, item={}",
@@ -779,8 +801,9 @@ public class AuctionManager {
      *
      * Flow (fully async - no server thread blocking):
      * 1. Query all EXPIRED listings for this seller
-     * 2. On server thread: give items to the player
-     * 3. Delete collected listings from the database
+     * 2. In the SAME serialized executor step, claim them by deleting the rows
+     *    (prevents crash-window double collection)
+     * 3. On server thread: give items to the player
      *
      * @param player The seller collecting their expired items
      */
@@ -797,6 +820,27 @@ public class AuctionManager {
                 }
             } catch (SQLException e) {
                 SolidusMod.LOGGER.error("Failed to query expired listings for collection", e);
+            }
+
+            // SECURITY FIX (crash-window dupe): previously the rows were deleted only
+            // AFTER the items had been handed to the player (async, fire-and-forget).
+            // A server crash between hand-out and delete let the seller claim the same
+            // items a second time after restart. The rows are now claimed (deleted)
+            // inside this same serialized executor step - BEFORE any items are handed
+            // out. Hand-over itself is guaranteed by the inventory-add/drop fallback.
+            if (!expired.isEmpty()) {
+                String deleteSql = "DELETE FROM auction_listings WHERE seller_uuid = ? AND status = 2";
+                try (PreparedStatement ps = persistentConnection.prepareStatement(deleteSql)) {
+                    ps.setString(1, player.getUUID().toString());
+                    int deleted = ps.executeUpdate();
+                    SolidusMod.LOGGER.info("Claimed {} collected listings for seller: {}",
+                        deleted, player.getUUID());
+                } catch (SQLException e) {
+                    SolidusMod.LOGGER.error("Failed to delete collected listings for seller: {}", player.getUUID(), e);
+                    // Deletion failed - do NOT hand out items, or they could be
+                    // re-claimed later. Return an empty list so the retry is safe.
+                    return new ArrayList<AuctionEntry>();
+                }
             }
             return expired;
         }, asyncExecutor).thenAccept(expired -> {
@@ -816,9 +860,6 @@ public class AuctionManager {
                     }
                     collected++;
                 }
-
-                // Delete collected listings from the database
-                deleteCollectedListings(player.getUUID());
 
                 player.sendSystemMessage(
                     TextUtil.success("Collected " + collected + " expired item(s)!"));
@@ -933,18 +974,19 @@ public class AuctionManager {
     }
 
     /**
-     * Deletes all collected (EXPIRED) listings for a seller from the database.
-     * Called after items have been successfully returned to the player.
+     * Deletes a single settled listing by ID from the database.
+     * Used when an expired item has been physically returned to an ONLINE
+     * seller - the row must be removed so /ah collect can never return a
+     * second copy of the same item.
      */
-    private void deleteCollectedListings(UUID sellerUuid) {
+    private void deleteSettledListing(UUID listingId) {
         CompletableFuture.runAsync(() -> {
-            String sql = "DELETE FROM auction_listings WHERE seller_uuid = ? AND status = 2";
+            String sql = "DELETE FROM auction_listings WHERE listing_id = ?";
             try (PreparedStatement ps = persistentConnection.prepareStatement(sql)) {
-                ps.setString(1, sellerUuid.toString());
-                int deleted = ps.executeUpdate();
-                SolidusMod.LOGGER.info("Deleted {} collected listings for seller: {}", deleted, sellerUuid);
+                ps.setString(1, listingId.toString());
+                ps.executeUpdate();
             } catch (SQLException e) {
-                SolidusMod.LOGGER.error("Failed to delete collected listings for seller: {}", sellerUuid, e);
+                SolidusMod.LOGGER.error("Failed to delete settled listing: {}", listingId, e);
             }
         }, asyncExecutor);
     }

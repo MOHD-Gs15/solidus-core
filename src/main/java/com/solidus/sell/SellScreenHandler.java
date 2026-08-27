@@ -524,6 +524,10 @@ public class SellScreenHandler extends AbstractContainerMenu {
         double totalEarnings = 0.0;
         int totalItemsSold = 0;
         java.util.List<ItemStack> unsellableItems = new java.util.ArrayList<>();
+        // Snapshots of sellable stacks consumed for this payout. If the async
+        // balance credit later fails, these are handed back to the player
+        // instead of being silently destroyed.
+        java.util.List<ItemStack> soldForCredit = new java.util.ArrayList<>();
 
         for (int i = 9; i < 54; i++) {
             ItemStack stack = sellContainer.getItem(i);
@@ -566,6 +570,8 @@ public class SellScreenHandler extends AbstractContainerMenu {
                     double value = CurrencyUtil.round(shopItem.sellPrice() * stack.getCount());
                     totalEarnings += value;
                     totalItemsSold += stack.getCount();
+                    // Recovery snapshot - see the balance-failure handler below.
+                    soldForCredit.add(stack.copy());
                 } else {
                     // Not sellable - return to player
                     unsellableItems.add(stack.copy());
@@ -595,12 +601,22 @@ public class SellScreenHandler extends AbstractContainerMenu {
             // Use this.player (ServerPlayer) instead of the method parameter
             // (Player), since BalanceManager.addBalance requires ServerPlayer
             // and player.level().getServer() requires ServerPlayer.
+            final java.util.List<ItemStack> finalSoldStacks = soldForCredit;
             balanceManager.addBalance(this.player, finalTotalEarnings).thenAccept(newBalance -> {
                 this.player.level().getServer().execute(() -> {
                     if (newBalance < 0) {
-                        SolidusMod.LOGGER.error("CRITICAL: Sell GUI balance add failed for {}! Items sold but no money received. Amount: {}",
-                            this.player.getName().getString(), finalTotalEarnings);
-                        this.player.sendSystemMessage(TextUtil.error("Transaction error. Please contact an admin."));
+                        // Crediting failed - RESTORE every snapshot taken of the items
+                        // that were consumed for this payout. Previously these items
+                        // were destroyed with no compensation. Anything that does not
+                        // fit back into the inventory is dropped at the player's feet.
+                        SolidusMod.LOGGER.error(
+                            "CRITICAL: Sell GUI balance add failed for {}! Restoring {} consumed stack(s). Amount: {}",
+                            this.player.getName().getString(), finalSoldStacks.size(), finalTotalEarnings);
+                        for (ItemStack restore : finalSoldStacks) {
+                            returnItemToPlayer(restore);
+                        }
+                        this.player.sendSystemMessage(TextUtil.error(
+                            "Transaction error. Your placed items have been returned. Please try again."));
                         return;
                     }
 
