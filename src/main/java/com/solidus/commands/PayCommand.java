@@ -7,6 +7,7 @@ import com.solidus.economy.BalanceManager;
 import com.solidus.economy.EconomyEngine;
 import com.solidus.economy.SQLiteStorage;
 import com.solidus.economy.TransactionLog;
+import com.solidus.networking.RateLimiter;
 import com.solidus.util.TextUtil;
 import com.solidus.util.CurrencyUtil;
 
@@ -39,6 +40,8 @@ import java.util.UUID;
  * - Maximum transaction cap enforcement
  * - Recipient existence validation
  * - Atomic deduct-then-add operation with rollback on failure
+ * - Per-sender transfer cooldown via RateLimiter (1 payment/second) - stops
+ *   command-macro flooding from polluting the ledger and hammering SQLite
  *
  * Offline Payment Flow:
  * When paying an offline player, the system looks up the player's UUID
@@ -92,12 +95,34 @@ public class PayCommand {
     }
 
     /**
+     * Per-sender anti-spam gate for both /pay paths.
+     * Consumes a transfer slot only when allowed, so a rejected payment still
+     * counts as the sender's attempt for this second. Returns true to proceed.
+     */
+    private static boolean allowByRateLimit(ServerPlayer sender) {
+        RateLimiter rateLimiter = SolidusMod.getRateLimiter();
+        if (rateLimiter == null) return true; // defensive: never called before init in production
+
+        if (rateLimiter.allowTransfer(sender.getUUID())) {
+            return true;
+        }
+
+        long remainingSec = (rateLimiter.getRemainingTransferCooldown(sender.getUUID()) + 999) / 1000;
+        sender.sendSystemMessage(TextUtil.error(
+            "You are sending payments too quickly. Try again in " + remainingSec + "s."));
+        return false;
+    }
+
+    /**
      * Executes a payment to an online player.
      */
     private static void executePayOnline(ServerPlayer sender, ServerPlayer receiver,
                                           double amount, EconomyEngine economyEngine) {
         BalanceManager balanceManager = economyEngine.getBalanceManager();
         TransactionLog transactionLog = economyEngine.getTransactionLog();
+
+        // Rate limit: max 1 payment per second per sender (anti-spam gate)
+        if (!allowByRateLimit(sender)) return;
 
         // Pre-validation: reject negative or zero amounts
         if (amount <= 0) {
@@ -176,6 +201,9 @@ public class PayCommand {
         BalanceManager balanceManager = economyEngine.getBalanceManager();
         TransactionLog transactionLog = economyEngine.getTransactionLog();
         SQLiteStorage storage = economyEngine.getStorage();
+
+        // Rate limit: max 1 payment per second per sender (anti-spam gate)
+        if (!allowByRateLimit(sender)) return;
 
         // Pre-validation: reject negative or zero amounts
         if (amount <= 0) {

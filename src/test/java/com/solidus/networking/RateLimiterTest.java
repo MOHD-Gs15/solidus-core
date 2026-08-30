@@ -137,6 +137,163 @@ class RateLimiterTest {
         }
     }
 
+    // -- allowTransfer (pay cooldown) -------------------------
+
+    @Nested
+    @DisplayName("allowTransfer() - /pay cooldown")
+    class AllowTransferTest {
+
+        @Test
+        @DisplayName("MIN_PAY_INTERVAL_MS is 1000")
+        void minPayIntervalIsCorrect() {
+            assertEquals(1_000, RateLimiter.MIN_PAY_INTERVAL_MS);
+        }
+
+        @Test
+        @DisplayName("first transfer from a new player is allowed")
+        void firstTransferAllowed() {
+            UUID player = UUID.randomUUID();
+            assertTrue(limiter.allowTransfer(player));
+        }
+
+        @Test
+        @DisplayName("immediate second transfer from the same player is rejected")
+        void immediateSecondTransferRejected() {
+            UUID player = UUID.randomUUID();
+            assertTrue(limiter.allowTransfer(player));
+            assertFalse(limiter.allowTransfer(player));
+        }
+
+        @Test
+        @DisplayName("transfer after cooldown elapses is allowed")
+        void transferAfterCooldownAllowed() throws InterruptedException {
+            UUID player = UUID.randomUUID();
+            assertTrue(limiter.allowTransfer(player));
+            Thread.sleep(RateLimiter.MIN_PAY_INTERVAL_MS + 20);
+            assertTrue(limiter.allowTransfer(player));
+        }
+
+        @Test
+        @DisplayName("rapid transfer macro: only first passes, rest are dropped")
+        void rapidTransferMacro() {
+            UUID player = UUID.randomUUID();
+            int allowed = 0;
+            for (int i = 0; i < 50; i++) {
+                if (limiter.allowTransfer(player)) allowed++;
+            }
+            assertEquals(1, allowed, "only the first rapid transfer should be allowed");
+        }
+
+        @Test
+        @DisplayName("click bucket and transfer bucket are independent")
+        void bucketsAreIndependent() {
+            UUID player = UUID.randomUUID();
+            // A GUI click must not consume the transfer slot (transfer is first in its bucket)
+            assertTrue(limiter.allowClick(player));
+            assertTrue(limiter.allowTransfer(player));
+
+            // ...and a transfer must not consume the click slot (click is first in its bucket)
+            UUID other = UUID.randomUUID();
+            assertTrue(limiter.allowTransfer(other));
+            assertTrue(limiter.allowClick(other));
+        }
+
+        @Test
+        @DisplayName("transfers are rate-limited independently per player")
+        void differentPlayersIndependent() {
+            UUID sender = UUID.randomUUID();
+            UUID other = UUID.randomUUID();
+            assertTrue(limiter.allowTransfer(sender));
+            assertTrue(limiter.allowTransfer(other));
+            assertFalse(limiter.allowTransfer(sender));
+        }
+
+        @Test
+        @DisplayName("removePlayer resets transfer state")
+        void removePlayerResetsTransfer() {
+            UUID player = UUID.randomUUID();
+            assertTrue(limiter.allowTransfer(player));
+            assertFalse(limiter.allowTransfer(player));
+            limiter.removePlayer(player);
+            assertTrue(limiter.allowTransfer(player));
+        }
+
+        @Test
+        @DisplayName("clear() resets transfer state")
+        void clearResetsTransfer() {
+            UUID player = UUID.randomUUID();
+            assertTrue(limiter.allowTransfer(player));
+            limiter.clear();
+            assertTrue(limiter.allowTransfer(player));
+        }
+
+        @Test
+        @DisplayName("concurrent transfers for the same player: exactly 1 succeeds")
+        void concurrentTransfersForSamePlayer() throws InterruptedException {
+            UUID player = UUID.randomUUID();
+            int threadCount = 50;
+            ExecutorService pool = Executors.newFixedThreadPool(threadCount);
+            AtomicInteger allowedCount = new AtomicInteger(0);
+            CountDownLatch start = new CountDownLatch(1);
+            CountDownLatch done = new CountDownLatch(threadCount);
+
+            for (int i = 0; i < threadCount; i++) {
+                pool.submit(() -> {
+                    try {
+                        start.await();
+                        if (limiter.allowTransfer(player)) {
+                            allowedCount.incrementAndGet();
+                        }
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                    } finally {
+                        done.countDown();
+                    }
+                });
+            }
+
+            start.countDown();
+            assertTrue(done.await(5, TimeUnit.SECONDS));
+            pool.shutdown();
+
+            assertEquals(1, allowedCount.get(),
+                "exactly one concurrent transfer should be allowed");
+        }
+    }
+
+    // -- getRemainingTransferCooldown -------------------------
+
+    @Nested
+    @DisplayName("getRemainingTransferCooldown()")
+    class GetRemainingTransferCooldownTest {
+
+        @Test
+        @DisplayName("returns 0 for unknown player")
+        void unknownPlayerReturnsZero() {
+            assertEquals(0, limiter.getRemainingTransferCooldown(UUID.randomUUID()));
+        }
+
+        @Test
+        @DisplayName("returns positive value immediately after a transfer")
+        void afterTransferReturnsPositive() {
+            UUID player = UUID.randomUUID();
+            limiter.allowTransfer(player);
+            long remaining = limiter.getRemainingTransferCooldown(player);
+            assertTrue(remaining > 0, "remaining cooldown should be positive right after transfer");
+            assertTrue(remaining <= RateLimiter.MIN_PAY_INTERVAL_MS,
+                "remaining should not exceed MIN_PAY_INTERVAL_MS");
+        }
+
+        @Test
+        @DisplayName("returns 0 after transfer cooldown elapses")
+        void returnsZeroAfterCooldown() throws InterruptedException {
+            UUID player = UUID.randomUUID();
+            limiter.allowTransfer(player);
+            Thread.sleep(RateLimiter.MIN_PAY_INTERVAL_MS + 20);
+            assertEquals(0, limiter.getRemainingTransferCooldown(player));
+        }
+    }
+
     // -- removePlayer ----------------------------------------
 
     @Nested
