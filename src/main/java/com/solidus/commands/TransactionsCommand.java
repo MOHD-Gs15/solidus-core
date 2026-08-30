@@ -23,8 +23,12 @@ import java.util.List;
  * Usage: /transactions [page]
  * Permission: solidus.command.transactions (default: all players)
  *
- * Displays the last 10 transactions for the player, showing type,
+ * Displays 10 transactions per page for the player, showing type,
  * amount, counterpart, item details, and timestamp.
+ *
+ * Performance: pagination is pushed down to SQLite (COUNT(*) for the page
+ * footer + LIMIT/OFFSET for the rows themselves) so opening page 50 costs
+ * the same as page 1 no matter how large the ledger grows.
  * All text uses Component.literal().withStyle() - NO legacy formatting codes.
  */
 public class TransactionsCommand {
@@ -54,53 +58,55 @@ public class TransactionsCommand {
         TransactionLog transactionLog = economyEngine.getTransactionLog();
         int offset = (page - 1) * PAGE_SIZE;
 
-        transactionLog.getTransactions(player.getUUID(), PAGE_SIZE + offset).thenAccept(allEntries -> {
-            player.level().getServer().execute(() -> {
-                // Header
-                player.sendSystemMessage(TextUtil.styledBold(
-                    "======= Transaction History =======", ChatFormatting.GOLD));
+        // Cheap COUNT(*) for the footer, then only the requested page via SQL
+        // LIMIT/OFFSET - the whole history is never loaded into memory.
+        transactionLog.countTransactions(player.getUUID()).thenAccept(totalCount ->
+            transactionLog.getTransactions(player.getUUID(), PAGE_SIZE, offset).thenAccept(pageEntries -> {
+                player.level().getServer().execute(() -> {
+                    // Header
+                    player.sendSystemMessage(TextUtil.styledBold(
+                        "======= Transaction History =======", ChatFormatting.GOLD));
 
-                if (allEntries.isEmpty()) {
-                    player.sendSystemMessage(TextUtil.styled(
-                        "No transactions recorded yet.", ChatFormatting.GRAY));
-                    return;
-                }
+                    if (totalCount == 0) {
+                        player.sendSystemMessage(TextUtil.styled(
+                            "No transactions recorded yet.", ChatFormatting.GRAY));
+                        player.sendSystemMessage(TextUtil.styledBold(
+                            "===================================", ChatFormatting.GOLD));
+                        return;
+                    }
 
-                // Paginate
-                int fromIndex = Math.min(offset, allEntries.size());
-                int toIndex = Math.min(offset + PAGE_SIZE, allEntries.size());
-                List<TransactionLog.TransactionEntry> pageEntries = allEntries.subList(fromIndex, toIndex);
+                    if (pageEntries.isEmpty()) {
+                        player.sendSystemMessage(TextUtil.styled(
+                            "No transactions on this page.", ChatFormatting.GRAY));
+                        player.sendSystemMessage(TextUtil.styledBold(
+                            "===================================", ChatFormatting.GOLD));
+                        return;
+                    }
 
-                if (pageEntries.isEmpty()) {
-                    player.sendSystemMessage(TextUtil.styled(
-                        "No transactions on this page.", ChatFormatting.GRAY));
-                    return;
-                }
+                    for (TransactionLog.TransactionEntry entry : pageEntries) {
+                        Component message = formatTransactionEntry(entry);
+                        player.sendSystemMessage(message);
+                    }
 
-                for (TransactionLog.TransactionEntry entry : pageEntries) {
-                    Component message = formatTransactionEntry(entry);
-                    player.sendSystemMessage(message);
-                }
+                    // Footer with page info
+                    int totalPages = Math.max(1, (int) Math.ceil((double) totalCount / PAGE_SIZE));
+                    if (page < totalPages) {
+                        player.sendSystemMessage(
+                            TextUtil.styled("Page " + page + "/" + totalPages + " - ",
+                                ChatFormatting.GRAY)
+                                .append(TextUtil.styled("/transactions " + (page + 1), ChatFormatting.AQUA))
+                        );
+                    } else {
+                        player.sendSystemMessage(
+                            TextUtil.styled("Page " + page + "/" + totalPages + " (last page)",
+                                ChatFormatting.GRAY)
+                        );
+                    }
 
-                // Footer with page info
-                int totalPages = (int) Math.ceil((double) allEntries.size() / PAGE_SIZE);
-                if (page < totalPages) {
-                    player.sendSystemMessage(
-                        TextUtil.styled("Page " + page + "/" + totalPages + " - ",
-                            ChatFormatting.GRAY)
-                            .append(TextUtil.styled("/transactions " + (page + 1), ChatFormatting.AQUA))
-                    );
-                } else {
-                    player.sendSystemMessage(
-                        TextUtil.styled("Page " + page + "/" + totalPages + " (last page)",
-                            ChatFormatting.GRAY)
-                    );
-                }
-
-                player.sendSystemMessage(TextUtil.styledBold(
-                    "===================================", ChatFormatting.GOLD));
-            });
-        });
+                    player.sendSystemMessage(TextUtil.styledBold(
+                        "===================================", ChatFormatting.GOLD));
+                });
+            }));
     }
 
     private static Component formatTransactionEntry(TransactionLog.TransactionEntry entry) {

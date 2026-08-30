@@ -225,6 +225,63 @@ public class TransactionLog {
         }, asyncExecutor);
     }
 
+    /**
+     * Gets a page of transactions for a specific player, newest first.
+     * Pagination is pushed down to SQLite (LIMIT/OFFSET on the
+     * (player_uuid, timestamp DESC) index) instead of fetching the whole
+     * history and slicing in memory, so page N costs the same regardless of
+     * how large the ledger grows.
+     *
+     * @param playerUuid The player's UUID
+     * @param limit      Maximum number of entries to return (page size)
+     * @param offset     Number of newest entries to skip (0-based;
+     *                   (page - 1) * pageSize for /transactions)
+     * @return CompletableFuture with the page of TransactionEntry objects
+     */
+    public CompletableFuture<List<TransactionEntry>> getTransactions(UUID playerUuid, int limit, int offset) {
+        return CompletableFuture.supplyAsync(() -> {
+            List<TransactionEntry> entries = new ArrayList<>();
+            String sql = "SELECT * FROM transaction_log WHERE player_uuid = ? ORDER BY timestamp DESC LIMIT ? OFFSET ?";
+            try (PreparedStatement ps = persistentConnection.prepareStatement(sql)) {
+                ps.setString(1, playerUuid.toString());
+                ps.setInt(2, limit);
+                ps.setInt(3, Math.max(0, offset));
+                try (ResultSet rs = ps.executeQuery()) {
+                    while (rs.next()) {
+                        entries.add(mapResultSetToEntry(rs));
+                    }
+                }
+            } catch (SQLException e) {
+                LOGGER.error("Failed to get transaction page for player: {}", playerUuid, e);
+            }
+            return entries;
+        }, asyncExecutor);
+    }
+
+    /**
+     * Counts all transactions recorded for a specific player.
+     * Used by /transactions to compute total pages without fetching rows.
+     *
+     * @param playerUuid The player's UUID
+     * @return CompletableFuture with the total number of entries for the player
+     */
+    public CompletableFuture<Integer> countTransactions(UUID playerUuid) {
+        return CompletableFuture.supplyAsync(() -> {
+            String sql = "SELECT COUNT(*) FROM transaction_log WHERE player_uuid = ?";
+            try (PreparedStatement ps = persistentConnection.prepareStatement(sql)) {
+                ps.setString(1, playerUuid.toString());
+                try (ResultSet rs = ps.executeQuery()) {
+                    if (rs.next()) {
+                        return rs.getInt(1);
+                    }
+                }
+            } catch (SQLException e) {
+                LOGGER.error("Failed to count transactions for player: {}", playerUuid, e);
+            }
+            return 0;
+        }, asyncExecutor);
+    }
+
     // -- Offline Notification System -----------------------
 
     /**
