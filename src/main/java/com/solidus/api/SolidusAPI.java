@@ -226,13 +226,37 @@ public final class SolidusAPI {
     // -- Leaderboard -------------------------------------
 
     /**
-     * Gets the top N players by balance for leaderboard display.
+     * Gets the top N players by balance for leaderboard display (first page
+     * of {@link #getTopBalances(int, int)}).
      *
      * @param limit Maximum number of entries to return
      * @return CompletableFuture with list of BalanceEntry objects
      */
     public CompletableFuture<List<SQLiteStorage.BalanceEntry>> getTopBalances(int limit) {
         return engine.getBalanceManager().getTopBalances(limit);
+    }
+
+    /**
+     * Gets a page of the leaderboard with pagination pushed down to SQLite
+     * (LIMIT/OFFSET), so deep pages cost the same as page 1. Ranks are
+     * global and continue across pages (offset 10 starts at rank 11).
+     *
+     * @param limit  Maximum number of entries to return (page size)
+     * @param offset Number of higher-ranked entries to skip (0-based)
+     * @return CompletableFuture with list of BalanceEntry objects
+     */
+    public CompletableFuture<List<SQLiteStorage.BalanceEntry>> getTopBalances(int limit, int offset) {
+        return engine.getBalanceManager().getTopBalances(limit, offset);
+    }
+
+    /**
+     * Counts all registered economy entries (players with a balance row).
+     * Useful with paged {@code getTopBalances} to compute total page counts.
+     *
+     * @return CompletableFuture with the total number of balance entries
+     */
+    public CompletableFuture<Integer> getBalanceEntryCount() {
+        return engine.getBalanceManager().countBalanceEntries();
     }
 
     // -- Transaction Logging -----------------------------

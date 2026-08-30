@@ -171,7 +171,8 @@ A veto denial aborts the transaction cleanly — balances untouched, items stay 
 /shop                                    ← Open the server shop GUI
 /sell all                                ← Sell all sellable items in your inventory
 /ah sell 500                             ← List an item on the auction house
-/baltop                                  ← See the wealth leaderboard
+/baltop                                  ← See the wealth leaderboard (10 per page)
+/baltop 2                                ← Jump to leaderboard page 2
 ```
 
 ### Adding Ecosystem Modules
@@ -196,7 +197,7 @@ All modules auto-detect Solidus Core via reflection and activate automatically. 
 | `/balance` | Show balance |
 | `/pay <player> <amount>` | Transfer to online player |
 | `/pay offline <player> <amount>` | Transfer to offline player |
-| `/baltop` | Wealth leaderboard |
+| `/baltop [page]` | Wealth leaderboard, 10 per page (ranks continue across pages) |
 | `/shop` | Open shop |
 | `/shop search <query>` | Search shop items |
 | `/sell gui` | Open sell GUI (place items to sell) |

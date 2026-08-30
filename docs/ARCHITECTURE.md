@@ -445,7 +445,9 @@ In addition to the balance cache, `SQLiteStorage` maintains a `ConcurrentHashMap
 | `subtractBalance(UUID, String, double)` | Atomic check-and-deduct (TOCTOU-safe) | `CompletableFuture<Double>` |
 | `setBalance(UUID, String, double)` | Direct balance set (admin operation) | `CompletableFuture<Double>` |
 | `hasBalance(UUID, double)` | Checks cache for sufficient funds | `CompletableFuture<Boolean>` |
-| `getTopBalances(int)` | Queries SQLite for leaderboard | `CompletableFuture<List<BalanceEntry>>` |
+| `getTopBalances(int)` | Queries SQLite for leaderboard (first page) | `CompletableFuture<List<BalanceEntry>>` |
+| `getTopBalances(int, int)` | Paged leaderboard via SQL LIMIT/OFFSET on idx_balance_rank; ranks continue across pages | `CompletableFuture<List<BalanceEntry>>` |
+| `getBalanceEntryCount()` | Cheap COUNT(*) of economy entries for "Page X/Y" footers | `CompletableFuture<Integer>` |
 | `ensurePlayerExists(UUID, String)` | Creates player record if missing | `CompletableFuture<Void>` |
 
 #### The `subtractBalance` Atomic Guarantee
@@ -1266,7 +1268,7 @@ Layer 5: broadcastChanges()
 | `hasSufficientBalance(ServerPlayer, double)` | `CompletableFuture<Boolean>` | Check if player can afford |
 | `transfer(ServerPlayer, ServerPlayer, double)` | `CompletableFuture<TransferResult>` | Atomic online transfer |
 | `transferOffline(UUID, String, UUID, String, double)` | `CompletableFuture<TransferResult>` | Atomic offline transfer |
-| `getTopBalances(int)` | `CompletableFuture<List<BalanceEntry>>` | Leaderboard query |
+| `getTopBalances(int, int)` | `CompletableFuture<List<BalanceEntry>>` | Paged leaderboard query (offset 10 → ranks start at 11) |
 | `getTransactionLog()` | `TransactionLog` | Access to transaction logging |
 | `registerTransactionHook(hook)` | `boolean` | Register an economy transaction hook (false if name taken) |
 | `unregisterTransactionHook(hook)` | `boolean` | Remove a previously registered hook |

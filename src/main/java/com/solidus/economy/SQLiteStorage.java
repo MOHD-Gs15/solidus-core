@@ -252,7 +252,8 @@ public class SQLiteStorage {
     }
 
     /**
-     * Retrieves the top N players by balance for leaderboard display.
+     * Retrieves the top N players by balance for leaderboard display
+     * (first page of {@link #getTopBalances(int, int)}).
      *
      * Uses the SQLite idx_balance_rank index for efficient sorting
      * instead of sorting the entire in-memory cache. This scales
@@ -266,14 +267,36 @@ public class SQLiteStorage {
      * @return CompletableFuture containing list of BalanceEntry objects
      */
     public CompletableFuture<List<BalanceEntry>> getTopBalances(int limit) {
+        return getTopBalances(limit, 0);
+    }
+
+    /**
+     * Retrieves a page of the leaderboard with pagination pushed down to
+     * SQLite (LIMIT/OFFSET on the idx_balance_rank index), so fetching page
+     * 50 costs the same as page 1 no matter how many players are registered.
+     *
+     * <p>Ranks are global and continue across pages: with an offset of 10,
+     * the first returned entry is rank 11. A negative offset is clamped to 0,
+     * and an offset beyond the end simply returns an empty list.</p>
+     *
+     * Player names are resolved from the in-memory playerNameCache
+     * for instant lookup without additional DB queries.
+     *
+     * @param limit  Maximum number of entries to return (page size)
+     * @param offset Number of higher-ranked entries to skip (0-based)
+     * @return CompletableFuture containing list of BalanceEntry objects
+     */
+    public CompletableFuture<List<BalanceEntry>> getTopBalances(int limit, int offset) {
         return CompletableFuture.supplyAsync(() -> {
             ensureInitialized();
             List<BalanceEntry> entries = new ArrayList<>();
-            String sql = "SELECT uuid, player_name, balance FROM player_balances ORDER BY balance DESC LIMIT ?";
+            String sql = "SELECT uuid, player_name, balance FROM player_balances "
+                + "ORDER BY balance DESC LIMIT ? OFFSET ?";
             try (PreparedStatement ps = persistentConnection.prepareStatement(sql)) {
                 ps.setInt(1, limit);
+                ps.setInt(2, Math.max(0, offset));
                 try (ResultSet rs = ps.executeQuery()) {
-                    int rank = 0;
+                    int rank = Math.max(0, offset);
                     while (rs.next()) {
                         rank++;
                         String name = rs.getString("player_name");
@@ -287,18 +310,46 @@ public class SQLiteStorage {
                 }
             } catch (SQLException e) {
                 LOGGER.error("Failed to get top balances from database", e);
-                // Fallback to in-memory sort if DB query fails
+                // Fallback to in-memory sort if DB query fails (offset honored
+                // with skip so pages stay aligned even on the degraded path)
                 return balanceCache.entrySet().stream()
                     .sorted((a, b) -> Double.compare(b.getValue(), a.getValue()))
+                    .skip(Math.max(0, offset))
                     .limit(limit)
                     .collect(ArrayList<BalanceEntry>::new,
                         (list, entry) -> {
                             String name = playerNameCache.getOrDefault(entry.getKey(), "Unknown");
-                            list.add(new BalanceEntry(list.size() + 1, name, entry.getValue()));
+                            list.add(new BalanceEntry(Math.max(0, offset) + list.size() + 1, name, entry.getValue()));
                         },
                         ArrayList::addAll);
             }
             return entries;
+        }, asyncExecutor);
+    }
+
+    /**
+     * Counts all registered economy entries (players with a balance row).
+     *
+     * <p>Used together with {@link #getTopBalances(int, int)} to render
+     * "Page X/Y" footers without loading any player rows. Runs as a cheap
+     * COUNT(*) on player_balances, with the in-memory cache size as the
+     * fallback if the query fails.</p>
+     *
+     * @return CompletableFuture with the total number of balance entries
+     */
+    public CompletableFuture<Integer> getBalanceEntryCount() {
+        return CompletableFuture.supplyAsync(() -> {
+            ensureInitialized();
+            String sql = "SELECT COUNT(*) FROM player_balances";
+            try (Statement stmt = persistentConnection.createStatement();
+                 ResultSet rs = stmt.executeQuery(sql)) {
+                if (rs.next()) {
+                    return rs.getInt(1);
+                }
+            } catch (SQLException e) {
+                LOGGER.error("Failed to count balance entries from database", e);
+            }
+            return balanceCache.size();
         }, asyncExecutor);
     }
 

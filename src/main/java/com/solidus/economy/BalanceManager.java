@@ -277,13 +277,37 @@ public class BalanceManager {
     }
 
     /**
-     * Gets the top N balances for leaderboard display.
+     * Gets the top N balances for leaderboard display (first page of
+     * {@link #getTopBalances(int, int)}).
      *
      * @param limit Number of top entries to return
      * @return CompletableFuture with list of balance entries
      */
     public CompletableFuture<List<SQLiteStorage.BalanceEntry>> getTopBalances(int limit) {
         return storage.getTopBalances(limit);
+    }
+
+    /**
+     * Gets a page of the leaderboard with pagination pushed down to SQLite
+     * (LIMIT/OFFSET), so deep pages cost the same as page 1. Ranks are
+     * global and continue across pages (offset 10 starts at rank 11).
+     *
+     * @param limit  Number of entries to return (page size)
+     * @param offset Number of higher-ranked entries to skip (0-based)
+     * @return CompletableFuture with list of balance entries
+     */
+    public CompletableFuture<List<SQLiteStorage.BalanceEntry>> getTopBalances(int limit, int offset) {
+        return storage.getTopBalances(limit, offset);
+    }
+
+    /**
+     * Counts all registered economy entries (players with a balance row).
+     * Used with paged {@code getTopBalances} to compute "Page X/Y" footers.
+     *
+     * @return CompletableFuture with the total number of balance entries
+     */
+    public CompletableFuture<Integer> countBalanceEntries() {
+        return storage.getBalanceEntryCount();
     }
 
     /**
