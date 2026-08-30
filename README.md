@@ -132,6 +132,20 @@ Solidus provides a public API (`SolidusAPI`) for other Fabric mods to integrate 
 
 See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for full API reference, method signatures, and integration examples.
 
+### Transaction Hooks (new in 2.1.0)
+
+Solidus 2.1.0 adds a **transaction hook system** (`SolidusTransactionHook`) that lets companion mods intercept economy traffic at every money-movement point — the mechanism Solidus Governance uses to enforce daily limits, trading locks, frozen accounts, and transaction taxes:
+
+| Flow | Veto hook (before) | Notification hook (after) |
+|------|--------------------|---------------------------|
+| `/pay` + API transfers | `allowTransfer` | `afterTransfer` |
+| Auction listing | `allowAuctionListing` | `afterAuctionListing` |
+| Auction purchase | `allowAuctionPurchase` | `afterAuctionSale` |
+| Shop purchase | `allowShopPurchase` | `afterShopPurchase` |
+| Shop sell (GUI · `/sell all` · Sell GUI) | `allowShopSell` | `afterShopSell` |
+
+A veto denial aborts the transaction cleanly — balances untouched, items stay in hand, and the denial reason is shown to the player. Notifications fire only after the transaction has fully settled. Registration goes through `SolidusAPI.registerTransactionHook(hook)` (reflection-friendly; duplicate hook names are ignored), and the dispatch is **fail-open**: a hook that throws is logged and skipped for that transaction, so one misbehaving mod can never wedge the economy.
+
 ---
 
 ## Quick Start

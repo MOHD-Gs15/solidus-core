@@ -1,6 +1,8 @@
 package com.solidus.auction;
 
 import com.solidus.SolidusMod;
+import com.solidus.api.EconomyHooks;
+import com.solidus.api.SolidusTransactionHook;
 import com.solidus.economy.BalanceManager;
 import com.solidus.economy.EconomyEngine;
 import com.solidus.economy.TransactionLog;
@@ -214,6 +216,17 @@ public class AuctionManager {
             return;
         }
 
+        // Transaction hook veto (Solidus 2.1.0+): BEFORE the item leaves the
+        // player's hand and before any fee is charged. A denial here is a
+        // clean no-op - nothing has been touched yet.
+        SolidusTransactionHook.Decision hookDecision = EconomyHooks.allow(hook ->
+            hook.allowAuctionListing(playerId, player.getName().getString(), price));
+        if (!hookDecision.allowed()) {
+            pendingListings.remove(playerId);
+            player.sendSystemMessage(TextUtil.error(hookDecision.reason()));
+            return;
+        }
+
         // Capture item details NOW, and SECURITY FIX (TOCTOU item duplication):
         // previously the item stayed in the player's hand while the fee deduction
         // and the database save ran asynchronously - a cheat client could deposit,
@@ -272,6 +285,11 @@ public class AuctionManager {
                                     listingFee, materialName, quantity,
                                     "Listed " + quantity + "x " + materialName + " for " + CurrencyUtil.format(price)
                                 );
+
+                                // Hook notification (Solidus 2.1.0+): listing fully settled.
+                                EconomyHooks.notifyHooks(hook ->
+                                    hook.afterAuctionListing(player.getUUID(), player.getName().getString(),
+                                        price, listingFee));
 
                                 player.sendSystemMessage(
                                     TextUtil.success("Item listed on the Auction House for ")
@@ -372,6 +390,19 @@ public class AuctionManager {
                     return "OWN_ITEM";
                 }
 
+                // Transaction hook veto (Solidus 2.1.0+): runs on the auction
+                // executor BEFORE the listing is marked SOLD. A denial here
+                // leaves the listing untouched and fully buyable by others.
+                // (entry is reassigned above, so capture it into a final local
+                // for lambda use.)
+                final AuctionEntry vetoEntry = entry;
+                SolidusTransactionHook.Decision hookDecision = EconomyHooks.allow(hook ->
+                    hook.allowAuctionPurchase(buyer.getUUID(), buyer.getName().getString(), vetoEntry.price()));
+                if (!hookDecision.allowed()) {
+                    return "HOOK_VETOED:" + (hookDecision.reason() != null
+                        ? hookDecision.reason() : "Transaction denied.");
+                }
+
                 // Mark as SOLD IMMEDIATELY (single-threaded executor guarantees
                 // no other thread can interfere - this IS the atomic operation)
                 String updateSql = "UPDATE auction_listings SET status = 1 WHERE listing_id = ?";
@@ -391,6 +422,12 @@ public class AuctionManager {
             // Balance reads are instant (in-memory cache), no cross-executor blocking
             buyer.level().getServer().execute(() -> {
                 if (result instanceof String errorMsg) {
+                    if (errorMsg.startsWith("HOOK_VETOED:")) {
+                        // Denied by a transaction hook - the listing was never
+                        // marked SOLD, nothing to roll back.
+                        buyer.sendSystemMessage(TextUtil.error(errorMsg.substring("HOOK_VETOED:".length())));
+                        return;
+                    }
                     switch (errorMsg) {
                         case "SOLD_OUT" -> buyer.sendSystemMessage(
                             TextUtil.error("This item has already been sold!"));

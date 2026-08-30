@@ -1,6 +1,8 @@
 package com.solidus.sell;
 
 import com.solidus.SolidusMod;
+import com.solidus.api.EconomyHooks;
+import com.solidus.api.SolidusTransactionHook;
 import com.solidus.economy.BalanceManager;
 import com.solidus.economy.EconomyEngine;
 import com.solidus.economy.TransactionLog;
@@ -520,6 +522,24 @@ public class SellScreenHandler extends AbstractContainerMenu {
             setCarried(ItemStack.EMPTY);
         }
 
+        // Transaction hook veto (Solidus 2.1.0+): runs BEFORE anything is
+        // consumed. On denial, every placed item is handed straight back and
+        // no payout happens - the GUI simply acts as a return-to-sender.
+        SolidusTransactionHook.Decision hookDecision = EconomyHooks.allow(hook ->
+            hook.allowShopSell(this.player.getUUID(), this.player.getName().getString()));
+        if (!hookDecision.allowed()) {
+            for (int i = 9; i < 54; i++) {
+                ItemStack stack = sellContainer.getItem(i);
+                if (!stack.isEmpty()) {
+                    returnItemToPlayer(stack);
+                    sellContainer.setItem(i, ItemStack.EMPTY);
+                }
+            }
+            this.player.sendSystemMessage(TextUtil.error(hookDecision.reason()));
+            super.removed(player);
+            return;
+        }
+
         // Process all items in the input area (slots 9-53)
         double totalEarnings = 0.0;
         int totalItemsSold = 0;
@@ -628,6 +648,10 @@ public class SellScreenHandler extends AbstractContainerMenu {
                         finalTotalEarnings, "VARIOUS", finalTotalItemsSold,
                         "Sold " + finalTotalItemsSold + " items via sell GUI for " + CurrencyUtil.format(finalTotalEarnings)
                     );
+
+                    // Hook notification (Solidus 2.1.0+): sell GUI payout settled.
+                    EconomyHooks.notifyHooks(hook ->
+                        hook.afterShopSell(this.player.getUUID(), this.player.getName().getString(), finalTotalEarnings));
 
                     // Success notification
                     this.player.sendSystemMessage(

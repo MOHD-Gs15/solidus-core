@@ -1,7 +1,9 @@
 package com.solidus.commands;
 
+import com.solidus.api.EconomyHooks;
 import com.solidus.api.PermissionChecker;
 import com.solidus.api.SolidusPermissions;
+import com.solidus.api.SolidusTransactionHook;
 import com.solidus.sell.SellGUI;
 import com.solidus.sell.SellScreenHandler;
 import com.solidus.shop.ShopManager;
@@ -130,6 +132,16 @@ public class SellCommand {
         double totalEarnings = 0.0;
         int totalItemsSold = 0;
         List<String> soldItems = new ArrayList<>();
+
+        // Transaction hook veto (Solidus 2.1.0+): MUST run before the scan
+        // loop below - that loop removes items from the inventory as it goes,
+        // so a denial after it starts would strand already-sold items.
+        SolidusTransactionHook.Decision hookDecision = EconomyHooks.allow(hook ->
+            hook.allowShopSell(player.getUUID(), player.getName().getString()));
+        if (!hookDecision.allowed()) {
+            player.sendSystemMessage(TextUtil.error(hookDecision.reason()));
+            return;
+        }
 
         // Process regular inventory items
         // Minecraft inventory layout: slots 0-35 = main + hotbar, 36-39 = armor, 40 = offhand

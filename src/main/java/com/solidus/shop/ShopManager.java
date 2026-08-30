@@ -6,6 +6,8 @@ import com.google.gson.JsonParser;
 import com.mojang.serialization.DataResult;
 import com.mojang.serialization.JsonOps;
 import com.solidus.SolidusMod;
+import com.solidus.api.EconomyHooks;
+import com.solidus.api.SolidusTransactionHook;
 import com.solidus.auction.AuctionEntry;
 import com.solidus.economy.BalanceManager;
 import com.solidus.economy.EconomyEngine;
@@ -312,6 +314,17 @@ public class ShopManager {
 
         // Use double arithmetic to avoid integer overflow on large quantities
         double totalCost = CurrencyUtil.round(item.buyPrice() * (double) quantity);
+
+        // Transaction hook veto (Solidus 2.1.0+): cost is fully known, before
+        // any money moves. A denial here is a clean no-op.
+        SolidusTransactionHook.Decision hookDecision = EconomyHooks.allow(hook ->
+            hook.allowShopPurchase(playerId, player.getName().getString(), totalCost));
+        if (!hookDecision.allowed()) {
+            pendingBuys.remove(playerId);
+            player.sendSystemMessage(TextUtil.error(hookDecision.reason()));
+            return;
+        }
+
         BalanceManager balanceManager = economyEngine.getBalanceManager();
 
         // Atomic check-and-deduct: subtractBalance checks funds AND deducts
@@ -353,6 +366,10 @@ public class ShopManager {
                         totalCost, material, quantity,
                         "Bought " + quantity + "x " + material + " from shop"
                     );
+
+                    // Hook notification (Solidus 2.1.0+): purchase fully settled.
+                    EconomyHooks.notifyHooks(hook ->
+                        hook.afterShopPurchase(playerId, player.getName().getString(), totalCost));
 
                     // Success notification
                     player.sendSystemMessage(
@@ -412,6 +429,16 @@ public class ShopManager {
             return;
         }
 
+        // Transaction hook veto (Solidus 2.1.0+): BEFORE the items are removed
+        // from the inventory. A denial here is a clean no-op.
+        SolidusTransactionHook.Decision hookDecision = EconomyHooks.allow(hook ->
+            hook.allowShopSell(playerId, player.getName().getString()));
+        if (!hookDecision.allowed()) {
+            pendingSells.remove(playerId);
+            player.sendSystemMessage(TextUtil.error(hookDecision.reason()));
+            return;
+        }
+
         // SECURITY FIX (payout-before-removal TOCTOU): previously the balance
         // was credited FIRST and the items removed afterwards, so a player
         // could move/drop part of the stack during the async credit window and
@@ -456,6 +483,10 @@ public class ShopManager {
                         totalValue, material, removedCount,
                         "Sold " + removedCount + "x " + material + " to shop"
                     );
+
+                    // Hook notification (Solidus 2.1.0+): sell fully settled.
+                    EconomyHooks.notifyHooks(hook ->
+                        hook.afterShopSell(playerId, player.getName().getString(), totalValue));
 
                     player.sendSystemMessage(message.append(
                         TextUtil.styled(" | New balance: ", ChatFormatting.GRAY))
@@ -599,6 +630,12 @@ public class ShopManager {
                     totalEarnings, "VARIOUS", totalItemsSold,
                     "Sold " + totalItemsSold + " items via /sell all for " + CurrencyUtil.format(totalEarnings)
                 );
+
+                // Hook notification (Solidus 2.1.0+): sell-all payout settled.
+                // (The corresponding allowShopSell veto already ran in the
+                // /sell all command BEFORE any item was removed.)
+                EconomyHooks.notifyHooks(hook ->
+                    hook.afterShopSell(player.getUUID(), player.getName().getString(), totalEarnings));
 
                 // Success notification
                 player.sendSystemMessage(

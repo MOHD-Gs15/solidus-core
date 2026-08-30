@@ -1,5 +1,7 @@
 package com.solidus.economy;
 
+import com.solidus.api.EconomyHooks;
+import com.solidus.api.SolidusTransactionHook;
 import com.solidus.util.CurrencyUtil;
 
 import org.slf4j.Logger;
@@ -220,6 +222,20 @@ public class BalanceManager {
                 new TransferResult(false, "You cannot pay yourself.", 0, 0));
         }
 
+        // Transaction hook veto (Solidus 2.1.0+): companion mods (e.g. Solidus
+        // Governance) can enforce limits / trading locks / frozen accounts here.
+        // Runs synchronously on the caller thread - hooks are contracted to be
+        // fast, non-blocking, in-memory checks. First denial wins and its reason
+        // is surfaced to the player verbatim via the TransferResult message.
+        if (EconomyHooks.hasHooks()) {
+            SolidusTransactionHook.Decision decision = EconomyHooks.allow(hook ->
+                hook.allowTransfer(senderUuid, senderName, receiverUuid, receiverName, amount));
+            if (!decision.allowed()) {
+                return CompletableFuture.completedFuture(
+                    new TransferResult(false, decision.reason(), 0, 0));
+            }
+        }
+
         // Atomic transfer: deduct from sender, then add to receiver
         return storage.subtractBalance(senderUuid, senderName, amount)
             .thenCompose(newSenderBalance -> {
@@ -247,6 +263,13 @@ public class BalanceManager {
                                     return new TransferResult(false, "Transfer failed. Please try again.", 0, 0);
                                 });
                         }
+                        // Hook notifications (Solidus 2.1.0+): fired only after the
+                        // transfer has fully settled so observers (limit recording,
+                        // tax collection) always see committed state.
+                        EconomyHooks.notifyHooks(hook ->
+                            hook.afterTransfer(senderUuid, senderName,
+                                receiverUuid, receiverName, amount));
+
                         return CompletableFuture.completedFuture(
                             new TransferResult(true, "Transfer successful.", newSenderBalance, newReceiverBalance));
                     });

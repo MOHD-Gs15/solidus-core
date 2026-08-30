@@ -252,6 +252,47 @@ public final class SolidusAPI {
         return engine.getTransactionLog();
     }
 
+    // -- Transaction Hooks --------------------------------
+
+    /**
+     * Registers an economy transaction hook. Hooks can veto transactions
+     * before they happen (limits, trading locks, freezes) and observe them
+     * afterwards (recording, taxes, alerts).
+     *
+     * <p>Registration is idempotent by hook name: registering a second hook
+     * with the same {@link SolidusTransactionHook#name() name} is ignored
+     * and returns false.</p>
+     *
+     * @param hook The hook to register (must not be null)
+     * @return true if registered, false if a hook with the same name exists
+     * @since 2.1.0
+     */
+    public boolean registerTransactionHook(SolidusTransactionHook hook) {
+        return EconomyHooks.register(hook);
+    }
+
+    /**
+     * Unregisters a previously registered transaction hook.
+     *
+     * @param hook The hook instance to remove
+     * @return true if it was registered and is now removed
+     * @since 2.1.0
+     */
+    public boolean unregisterTransactionHook(SolidusTransactionHook hook) {
+        return EconomyHooks.unregister(hook);
+    }
+
+    /**
+     * Gets the number of currently registered transaction hooks.
+     * Intended for diagnostics/logging.
+     *
+     * @return the number of active hooks
+     * @since 2.1.0
+     */
+    public int getRegisteredHookCount() {
+        return EconomyHooks.registeredHooks().size();
+    }
+
     // -- Utility -----------------------------------------
 
     /**
