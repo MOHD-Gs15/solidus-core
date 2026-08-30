@@ -77,6 +77,12 @@ public final class SolidusPermissions {
     /** View transaction history - /transactions */
     public static final String TRANSACTIONS = "solidus.command.transactions";
 
+    /** Export own transaction history as CSV - /transactions export */
+    public static final String TRANSACTIONS_EXPORT = "solidus.command.transactions.export";
+
+    /** Export the full transaction ledger as CSV - /transactions exportall (OP 2+) */
+    public static final String TRANSACTIONS_EXPORT_ALL = "solidus.command.transactions.exportall";
+
     // ===========================================================
     //  ANALYTICS - Data Analytics Commands
     // ===========================================================
@@ -218,6 +224,7 @@ public final class SolidusPermissions {
         if (permission.startsWith("solidus.command.")) {
             // Admin-only sub-commands need a higher OP level
             if (permission.equals(SHOP_RELOAD)) return 2;
+            if (permission.equals(TRANSACTIONS_EXPORT_ALL)) return 2;
             return 0;
         }
 

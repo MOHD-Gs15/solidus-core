@@ -15,7 +15,16 @@ import net.minecraft.network.chat.Component;
 import net.minecraft.network.chat.MutableComponent;
 import net.minecraft.server.level.ServerPlayer;
 
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.time.Duration;
+import java.time.ZoneOffset;
+import java.time.format.DateTimeFormatter;
 import java.util.List;
+import java.util.concurrent.CompletableFuture;
 
 /**
  * /transactions command - View recent financial transaction history.
@@ -26,6 +35,11 @@ import java.util.List;
  * Displays 10 transactions per page for the player, showing type,
  * amount, counterpart, item details, and timestamp.
  *
+ * Export (2.1.0): /transactions export [days] writes the caller's own
+ * history to a CSV file under <server>/solidus/exports/ (default 7 days);
+ * /transactions exportall [days] (OP 2+) exports every player's ledger.
+ * The ledger is capped at TransactionLog.MAX_EXPORT_ROWS per export.
+ *
  * Performance: pagination is pushed down to SQLite (COUNT(*) for the page
  * footer + LIMIT/OFFSET for the rows themselves) so opening page 50 costs
  * the same as page 1 no matter how large the ledger grows.
@@ -33,7 +47,12 @@ import java.util.List;
  */
 public class TransactionsCommand {
 
+    private static final Logger LOGGER = LoggerFactory.getLogger(TransactionsCommand.class);
+
     private static final int PAGE_SIZE = 10;
+    private static final int DEFAULT_EXPORT_DAYS = 7;
+    private static final DateTimeFormatter EXPORT_STAMP =
+        DateTimeFormatter.ofPattern("yyyyMMdd_HHmmss");
 
     public static void register(CommandDispatcher<CommandSourceStack> dispatcher, EconomyEngine economyEngine) {
         dispatcher.register(Commands.literal("transactions")
@@ -50,6 +69,40 @@ public class TransactionsCommand {
                     executeTransactions(player, economyEngine, page);
                     return 1;
                 })
+            )
+            // /transactions export [days] - own history as CSV (all players)
+            .then(Commands.literal("export")
+                .requires(PermissionChecker.require(SolidusPermissions.TRANSACTIONS_EXPORT, 0))
+                .executes(context -> {
+                    ServerPlayer player = context.getSource().getPlayerOrException();
+                    executeExport(player, economyEngine, DEFAULT_EXPORT_DAYS, false);
+                    return 1;
+                })
+                .then(Commands.argument("days", com.mojang.brigadier.arguments.IntegerArgumentType.integer(1, 365))
+                    .executes(context -> {
+                        ServerPlayer player = context.getSource().getPlayerOrException();
+                        int days = com.mojang.brigadier.arguments.IntegerArgumentType.getInteger(context, "days");
+                        executeExport(player, economyEngine, days, false);
+                        return 1;
+                    })
+                )
+            )
+            // /transactions exportall [days] - full ledger as CSV (OP 2+)
+            .then(Commands.literal("exportall")
+                .requires(PermissionChecker.require(SolidusPermissions.TRANSACTIONS_EXPORT_ALL, 0))
+                .executes(context -> {
+                    ServerPlayer player = context.getSource().getPlayerOrException();
+                    executeExport(player, economyEngine, DEFAULT_EXPORT_DAYS, true);
+                    return 1;
+                })
+                .then(Commands.argument("days", com.mojang.brigadier.arguments.IntegerArgumentType.integer(1, 365))
+                    .executes(context -> {
+                        ServerPlayer player = context.getSource().getPlayerOrException();
+                        int days = com.mojang.brigadier.arguments.IntegerArgumentType.getInteger(context, "days");
+                        executeExport(player, economyEngine, days, true);
+                        return 1;
+                    })
+                )
             )
         );
     }
@@ -107,6 +160,71 @@ public class TransactionsCommand {
                         "===================================", ChatFormatting.GOLD));
                 });
             }));
+    }
+
+    private static void executeExport(ServerPlayer player, EconomyEngine economyEngine, int days, boolean allPlayers) {
+        TransactionLog transactionLog = economyEngine.getTransactionLog();
+        long sinceMs = System.currentTimeMillis() - Duration.ofDays(days).toMillis();
+
+        CompletableFuture<List<TransactionLog.TransactionEntry>> fetch = allPlayers
+            ? transactionLog.getAllTransactionsSince(sinceMs)
+            : transactionLog.getTransactionsSince(player.getUUID(), sinceMs);
+
+        // File IO runs on the common pool (never the DB executor, never the
+        // server thread); only the final message hops back via server.execute.
+        fetch.thenAcceptAsync(entries -> {
+            if (entries.isEmpty()) {
+                player.level().getServer().execute(() -> player.sendSystemMessage(
+                    TextUtil.styled("No transactions in the last " + days
+                        + " day(s) - nothing to export.", ChatFormatting.GRAY)));
+                return;
+            }
+            try {
+                Path dir = resolveExportDir();
+                String baseName = "transactions_export_" + (allPlayers ? "all_" : "")
+                    + EXPORT_STAMP.format(java.time.Instant.now().atZone(ZoneOffset.UTC));
+                Path file = nextAvailableFile(dir, baseName);
+                TransactionLog.writeCsvFile(entries, file);
+
+                long sizeKb = Math.max(1, Files.size(file) / 1024);
+                String scope = allPlayers ? "(all players) " : "";
+                player.level().getServer().execute(() -> player.sendSystemMessage(
+                    TextUtil.styled("Exported " + entries.size() + " transactions "
+                        + scope + "from the last " + days + " day(s) to ", ChatFormatting.GREEN)
+                        .append(TextUtil.styled("solidus/exports/" + file.getFileName(), ChatFormatting.AQUA))
+                        .append(TextUtil.styled(" (" + sizeKb + " KB)", ChatFormatting.GRAY))));
+            } catch (Exception e) {
+                LOGGER.error("CSV export failed for {}: allPlayers={}",
+                    player.getName().getString(), allPlayers, e);
+                player.level().getServer().execute(() -> player.sendSystemMessage(
+                    TextUtil.error("Export failed - check the server log for details.")));
+            }
+        });
+    }
+
+    /**
+     * Export directory: <game dir>/solidus/exports (game dir resolved the
+     * same way EconomyEngine resolves it - via FabricLoader's config dir).
+     * Falls back to a relative path if the loader is unavailable.
+     */
+    private static Path resolveExportDir() {
+        try {
+            return net.fabricmc.loader.api.FabricLoader.getInstance()
+                .getConfigDir().getParent().resolve("solidus").resolve("exports");
+        } catch (Throwable t) {
+            return java.nio.file.Paths.get("solidus", "exports");
+        }
+    }
+
+    /** Returns <base>.csv, or <base>_2.csv, <base>_3.csv, ... if taken. */
+    private static Path nextAvailableFile(Path dir, String baseName) {
+        Path file = dir.resolve(baseName + ".csv");
+        int n = 2;
+        while (Files.exists(file) && n < 100) {
+            file = dir.resolve(baseName + "_" + n + ".csv");
+            n++;
+        }
+        return file;
     }
 
     private static Component formatTransactionEntry(TransactionLog.TransactionEntry entry) {

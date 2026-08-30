@@ -5,14 +5,22 @@ import com.solidus.util.CurrencyUtil;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.io.IOException;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.sql.Connection;
 import java.sql.DriverManager;
 import java.sql.PreparedStatement;
 import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.sql.Statement;
+import java.time.Instant;
+import java.time.ZoneOffset;
+import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Locale;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutorService;
@@ -280,6 +288,157 @@ public class TransactionLog {
             }
             return 0;
         }, asyncExecutor);
+    }
+
+    /**
+     * Maximum number of rows a single export may return. Exports are rare,
+     * command-triggered operations, but the ledger grows for the life of the
+     * server - this cap keeps a runaway export from exhausting server memory.
+     * When the cap is hit, the newest rows win (ORDER BY timestamp DESC).
+     */
+    public static final int MAX_EXPORT_ROWS = 200_000;
+
+    /**
+     * Gets a player's transactions within a time window, newest first.
+     * Used by {@code /transactions export [days]} to hand players their own
+     * history as CSV. Uses the (player_uuid, timestamp DESC) index, so the
+     * window scan stays efficient even on a large ledger.
+     *
+     * @param playerUuid  The player's UUID
+     * @param sinceEpochMs Inclusive lower bound on row timestamps (millis)
+     * @return CompletableFuture with matching entries, newest first
+     */
+    public CompletableFuture<List<TransactionEntry>> getTransactionsSince(UUID playerUuid, long sinceEpochMs) {
+        return getTransactionsSince(playerUuid, sinceEpochMs, MAX_EXPORT_ROWS);
+    }
+
+    /** Windowed read with an explicit row cap (see {@link #MAX_EXPORT_ROWS}). */
+    public CompletableFuture<List<TransactionEntry>> getTransactionsSince(
+            UUID playerUuid, long sinceEpochMs, int maxRows) {
+        return CompletableFuture.supplyAsync(() -> {
+            List<TransactionEntry> entries = new ArrayList<>();
+            String sql = "SELECT * FROM transaction_log "
+                + "WHERE player_uuid = ? AND timestamp >= ? "
+                + "ORDER BY timestamp DESC LIMIT ?";
+            try (PreparedStatement ps = persistentConnection.prepareStatement(sql)) {
+                ps.setString(1, playerUuid.toString());
+                ps.setLong(2, sinceEpochMs);
+                ps.setInt(3, Math.max(0, maxRows));
+                try (ResultSet rs = ps.executeQuery()) {
+                    while (rs.next()) {
+                        entries.add(mapResultSetToEntry(rs));
+                    }
+                }
+            } catch (SQLException e) {
+                LOGGER.error("Failed to get transactions since {} for player: {}", sinceEpochMs, playerUuid, e);
+            }
+            return entries;
+        }, asyncExecutor);
+    }
+
+    /**
+     * Gets ALL players' transactions within a time window, newest first.
+     * Used by the admin-only {@code /transactions exportall [days]} - the
+     * full-ledger counterpart of {@link #getTransactionsSince(UUID, long)}.
+     * Capped at {@link #MAX_EXPORT_ROWS} (newest rows win).
+     *
+     * @param sinceEpochMs Inclusive lower bound on row timestamps (millis)
+     * @return CompletableFuture with matching entries across all players
+     */
+    public CompletableFuture<List<TransactionEntry>> getAllTransactionsSince(long sinceEpochMs) {
+        return getAllTransactionsSince(sinceEpochMs, MAX_EXPORT_ROWS);
+    }
+
+    /** Windowed all-players read with an explicit row cap. */
+    public CompletableFuture<List<TransactionEntry>> getAllTransactionsSince(long sinceEpochMs, int maxRows) {
+        return CompletableFuture.supplyAsync(() -> {
+            List<TransactionEntry> entries = new ArrayList<>();
+            String sql = "SELECT * FROM transaction_log "
+                + "WHERE timestamp >= ? "
+                + "ORDER BY timestamp DESC LIMIT ?";
+            try (PreparedStatement ps = persistentConnection.prepareStatement(sql)) {
+                ps.setLong(1, sinceEpochMs);
+                ps.setInt(2, Math.max(0, maxRows));
+                try (ResultSet rs = ps.executeQuery()) {
+                    while (rs.next()) {
+                        entries.add(mapResultSetToEntry(rs));
+                    }
+                }
+            } catch (SQLException e) {
+                LOGGER.error("Failed to get all transactions since {}", sinceEpochMs, e);
+            }
+            return entries;
+        }, asyncExecutor);
+    }
+
+    // -- CSV Export ----------------------------------------
+
+    private static final String CSV_HEADER =
+        "timestamp_ms,timestamp_utc,type,player_uuid,player_name,"
+        + "target_uuid,target_name,amount,item_material,item_quantity,description";
+
+    private static final DateTimeFormatter CSV_UTC_FORMAT =
+        DateTimeFormatter.ofPattern("yyyy-MM-dd'T'HH:mm:ss'Z'").withZone(ZoneOffset.UTC);
+
+    /**
+     * Builds a RFC 4180-style CSV document from transaction entries.
+     *
+     * <p>Columns: timestamp_ms (sortable epoch), timestamp_utc (ISO-8601 UTC,
+     * human-readable), type, player_uuid, player_name, target_uuid,
+     * target_name, amount (2 decimals, Locale.ROOT), item_material,
+     * item_quantity, description. Fields containing commas, quotes, or line
+     * breaks are quoted with doubled inner quotes; null fields export empty.</p>
+     *
+     * @param entries The entries to serialize (already ordered by the caller)
+     * @return The full CSV document as a string (header always present)
+     */
+    public static String buildCsv(List<TransactionEntry> entries) {
+        StringBuilder sb = new StringBuilder(CSV_HEADER).append('\n');
+        for (TransactionEntry e : entries) {
+            sb.append(e.timestamp()).append(',')
+                .append(CSV_UTC_FORMAT.format(Instant.ofEpochMilli(e.timestamp()))).append(',')
+                .append(e.type().code()).append(',')
+                .append(e.playerUuid()).append(',')
+                .append(csvEscape(e.playerName())).append(',')
+                .append(e.targetUuid() != null ? e.targetUuid().toString() : "").append(',')
+                .append(csvEscape(e.targetName())).append(',')
+                .append(String.format(Locale.ROOT, "%.2f", e.amount())).append(',')
+                .append(csvEscape(e.itemMaterial())).append(',')
+                .append(e.itemQuantity()).append(',')
+                .append(csvEscape(e.description())).append('\n');
+        }
+        return sb.toString();
+    }
+
+    /**
+     * Writes {@link #buildCsv(List)} to a file as UTF-8, creating parent
+     * directories as needed.
+     *
+     * @param entries The entries to serialize
+     * @param file    The target file (parent dirs created if missing)
+     * @throws IOException if directories cannot be created or the file
+     *                     cannot be written
+     */
+    public static void writeCsvFile(List<TransactionEntry> entries, Path file) throws IOException {
+        if (file.getParent() != null) {
+            Files.createDirectories(file.getParent());
+        }
+        Files.writeString(file, buildCsv(entries), StandardCharsets.UTF_8);
+    }
+
+    /**
+     * RFC 4180 field escaping: quotes a field when it contains a comma,
+     * quote, CR, or LF, and doubles any inner quotes. Null becomes empty.
+     * Package-private so the export behavior is directly unit-testable.
+     */
+    static String csvEscape(String field) {
+        if (field == null) return "";
+        boolean needsQuoting = field.indexOf(',') >= 0
+            || field.indexOf('"') >= 0
+            || field.indexOf('\n') >= 0
+            || field.indexOf('\r') >= 0;
+        if (!needsQuoting) return field;
+        return '"' + field.replace("\"", "\"\"") + '"';
     }
 
     // -- Offline Notification System -----------------------

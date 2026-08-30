@@ -295,7 +295,7 @@ com.solidus
 │   ├── ShopCommand.java          // /shop, /shop search
 │   ├── SellCommand.java          // /sell gui, /sell all
 │   ├── AuctionCommand.java       // /ah, /ah sell/collect/cancel/sort
-│   └── TransactionsCommand.java  // /transactions [page]
+│   └── TransactionsCommand.java  // /transactions [page] [export [days] | exportall [days]]
 ├── economy/                      // Core economy engine
 │   ├── EconomyEngine.java        // Central coordinator
 │   ├── SQLiteStorage.java        // Async persistent backend
@@ -565,6 +565,19 @@ The `TransactionLog` serves two purposes:
 ```
 
 `CopyOnWriteArrayList` is chosen for thread safety: multiple threads may add notifications concurrently, while the rare read operation (delivery) gets a consistent snapshot.
+
+#### CSV Export (`/transactions export`)
+
+Solidus 2.1.0 adds windowed reads plus CSV serialization for server bookkeeping:
+
+| Method | SQL | Row cap |
+|--------|-----|---------|
+| `getTransactionsSince(uuid, sinceMs)` | `WHERE player_uuid = ? AND timestamp >= ?` on the (player_uuid, timestamp DESC) index | `MAX_EXPORT_ROWS` (200,000, newest win) |
+| `getAllTransactionsSince(sinceMs)` | `WHERE timestamp >= ?` (admin full-ledger path) | same cap |
+
+- `buildCsv(entries)` / `writeCsvFile(entries, path)` emit RFC 4180-style CSV with 11 columns: `timestamp_ms` (sortable epoch), `timestamp_utc` (ISO-8601 UTC), `type`, `player_uuid`, `player_name`, `target_uuid`, `target_name`, `amount` (2 decimals, `Locale.ROOT`), `item_material`, `item_quantity`, `description`. Fields containing commas, quotes, or line breaks are quoted with doubled inner quotes; null fields export empty.
+- Files land in `<game dir>/solidus/exports/transactions_export_[all_]<yyyyMMdd_HHmmss>.csv`, suffixed `_2`, `_3`, ... on collision. File IO runs on the common pool - never the DB executor and never the server thread; only the completion message hops back via `server.execute`.
+- Permission model: `/transactions export [days]` exports the caller's own history (OP 0, default 7 days, max 365); `/transactions exportall [days]` exports every player's ledger (OP 2+).
 
 ---
 
@@ -1716,6 +1729,8 @@ solidus_auctions.db      // SQLite auction database (server root)
 | `/ah cancel <uuid>` | `solidus.core.auction.cancel` | Cancel a listing |
 | `/ah sort <order>` | `solidus.core.auction.sort` | Sort listings |
 | `/transactions [page]` | `solidus.core.balance.view` | View transaction history |
+| `/transactions export [days]` | `solidus.command.transactions.export` (OP 0) | Export own history to CSV (default 7 days) |
+| `/transactions exportall [days]` | `solidus.command.transactions.exportall` (OP 2+) | Export the full ledger to CSV |
 
 ---
 

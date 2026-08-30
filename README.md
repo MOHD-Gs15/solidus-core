@@ -77,7 +77,7 @@ A lightweight virtual economy designed for multiplayer survival servers. All ope
 * Configurable starting balance
 * Secure player transfers (`/pay`) — online and offline, validated server-side
 * Global wealth leaderboard (`/baltop`)
-* Full transaction history (`/transactions`) with pagination
+* Full transaction history (`/transactions`) with pagination + CSV export
 * Offline notifications on login — players see missed payments
 * Currency symbol: `S$` (configurable)
 
@@ -208,7 +208,9 @@ All modules auto-detect Solidus Core via reflection and activate automatically. 
 | `/ah collect` | Reclaim expired items |
 | `/ah cancel <uuid>` | Cancel own listing |
 | `/ah sort <criteria>` | Sort listings (price/newest/material) |
-| `/transactions [page]` | Transaction history |
+| `/transactions [page]` | Transaction history (10 per page) |
+| `/transactions export [days]` | Export your own history to CSV (default 7 days) |
+| `/transactions exportall [days]` | Export the full ledger to CSV (OP 2+) |
 
 ---
 
