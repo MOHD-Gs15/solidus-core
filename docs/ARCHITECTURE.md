@@ -32,7 +32,7 @@
     - 10.1 [ServerPlayerEntityMixin — Packet Interception](#101-serverplayerentitymixin--packet-interception)
     - 10.2 [ScreenHandlerMixin — Safety Net](#102-screenhandlermixin--safety-net)
     - 10.3 [PacketHandler — Click Routing Gateway](#103-packethandler--click-routing-gateway)
-    - 10.4 [RateLimiter — 150ms Click Cooldown](#104-ratelimiter--150ms-click-cooldown)
+    - 10.4 [RateLimiter — Click & Transfer Cooldowns](#104-ratelimiter--click--transfer-cooldowns)
 11. [Cross-Cutting: Permission System](#11-cross-cutting-permission-system)
     - 11.1 [SolidusPermissions — Permission Node Registry](#111-soliduspermissions--permission-node-registry)
     - 11.2 [PermissionChecker — Unified Checking with LuckPerms](#112-permissionchecker--unified-checking-with-luckperms)
@@ -45,6 +45,7 @@
     - 13.2 [Reflection-Based Integration (Zero Dependency)](#132-reflection-based-integration-zero-dependency)
     - 13.3 [Compile-Time Integration](#133-compile-time-integration)
     - 13.4 [SolidusIntegration — Reference Implementation](#134-solidusintegration--reference-implementation)
+    - 13.5 [SolidusTransactionHook — Economy Interception Hooks](#135-solidustransactionhook--economy-interception-hooks)
 14. [Thread Safety Model](#14-thread-safety-model)
 15. [Database Schema](#15-database-schema)
 16. [Configuration System](#16-configuration-system)
@@ -1055,32 +1056,37 @@ Incoming Click
 
 The handler also manages cleanup when players disconnect, removing rate limit entries and any pending state.
 
-### 10.4 RateLimiter — 150ms Click Cooldown
+### 10.4 RateLimiter — Click & Transfer Cooldowns
 
 **File**: `com.solidus.networking.RateLimiter`
 
-A per-player click cooldown prevents automated click spam (e.g., from auto-clicker mods or macros):
+A per-player cooldown system with **two independent buckets** — a GUI click never consumes a transfer slot and vice versa:
+
+| Bucket | Constant | Interval | Guarded path |
+|--------|----------|----------|--------------|
+| Clicks | `MIN_CLICK_INTERVAL_MS` | 150ms | Container click packets (shop/auction GUIs) — silently dropped |
+| Transfers | `MIN_PAY_INTERVAL_MS` | 1,000ms | `/pay` (online + offline) — friendly wait message with remaining seconds |
+
+Both buckets share one atomic acquire primitive:
 
 ```java
-public boolean tryConsume(UUID playerUuid) {
-    long now = System.currentTimeMillis();
-    AtomicBoolean allowed = new AtomicBoolean(false);
-
-    rateLimitMap.compute(playerUuid, (uuid, lastClick) -> {
-        if (lastClick == null || (now - lastClick) >= COOLDOWN_MS) {
-            allowed.set(true);
-            return now;
-        }
-        return lastClick;  // Reject — too soon
+private boolean tryAcquire(ConcurrentHashMap<UUID, Long> timestamps,
+                           UUID playerUuid, long minIntervalMs) {
+    // ...
+    timestamps.compute(playerUuid, (uuid, last) -> {
+        if (last == null)          { allowed[0] = true;  return now; }   // first action
+        if (now - last < interval) { allowed[0] = false; return last; }  // too soon — keep old stamp
+        allowed[0] = true;         return now;                           // allowed — refresh stamp
     });
-
-    return allowed.get();
+    return allowed[0];
 }
 ```
 
-The `compute()` method is atomic — it guarantees that the check and update happen as a single operation, preventing race conditions where two simultaneous clicks both pass the check.
+The `compute()` method is atomic — it guarantees that the check and update happen as a single operation, preventing race conditions where two simultaneous clicks (or payment macros) both pass the check.
 
-**Stale Entry Cleanup**: A periodic cleanup removes entries older than 5 minutes, preventing memory leaks from players who disconnect without triggering the cleanup event.
+The transfer bucket exists because each `/pay` writes two ledger rows, sends two messages and invokes registered hooks — a command macro flooding `/pay` would pollute the audit trail and press SQLite even from an unmodified client.
+
+**Stale Entry Cleanup**: A periodic cleanup removes entries older than 5 minutes from both buckets, preventing memory leaks from players who disconnect without triggering the cleanup event. `removePlayer()` (on disconnect) and `clear()` (on shutdown) sweep both buckets.
 
 ---
 
@@ -1262,6 +1268,9 @@ Layer 5: broadcastChanges()
 | `transferOffline(UUID, String, UUID, String, double)` | `CompletableFuture<TransferResult>` | Atomic offline transfer |
 | `getTopBalances(int)` | `CompletableFuture<List<BalanceEntry>>` | Leaderboard query |
 | `getTransactionLog()` | `TransactionLog` | Access to transaction logging |
+| `registerTransactionHook(hook)` | `boolean` | Register an economy transaction hook (false if name taken) |
+| `unregisterTransactionHook(hook)` | `boolean` | Remove a previously registered hook |
+| `getRegisteredHookCount()` | `int` | Number of active hooks (diagnostics) |
 | `isAvailable()` | `boolean` | Check if API is initialized |
 
 #### Thread Safety
@@ -1379,6 +1388,85 @@ Solidus ships with a complete reference implementation showing how an external m
 - `applyDeathPenalty()` — Deducts a percentage of the victim's balance and gives it to the killer
 - `applyRefundWithSafety()` — Deducts with a refund safety check (if deduction fails, don't proceed)
 - Custom transaction logging — Shows how external mods can add their own transaction types to the audit trail
+
+### 13.5 SolidusTransactionHook — Economy Interception Hooks (new in 2.1.0)
+
+**Files**: `com.solidus.api.SolidusTransactionHook` (interface) · `com.solidus.api.EconomyHooks` (registry, internal) · `com.solidus.api.SolidusAPI` (registration)
+
+Companion mods can intercept **every money-movement point** in Solidus — before it happens (veto) and after it settles (notification) — without forking or patching Core. This is the mechanism Solidus Governance uses to enforce transfer limits, trading locks, account freezes and taxes.
+
+#### Hooked Transaction Points
+
+| Flow | Veto hook (pre-transaction) | Notification hook (post-settlement) |
+|------|-----------------------------|--------------------------------------|
+| `/pay` + API transfers (online + offline) | `allowTransfer(sender, receiver, amount)` | `afterTransfer(sender, receiver, amount)` |
+| Auction listing creation | `allowAuctionListing(seller, price)` | `afterAuctionListing(seller, price, fee)` |
+| Auction purchase | `allowAuctionPurchase(buyer, price)` | `afterAuctionSale(seller, buyer, price)` |
+| Shop purchase (GUI) | `allowShopPurchase(player, cost)` | `afterShopPurchase(player, cost)` |
+| Shop sell (GUI, `/sell all`, Sell GUI close) | `allowShopSell(player)` | `afterShopSell(player, payout)` |
+
+Veto hooks run **before any money or item moves** — a denial aborts the transaction cleanly: balances untouched, items stay where they are, and the player sees the hook's denial reason verbatim. Notification hooks run **after full settlement** and are intended for limit recording, tax collection, statistics and alerts. Batch sell flows pass no amount to the veto (the exact payout is not known yet) — use `afterShopSell` to observe the actual payout.
+
+#### Dispatch Rules (`EconomyHooks`)
+
+| Rule | Behavior |
+|------|----------|
+| First denial wins | The first veto denial is returned; its reason is surfaced to the player |
+| Reason normalization | A denial with a null/blank reason gets the generic fallback message |
+| Fail-open | A hook that throws is logged and skipped — it can never wedge the economy |
+| Duplicate protection | Registration rejects a second hook with the same `name()` |
+| Thread safety | `CopyOnWriteArrayList` registry — hooks may register/unregister while transactions flow |
+
+#### Threading Contract
+
+- **Veto hooks** run synchronously on the caller's thread (server tick thread, or the auction executor for purchases). They must be fast, non-blocking, in-memory checks. They must **not** synchronously call back into Solidus balance APIs — that queues work on the economy executor and risks deadlock.
+- **Notification hooks** run after settlement and may dispatch async work (e.g., chain `SolidusAPI` futures) but must never block the calling thread.
+
+#### Compile-Time Usage Example
+
+All interface methods are `default`, so a hook implements only what it needs — `name()` is the only abstract method. The `Decision` record provides `Decision.ALLOW` and `Decision.deny(String reason)`:
+
+```java
+public class MyTransferGuard implements SolidusTransactionHook {
+    @Override public String name() { return "my-transfer-guard"; }
+
+    @Override
+    public Decision allowTransfer(UUID sender, String senderName,
+                                  UUID receiver, String receiverName,
+                                  double amount) {
+        return amount >= 1_000_000
+            ? Decision.deny("Transfers over S$1,000,000 require staff approval.")
+            : Decision.ALLOW;
+    }
+
+    @Override
+    public void afterTransfer(UUID sender, String senderName,
+                              UUID receiver, String receiverName,
+                              double amount) {
+        stats.record(sender, receiver, amount);  // async-safe, never block
+    }
+}
+
+SolidusAPI.getInstance().registerTransactionHook(new MyTransferGuard());
+```
+
+#### Reflection-Based Registration (Zero Dependency)
+
+```java
+Class<?> hookItf = Class.forName("com.solidus.api.SolidusTransactionHook");
+Object proxy = Proxy.newProxyInstance(hookItf.getClassLoader(),
+        new Class<?>[]{ hookItf }, myInvocationHandler);  // fall back to generic defaults:
+                                                          // ALLOW / no-op / 0.0
+Class<?> apiClass = Class.forName("com.solidus.api.SolidusAPI");
+Object api = apiClass.getMethod("getInstance").invoke(null);
+apiClass.getMethod("registerTransactionHook", hookItf).invoke(api, proxy);
+```
+
+`Decision.ALLOW` is a static field on the nested `Decision` class (`SolidusTransactionHook$Decision`); a denial is built by invoking `deny` with the reason string. Call `unregisterTransactionHook` (or the reflected equivalent) on your mod's `SERVER_STOPPING` to release the hook.
+
+#### Reference Consumer
+
+Solidus Governance (1.2.0+) registers `CoreHookBridge` through exactly this contract: `allowTransfer` enforces daily transfer limits + trading lock + account freezes; `afterTransfer` / `afterAuctionSale` / `afterShopPurchase` collect configured taxes into the treasury account; listing/purchase vetoes enforce auction limits.
 
 ---
 
@@ -1670,6 +1758,7 @@ The `.github/workflows/test.yml` runs:
 | Offline balance | `SolidusAPI.getInstance().getBalanceOffline/addBalanceOffline/subtractBalanceOffline` | Offline rewards, scheduled payments |
 | Atomic transfers | `SolidusAPI.getInstance().transfer/transferOffline` | Peer-to-peer trades, tax collection |
 | Transaction logging | `SolidusAPI.getInstance().getTransactionLog()` | Audit trail integration, custom transaction types |
+| Transaction hooks (veto + notify) | `SolidusAPI.getInstance().registerTransactionHook(...)` — see [13.5](#135-solidustransactionhook--economy-interception-hooks) | Transfer limits, taxes, freezes, trading locks, alerts |
 | Permission checking | `PermissionChecker.require(node, defaultOpLevel)` | Custom command permissions |
 
 ### For GUI Extension Mods
