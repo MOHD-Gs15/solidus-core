@@ -1,6 +1,55 @@
+
 plugins {
     id 'java'
+    id 'jacoco'
+    id 'com.github.spotbugs' version '6.1.7'
     id 'net.fabricmc.fabric-loom' version "${loom_version}"
+}
+
+// ----------------------------------------------------------
+// Static analysis & coverage (Phase 1 tooling, audit follow-up)
+// - SpotBugs analyzes main+test sources; runs non-blocking on CI until
+//   Java 25 class-file support is confirmed, then flip ignoreFailures.
+// - Coverage is OPT-IN via the testWithCoverage task: the default `test`
+//   task stays agent-free so a JaCoCo/Java-25 compatibility issue can
+//   never break ordinary CI runs.
+// ----------------------------------------------------------
+jacoco {
+    toolVersion = '0.8.14'
+}
+
+spotbugs {
+    ignoreFailures = true   // non-blocking during the Java 25 toolchain shakeout
+}
+
+tasks.withType(com.github.spotbugs.snom.SpotBugsTask).configureEach {
+    reports {
+        html.required = true
+        xml.required = true
+    }
+}
+
+tasks.named('test') {
+    jacoco {
+        enabled = false   // keep the default test run fast and agent-free
+    }
+}
+
+tasks.register('testWithCoverage', Test) {
+    group = 'verification'
+    description = 'Runs tests with the JaCoCo agent and generates the coverage report.'
+    testClassesDirs = sourceSets.test.output.classesDirs
+    classpath = sourceSets.test.runtimeClasspath
+    finalizedBy tasks.jacocoTestReport
+}
+
+tasks.named('jacocoTestReport') {
+    dependsOn tasks.testWithCoverage
+    executionData tasks.testWithCoverage
+    reports {
+        xml.required = true
+        html.required = true
+    }
 }
 
 // ----------------------------------------------------------
@@ -75,7 +124,7 @@ dependencies {
     testRuntimeOnly "org.slf4j:slf4j-simple:2.0.12"
 }
 
-test {
+tasks.withType(Test).configureEach {
     useJUnitPlatform()
     testLogging {
         events "passed", "skipped", "failed"
