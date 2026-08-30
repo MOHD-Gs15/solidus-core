@@ -110,7 +110,7 @@ dependencies {
     implementation "net.fabricmc.fabric-api:fabric-api:${project.fabric_api_version}"
 
     // Standard dependencies
-    implementation "com.google.code.gson:gson:2.12.1"
+    implementation "com.google.code.gson:gson:2.14.0"
     implementation "org.xerial:sqlite-jdbc:3.47.2.0"
 
     // Include sqlite-jdbc in the final JAR for server-side database access
