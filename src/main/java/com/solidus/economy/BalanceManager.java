@@ -186,15 +186,19 @@ public class BalanceManager {
      * Neither player needs to be online. This is an atomic operation:
      * either both sides succeed or neither does.
      *
-     * <p>If the deduction from the sender fails (insufficient funds),
-     * the receiver's balance is not modified. If the addition to the
-     * receiver fails after deduction, the sender is refunded.</p>
+     * <p>Both legs (deduct from sender, credit receiver) execute inside ONE
+     * SQLite transaction via {@link SQLiteStorage#transferAtomic}. A crash or
+     * persistence failure between the legs can no longer leave money deducted
+     * without arriving - the database either holds both updates or neither.
+     * There is no manual refund path anymore because there is no window
+     * between the deduct and the credit.</p>
      *
      * Anti-Exploit Protections:
      * - Negative amount rejection
      * - Zero amount rejection
      * - Self-transfer rejection
-     * - Insufficient funds check (atomic deduct-then-add)
+     * - Insufficient funds check (inside the same transaction)
+     * - Receiver balance cap enforcement (inside the same transaction)
      * - Maximum transaction cap enforcement
      *
      * @param senderUuid   The sender's UUID
@@ -236,43 +240,30 @@ public class BalanceManager {
             }
         }
 
-        // Atomic transfer: deduct from sender, then add to receiver
-        return storage.subtractBalance(senderUuid, senderName, amount)
-            .thenCompose(newSenderBalance -> {
-                if (newSenderBalance < 0) {
-                    // Insufficient funds - nothing was deducted
-                    return CompletableFuture.completedFuture(
-                        new TransferResult(false, "Insufficient funds.", 0, 0));
+        // Atomic transfer: deduct from sender and credit the receiver inside
+        // ONE SQLite transaction (BEGIN IMMEDIATE ... COMMIT).
+        return storage.transferAtomic(senderUuid, senderName, receiverUuid, receiverName, amount)
+            .thenApply(outcome -> switch (outcome.status()) {
+                case SUCCESS -> {
+                    // Hook notifications (Solidus 2.1.0+): fired only after the
+                    // transfer has fully settled so observers (limit recording,
+                    // tax collection) always see committed state.
+                    EconomyHooks.notifyHooks(hook ->
+                        hook.afterTransfer(senderUuid, senderName,
+                            receiverUuid, receiverName, amount));
+                    yield new TransferResult(true, "Transfer successful.",
+                        outcome.senderNewBalance(), outcome.receiverNewBalance());
                 }
-                // Deduction succeeded, now add to receiver
-                return storage.addBalance(receiverUuid, receiverName, amount)
-                    .thenCompose(newReceiverBalance -> {
-                        if (newReceiverBalance < 0) {
-                            // CRITICAL: Addition failed after deduction - must verify refund succeeds
-                            LOGGER.error(
-                                "CRITICAL: Transfer add failed after deduct! Refunding sender. Sender: {}, Receiver: {}, Amount: {}",
-                                senderName, receiverName, amount);
-                            // Chain the refund and verify it succeeds - this is NOT fire-and-forget
-                            return storage.addBalance(senderUuid, senderName, amount)
-                                .thenApply(refundResult -> {
-                                    if (refundResult < 0) {
-                                        LOGGER.error(
-                                            "CATASTROPHIC: Refund also failed after transfer deduct! Sender: {}, Amount: {}. MANUAL INTERVENTION REQUIRED.",
-                                            senderName, amount);
-                                    }
-                                    return new TransferResult(false, "Transfer failed. Please try again.", 0, 0);
-                                });
-                        }
-                        // Hook notifications (Solidus 2.1.0+): fired only after the
-                        // transfer has fully settled so observers (limit recording,
-                        // tax collection) always see committed state.
-                        EconomyHooks.notifyHooks(hook ->
-                            hook.afterTransfer(senderUuid, senderName,
-                                receiverUuid, receiverName, amount));
-
-                        return CompletableFuture.completedFuture(
-                            new TransferResult(true, "Transfer successful.", newSenderBalance, newReceiverBalance));
-                    });
+                case INSUFFICIENT_FUNDS ->
+                    // Nothing was moved - the transaction rolled back.
+                    new TransferResult(false, "Insufficient funds.", 0, 0);
+                case RECEIVER_OVERFLOW ->
+                    // Nothing was moved - the transaction rolled back.
+                    new TransferResult(false, "Transfer failed: receiver balance limit exceeded.", 0, 0);
+                case PERSIST_ERROR ->
+                    // Nothing was moved - the transaction rolled back and the
+                    // cache was left untouched.
+                    new TransferResult(false, "Transfer failed. Please try again.", 0, 0);
             });
     }
 

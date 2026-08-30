@@ -453,6 +453,202 @@ public class SQLiteStorage {
         }, asyncExecutor);
     }
 
+    // -- Atomic Transfers ---------------------------------
+
+    /** Outcome status of an atomic {@link #transferAtomic} attempt. */
+    public enum TransferStatus {
+        /** Both legs settled and committed. */
+        SUCCESS,
+        /** Sender had insufficient funds - nothing was moved. */
+        INSUFFICIENT_FUNDS,
+        /** Crediting the receiver would break the balance cap - nothing was moved. */
+        RECEIVER_OVERFLOW,
+        /** Database error - nothing was moved (transaction rolled back). */
+        PERSIST_ERROR
+    }
+
+    /**
+     * Immutable result of an atomic transfer.
+     *
+     * @param status             outcome status
+     * @param senderNewBalance   sender balance after a successful transfer (0 on failure)
+     * @param receiverNewBalance receiver balance after a successful transfer (0 on failure)
+     */
+    public record TransferOutcome(TransferStatus status, double senderNewBalance, double receiverNewBalance) {}
+
+    /**
+     * Moves {@code amount} from one account to another as a single atomic unit.
+     *
+     * <p>Both the deduction from the sender and the credit to the receiver run
+     * inside one SQLite transaction ({@code BEGIN IMMEDIATE ... COMMIT}) on the
+     * shared persistent connection. Because the whole pair executes as one
+     * transaction on the single-threaded economy executor:</p>
+     *
+     * <ul>
+     *   <li>A crash between the two legs can no longer destroy money - SQLite's
+     *       WAL journaling recovers to a state that either contains both
+     *       updates or neither.</li>
+     *   <li>Concurrent transfers cannot interleave between the legs - the
+     *       executor serializes all storage tasks and the IMMEDIATE transaction
+     *       holds the write lock for the whole pair.</li>
+     *   <li>On any failure (insufficient funds, receiver overflow, database
+     *       error) the transaction is rolled back and the in-memory cache is
+     *       left untouched, so cache and database stay consistent.</li>
+     * </ul>
+     *
+     * <p>Semantics mirror the standalone subtract/add pair this method replaces:
+     * a sender with no row is treated as holding the starting balance, a
+     * receiver with no row is created with starting balance + amount, and all
+     * amounts are rounded through {@link CurrencyUtil#round(double)}.</p>
+     *
+     * @param senderUuid   The sender's unique ID
+     * @param senderName   The sender's display name
+     * @param receiverUuid The receiver's unique ID
+     * @param receiverName The receiver's display name
+     * @param amount       The amount to move (must be positive)
+     * @return CompletableFuture with the {@link TransferOutcome}
+     */
+    public CompletableFuture<TransferOutcome> transferAtomic(
+            UUID senderUuid, String senderName,
+            UUID receiverUuid, String receiverName,
+            double amount) {
+        ensureInitialized();
+        final double roundedAmount = CurrencyUtil.round(amount);
+
+        return CompletableFuture.supplyAsync(() ->
+            executeAtomicTransfer(senderUuid, senderName, receiverUuid, receiverName, roundedAmount),
+            asyncExecutor);
+    }
+
+    /**
+     * Executes the atomic transfer on the executor thread. Must only be called
+     * from the single-threaded executor (the persistent connection is not
+     * thread-safe and the cache contract requires executor-only writes).
+     *
+     * <p>The transaction is driven with raw {@code BEGIN IMMEDIATE} /
+     * {@code COMMIT} / {@code ROLLBACK} statements on the persistent
+     * connection. The connection stays in autocommit mode from the driver's
+     * perspective; SQLite itself suspends autocommit from the moment the raw
+     * {@code BEGIN} runs until the matching {@code COMMIT}/{@code ROLLBACK},
+     * which keeps the driver's transaction state machine out of the way.</p>
+     */
+    private TransferOutcome executeAtomicTransfer(
+            UUID senderUuid, String senderName,
+            UUID receiverUuid, String receiverName,
+            double roundedAmount) {
+
+        if (!CurrencyUtil.isValidAmount(roundedAmount)) {
+            LOGGER.warn("Atomic transfer rejected: invalid amount {}", roundedAmount);
+            return new TransferOutcome(TransferStatus.PERSIST_ERROR, 0, 0);
+        }
+        if (senderUuid.equals(receiverUuid)) {
+            LOGGER.warn("Atomic transfer rejected: sender and receiver are the same account");
+            return new TransferOutcome(TransferStatus.PERSIST_ERROR, 0, 0);
+        }
+
+        try {
+            // Grab the write lock up front so no external writer can slip
+            // between the deduct and the credit leg.
+            try (Statement tx = persistentConnection.createStatement()) {
+                tx.execute("BEGIN IMMEDIATE");
+            }
+
+            double senderCurrent = readBalanceForTransfer(senderUuid);
+            double receiverCurrent = readBalanceForTransfer(receiverUuid);
+
+            double senderNew = CurrencyUtil.round(senderCurrent - roundedAmount);
+            if (senderCurrent < roundedAmount || senderNew < 0) {
+                rollbackTransfer();
+                return new TransferOutcome(TransferStatus.INSUFFICIENT_FUNDS, 0, 0);
+            }
+
+            double receiverNew = CurrencyUtil.round(receiverCurrent + roundedAmount);
+            if (!CurrencyUtil.isValidBalance(receiverNew)) {
+                LOGGER.warn("Atomic transfer rejected: receiver balance would become {} (cap exceeded)", receiverNew);
+                rollbackTransfer();
+                return new TransferOutcome(TransferStatus.RECEIVER_OVERFLOW, 0, 0);
+            }
+
+            upsertBalanceInTx(senderUuid, senderName, senderNew);
+            upsertBalanceInTx(receiverUuid, receiverName, receiverNew);
+
+            try (Statement tx = persistentConnection.createStatement()) {
+                tx.execute("COMMIT");
+            }
+
+            // Committed: publish both new balances to the in-memory cache.
+            balanceCache.put(senderUuid, senderNew);
+            balanceCache.put(receiverUuid, receiverNew);
+            if (senderName != null && !senderName.isEmpty()) {
+                playerNameCache.put(senderUuid, senderName);
+            }
+            if (receiverName != null && !receiverName.isEmpty()) {
+                playerNameCache.put(receiverUuid, receiverName);
+            }
+            return new TransferOutcome(TransferStatus.SUCCESS, senderNew, receiverNew);
+        } catch (SQLException e) {
+            LOGGER.error("Atomic transfer failed - rolling back. Sender: {}, Receiver: {}",
+                senderUuid, receiverUuid, e);
+            rollbackTransfer();
+            return new TransferOutcome(TransferStatus.PERSIST_ERROR, 0, 0);
+        }
+    }
+
+    /**
+     * Reads one account's balance inside the open transfer transaction.
+     * A missing row is treated as holding the starting balance, mirroring the
+     * cache-defaulting behavior of the standalone add/subtract operations.
+     */
+    private double readBalanceForTransfer(UUID uuid) throws SQLException {
+        String sql = "SELECT balance FROM player_balances WHERE uuid = ?";
+        try (PreparedStatement ps = persistentConnection.prepareStatement(sql)) {
+            ps.setString(1, uuid.toString());
+            try (ResultSet rs = ps.executeQuery()) {
+                if (rs.next()) {
+                    return rs.getDouble("balance");
+                }
+            }
+        }
+        return CurrencyUtil.getStartingBalance();
+    }
+
+    /**
+     * Writes one account's balance inside the open transfer transaction using
+     * the same UPSERT shape as {@link #persistBalance} so new and existing
+     * rows are handled identically.
+     */
+    private void upsertBalanceInTx(UUID uuid, String playerName, double balance) throws SQLException {
+        String upsertSql = """
+            INSERT INTO player_balances (uuid, player_name, balance, last_updated)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(uuid) DO UPDATE SET
+                balance = excluded.balance,
+                player_name = excluded.player_name,
+                last_updated = excluded.last_updated
+        """;
+        try (PreparedStatement ps = persistentConnection.prepareStatement(upsertSql)) {
+            ps.setString(1, uuid.toString());
+            ps.setString(2, playerName);
+            ps.setDouble(3, balance);
+            ps.setLong(4, System.currentTimeMillis());
+            ps.executeUpdate();
+        }
+    }
+
+    /**
+     * Rolls back the open transfer transaction. Never throws: if the rollback
+     * itself fails, the error is logged as CATASTROPHIC and the database
+     * journal resolves the transaction when the connection is recovered.
+     */
+    private void rollbackTransfer() {
+        try (Statement tx = persistentConnection.createStatement()) {
+            tx.execute("ROLLBACK");
+        } catch (SQLException e) {
+            LOGGER.error("CATASTROPHIC: rollback of a failed transfer did not complete - "
+                + "cache left untouched; the database journal will resolve the transaction on restart.", e);
+        }
+    }
+
     /**
      * Checks whether a player has at least the specified amount.
      *
