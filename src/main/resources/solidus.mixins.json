@@ -3,8 +3,7 @@
   "package": "com.solidus.mixin",
   "compatibilityLevel": "JAVA_25",
   "server": [
-    "ServerPlayerEntityMixin",
-    "ScreenHandlerMixin"
+    "ServerPlayerEntityMixin"
   ],
   "injectors": {
     "defaultRequire": 1
