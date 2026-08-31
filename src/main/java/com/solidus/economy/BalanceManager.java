@@ -268,6 +268,70 @@ public class BalanceManager {
     }
 
     /**
+     * Moves an auction buyer's payment to the seller inside ONE atomic SQLite
+     * transaction, without firing the generic transfer hooks (neither the
+     * {@code allowTransfer} veto nor the {@code afterTransfer} notification).
+     *
+     * <p>The auction flow has its own hook lifecycle: the
+     * {@code allowAuctionPurchase} veto already ran before any money moved,
+     * and the {@code afterAuctionSale} notification fires after the sale has
+     * fully settled. Feeding this payment through {@link #transferOffline} as
+     * well would double-count the sender's daily transfer limits and stack
+     * the transfer tax on top of the auction tax in Solidus Governance.</p>
+     *
+     * <p>Why atomic: the previous auction settlement chained
+     * {@code subtractBalance(buyer)} and {@code addBalance(seller)} as two
+     * separate transactions. A crash between the two legs left the buyer
+     * charged, the seller unpaid, and the listing marked SOLD - the startup
+     * sweep then re-listed the item and the buyer's money was silently gone.
+     * With {@code transferAtomic} a crash mid-settlement rolls back BOTH
+     * legs, and the sweep correctly re-lists an unpaid listing.</p>
+     *
+     * @param buyerUuid   the buyer's UUID
+     * @param buyerName   the buyer's name
+     * @param sellerUuid  the seller's UUID
+     * @param sellerName  the seller's name
+     * @param amount      the listing price to move buyer -> seller
+     * @return CompletableFuture with TransferResult indicating outcome
+     */
+    public CompletableFuture<TransferResult> settleAuctionPurchase(
+            UUID buyerUuid, String buyerName,
+            UUID sellerUuid, String sellerName,
+            double amount) {
+        // Defense-in-depth validation (the auction already validates price > 0
+        // and rejects self-purchases; these guards protect against future
+        // callers bypassing those checks).
+        if (amount <= 0) {
+            return CompletableFuture.completedFuture(
+                new TransferResult(false, "Amount must be positive.", 0, 0));
+        }
+        if (!CurrencyUtil.isValidAmount(amount)) {
+            return CompletableFuture.completedFuture(
+                new TransferResult(false, "Amount exceeds maximum transfer limit.", 0, 0));
+        }
+        if (buyerUuid.equals(sellerUuid)) {
+            return CompletableFuture.completedFuture(
+                new TransferResult(false, "You cannot buy your own listing.", 0, 0));
+        }
+        return storage.transferAtomic(buyerUuid, buyerName, sellerUuid, sellerName, amount)
+            .thenApply(outcome -> switch (outcome.status()) {
+                case SUCCESS ->
+                    new TransferResult(true, "Transfer successful.",
+                        outcome.senderNewBalance(), outcome.receiverNewBalance());
+                case INSUFFICIENT_FUNDS ->
+                    // Nothing was moved - the transaction rolled back.
+                    new TransferResult(false, "Insufficient funds.", 0, 0);
+                case RECEIVER_OVERFLOW ->
+                    // Nothing was moved - the transaction rolled back.
+                    new TransferResult(false, "Transfer failed: seller balance limit exceeded.", 0, 0);
+                case PERSIST_ERROR ->
+                    // Nothing was moved - the transaction rolled back and the
+                    // cache was left untouched.
+                    new TransferResult(false, "Transfer failed. Please try again.", 0, 0);
+            });
+    }
+
+    /**
      * Gets the top N balances for leaderboard display (first page of
      * {@link #getTopBalances(int, int)}).
      *

@@ -70,6 +70,17 @@ public class SolidusMod implements DedicatedServerModInitializer {
         economyEngine = new EconomyEngine();
         economyEngine.initialize();
 
+        // Initialize the public API immediately after the engine (mod init time).
+        // COMPATIBILITY FIX: this used to run at SERVER_STARTED, but companion
+        // mods (Solidus Governance) detect the API and register their enforcement
+        // hooks at SERVER_STARTING - which fires BEFORE SERVER_STARTED - so
+        // SolidusAPI.getInstance() was still null during every registration
+        // attempt and Governance silently fell back to standalone mode (no
+        // limits, no freezes, no taxes inside Core flows). Initializing here
+        // guarantees the API exists before any server lifecycle event, while
+        // remaining idempotent (a duplicate call is safely ignored).
+        SolidusAPI.initialize(economyEngine);
+
         shopManager = new ShopManager(economyEngine);
         shopManager.loadConfiguration();
 
@@ -104,9 +115,6 @@ public class SolidusMod implements DedicatedServerModInitializer {
         // Required because MinecraftServer.getServer() is NOT available in Fabric
         ServerLifecycleEvents.SERVER_STARTED.register(server -> {
             auctionManager.setServer(server);
-
-            // Initialize the public API for inter-mod integration
-            SolidusAPI.initialize(economyEngine);
 
             LOGGER.info("Solidus: MinecraftServer instance injected into AuctionManager.");
         });

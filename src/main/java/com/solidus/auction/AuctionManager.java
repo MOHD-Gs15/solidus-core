@@ -123,6 +123,8 @@ public class AuctionManager {
     static final String SETTLED_EXPIRED_RETURN = "EXPIRED_RETURN";
     static final String SETTLED_EXPIRED_COLLECT = "EXPIRED_COLLECT";
     static final String SETTLED_CANCELLED = "CANCELLED";
+    /** Archived because the row's item data could not be deserialized (undeliverable). */
+    static final String SETTLED_CORRUPT = "CORRUPT";
 
     private final EconomyEngine economyEngine;
     private final ExecutorService asyncExecutor;
@@ -486,102 +488,117 @@ public class AuctionManager {
 
                 AuctionEntry entry = (AuctionEntry) result;
 
-                // TOCTOU Fix: Skip the separate getBalance check and go directly
-                // to subtractBalance, which atomically checks-and-deducts on the
-                // single-threaded economy executor. This eliminates the window where
-                // the buyer could spend money elsewhere between the check and deduction.
-                balanceManager.subtractBalance(buyer, entry.price()).thenAccept(newBuyerBalance -> {
-                    buyer.level().getServer().execute(() -> {
-                        if (newBuyerBalance < 0) {
-                            // Buyer couldn't afford - no money was deducted, rollback the sale
-                            SolidusMod.LOGGER.warn("Auction buyer {} cannot afford listing {}. Rolling back.",
-                                buyer.getName().getString(), entry.listingId());
-                            markAsUnsold(entry.listingId());
-                            buyer.sendSystemMessage(TextUtil.error("Insufficient funds!"));
-                            return;
-                        }
+                // R15 HARDENING: deserialize the item BEFORE any money moves.
+                // Previously the NBT was parsed only after the buyer had been
+                // charged and the seller paid, so corrupt row data produced an
+                // empty/failed delivery with the payment already gone. A corrupt
+                // listing now aborts cleanly here - no money moved, listing
+                // archived so it cannot trap future buyers.
+                ItemStack purchasedItem = deserializeItemStack(entry.itemNbt(), entry.materialName(), entry.quantity());
+                if (purchasedItem.isEmpty()) {
+                    SolidusMod.LOGGER.error(
+                        "Listing {} has corrupt item data (NBT unparseable and material '{}' unresolved) - cancelling purchase, no money moved.",
+                        entry.listingId(), entry.materialName());
+                    // The row is still status=SOLD at this point (it was marked
+                    // SOLD on the auction executor before this callback ran).
+                    // archiveCorruptListing claims it via "AND status = 1" - do
+                    // NOT markAsUnsold first, or the claim guard would miss it.
+                    archiveCorruptListing(entry);
+                    buyer.sendSystemMessage(TextUtil.error(
+                        "This listing's item data is corrupt. The purchase was cancelled and the listing removed."));
+                    return;
+                }
 
-                        // Pay the seller FIRST - if this fails, we must rollback the buyer
-                        balanceManager.addBalance(entry.sellerUuid(), entry.sellerName(), entry.price())
-                            .thenAccept(newSellerBalance -> {
-                                buyer.level().getServer().execute(() -> {
-                                    if (newSellerBalance < 0) {
-                                        // CRITICAL: Seller payment failed after buyer was charged!
-                                        // Rollback: refund the buyer and mark listing as unsold
-                                        SolidusMod.LOGGER.error(
-                                            "CRITICAL: Failed to pay auction seller {} for listing {}. Rolling back buyer.",
-                                            entry.sellerName(), entry.listingId());
-                                        markAsUnsold(entry.listingId());
-                                        balanceManager.addBalance(buyer, entry.price()).thenAccept(refundBalance -> {
-                                            buyer.level().getServer().execute(() -> {
-                                                if (refundBalance < 0) {
-                                                    SolidusMod.LOGGER.error(
-                                                        "CATASTROPHIC: Buyer refund also failed after seller payment failure! Buyer: {}, Amount: {}",
-                                                        buyer.getName().getString(), entry.price());
-                                                    buyer.sendSystemMessage(TextUtil.error(
-                                                        "Critical error: refund failed. Please contact an admin immediately."));
-                                                } else {
-                                                    buyer.sendSystemMessage(TextUtil.error(
-                                                        "Transaction failed - seller could not be paid. Your money has been refunded."));
-                                                }
-                                            });
-                                        });
-                                        return;
-                                    }
+                // ATOMIC SETTLEMENT FIX: move buyer -> seller payment inside ONE
+                // SQLite transaction (BEGIN IMMEDIATE ... COMMIT). The previous
+                // subtract-then-add chain left a crash window where the buyer was
+                // charged, the seller never paid, and the startup sweep re-listed
+                // the item - buyer money silently lost. transferAtomic rolls back
+                // both legs together, so an interrupted settlement leaves an
+                // unpaid (re-listable) listing and intact balances. This path
+                // deliberately does NOT fire the generic transfer hooks: the
+                // auction flow has its own lifecycle (allowAuctionPurchase veto
+                // ran above; afterAuctionSale notification fires below).
+                balanceManager.settleAuctionPurchase(
+                        buyer.getUUID(), buyer.getName().getString(),
+                        entry.sellerUuid(), entry.sellerName(),
+                        entry.price())
+                    .thenAccept(transferResult -> {
+                        buyer.level().getServer().execute(() -> {
+                            if (!transferResult.success()) {
+                                // Nothing was moved - the transaction rolled back.
+                                // Roll the listing back to ACTIVE so others can buy.
+                                SolidusMod.LOGGER.warn(
+                                    "Auction settlement failed for listing {} ({}). Rolling back.",
+                                    entry.listingId(), transferResult.message());
+                                markAsUnsold(entry.listingId());
+                                buyer.sendSystemMessage(TextUtil.error(transferResult.message()));
+                                return;
+                            }
 
-                                    // Seller paid successfully - give item to buyer
-                                    ItemStack purchasedItem = deserializeItemStack(entry.itemNbt(), entry.materialName(), entry.quantity());
-                                    if (!buyer.getInventory().add(purchasedItem)) {
-                                        buyer.drop(purchasedItem, false);
-                                        buyer.sendSystemMessage(TextUtil.warning("Inventory full! Item dropped at your feet."));
-                                    }
+                            double newBuyerBalance = transferResult.senderNewBalance();
 
-                                    // Log transaction for buyer
-                                    economyEngine.getTransactionLog().log(
-                                        TransactionLog.Type.AUCTION_BOUGHT,
-                                        buyer.getUUID(), buyer.getName().getString(),
-                                        entry.sellerUuid(), entry.sellerName(),
-                                        entry.price(), entry.materialName(), entry.quantity(),
-                                        "Bought " + entry.quantity() + "x " + entry.materialName() + " from " + entry.sellerName()
-                                    );
+                            // Money moved atomically - deliver the (pre-validated) item
+                            if (!buyer.getInventory().add(purchasedItem)) {
+                                buyer.drop(purchasedItem, false);
+                                buyer.sendSystemMessage(TextUtil.warning("Inventory full! Item dropped at your feet."));
+                            }
 
-                                    // Log transaction for seller (may be offline)
-                                    economyEngine.getTransactionLog().log(
-                                        TransactionLog.Type.AUCTION_SOLD,
-                                        entry.sellerUuid(), entry.sellerName(),
-                                        buyer.getUUID(), buyer.getName().getString(),
-                                        entry.price(), entry.materialName(), entry.quantity(),
-                                        "Sold " + entry.quantity() + "x " + entry.materialName() + " to " + buyer.getName().getString()
-                                    );
+                            // Log transaction for buyer
+                            economyEngine.getTransactionLog().log(
+                                TransactionLog.Type.AUCTION_BOUGHT,
+                                buyer.getUUID(), buyer.getName().getString(),
+                                entry.sellerUuid(), entry.sellerName(),
+                                entry.price(), entry.materialName(), entry.quantity(),
+                                "Bought " + entry.quantity() + "x " + entry.materialName() + " from " + entry.sellerName()
+                            );
 
-                                    // Queue notification for seller (delivers immediately if online)
-                                    economyEngine.getTransactionLog().queueNotification(
-                                        entry.sellerUuid(),
-                                        "Your auction item " + entry.quantity() + "x " + entry.materialName() +
-                                            " was purchased by " + buyer.getName().getString() + " for " +
-                                            CurrencyUtil.format(entry.price()),
-                                        buyer.level().getServer()
-                                    );
+                            // Log transaction for seller (may be offline)
+                            economyEngine.getTransactionLog().log(
+                                TransactionLog.Type.AUCTION_SOLD,
+                                entry.sellerUuid(), entry.sellerName(),
+                                buyer.getUUID(), buyer.getName().getString(),
+                                entry.price(), entry.materialName(), entry.quantity(),
+                                "Sold " + entry.quantity() + "x " + entry.materialName() + " to " + buyer.getName().getString()
+                            );
 
-                                    // Housekeeping: the sale is fully settled (money moved both
-                                    // ways, item delivered). The SOLD row is only deleted AFTER
-                                    // it has been durably archived into auction_sold_history
-                                    // (buyer attributed), so a failed TransactionLog insert can
-                                    // no longer erase the only record of the sale. If archiving
-                                    // fails, the SOLD row is kept and the startup sweep retries.
-                                    settleSoldListing(entry, buyer);
+                            // Queue notification for seller (delivers immediately if online)
+                            economyEngine.getTransactionLog().queueNotification(
+                                entry.sellerUuid(),
+                                "Your auction item " + entry.quantity() + "x " + entry.materialName() +
+                                    " was purchased by " + buyer.getName().getString() + " for " +
+                                    CurrencyUtil.format(entry.price()),
+                                buyer.level().getServer()
+                            );
 
-                                    // Success notification
-                                    buyer.sendSystemMessage(
-                                        TextUtil.success("Purchased " + entry.quantity() + "x " + entry.materialName() + " for ")
-                                            .append(TextUtil.currency(CurrencyUtil.format(entry.price())))
-                                            .append(TextUtil.styled(" | New balance: ", ChatFormatting.GRAY))
-                                            .append(TextUtil.currency(CurrencyUtil.format(newBuyerBalance)))
-                                    );
-                                });
-                            });
+                            // MISSING-HOOK FIX: afterAuctionSale was documented in
+                            // SolidusTransactionHook (and consumed by Solidus
+                            // Governance for the auction tax) but was never fired by
+                            // any code path - the auction tax silently never collected.
+                            // Fired only after the movement has fully settled above.
+                            EconomyHooks.notifyHooks(hook ->
+                                hook.afterAuctionSale(
+                                    entry.sellerUuid(), entry.sellerName(),
+                                    buyer.getUUID(), buyer.getName().getString(),
+                                    entry.price()));
+
+                            // Housekeeping: the sale is fully settled (money moved both
+                            // ways atomically, item delivered). The SOLD row is only deleted AFTER
+                            // it has been durably archived into auction_sold_history
+                            // (buyer attributed), so a failed TransactionLog insert can
+                            // no longer erase the only record of the sale. If archiving
+                            // fails, the SOLD row is kept and the startup sweep retries.
+                            settleSoldListing(entry, buyer);
+
+                            // Success notification
+                            buyer.sendSystemMessage(
+                                TextUtil.success("Purchased " + entry.quantity() + "x " + entry.materialName() + " for ")
+                                    .append(TextUtil.currency(CurrencyUtil.format(entry.price())))
+                                    .append(TextUtil.styled(" | New balance: ", ChatFormatting.GRAY))
+                                    .append(TextUtil.currency(CurrencyUtil.format(newBuyerBalance)))
+                            );
+                        });
                     });
-                });
             });
         });
     }
@@ -1236,6 +1253,35 @@ public class AuctionManager {
                 ps.executeUpdate();
             } catch (SQLException e) {
                 SolidusMod.LOGGER.error("Failed to delete archived sold listing: {}", entry.listingId(), e);
+            }
+        }, asyncExecutor);
+    }
+
+    /**
+     * Archives a listing whose item data cannot be deserialized (corrupt NBT
+     * AND unresolved material). The buyer's purchase was aborted with no money
+     * moved; the row is archived into {@code auction_sold_history} with a
+     * distinct {@code CORRUPT} reason and removed from the active listings so
+     * it can never trap another buyer into a paid-but-undeliverable sale.
+     * Admins find the preserved row (seller attributed, no buyer) in the
+     * history table for manual follow-up with the seller.
+     */
+    private void archiveCorruptListing(AuctionEntry entry) {
+        CompletableFuture.runAsync(() -> {
+            boolean archived = insertSoldHistory(persistentConnection, entry,
+                null, null, SETTLED_CORRUPT, System.currentTimeMillis(), SolidusMod.LOGGER);
+            if (!archived) {
+                SolidusMod.LOGGER.error(
+                    "Corrupt listing {} could NOT be archived - keeping SOLD row for startup recovery",
+                    entry.listingId());
+                return;
+            }
+            try (PreparedStatement ps = persistentConnection.prepareStatement(
+                    "DELETE FROM auction_listings WHERE listing_id = ? AND status = 1")) {
+                ps.setString(1, entry.listingId().toString());
+                ps.executeUpdate();
+            } catch (SQLException e) {
+                SolidusMod.LOGGER.error("Failed to delete archived corrupt listing: {}", entry.listingId(), e);
             }
         }, asyncExecutor);
     }
