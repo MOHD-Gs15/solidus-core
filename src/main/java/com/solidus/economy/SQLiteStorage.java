@@ -219,7 +219,12 @@ public class SQLiteStorage {
         // Schedule name refresh via executor (fire-and-forget, ordered with other mutations)
         // This prevents the caller thread from writing playerNameCache directly,
         // which could race with executor-thread writes from persistBalance().
-        if (playerName != null && !playerName.isEmpty()) {
+        // PERF: only when the name actually differs from the cached one - hot
+        // paths (/baltop pages, analytics pulls, command completion) used to
+        // enqueue one no-op executor task per read just to re-write the same
+        // name, crowding the queue that serves real balance mutations.
+        if (playerName != null && !playerName.isEmpty()
+                && !playerName.equals(playerNameCache.get(uuid))) {
             asyncExecutor.execute(() -> {
                 playerNameCache.put(uuid, playerName);
             });
@@ -305,7 +310,7 @@ public class SQLiteStorage {
                             UUID uuid = UUID.fromString(rs.getString("uuid"));
                             name = playerNameCache.getOrDefault(uuid, "Unknown");
                         }
-                        entries.add(new BalanceEntry(rank, name, rs.getDouble("balance")));
+                        entries.add(new BalanceEntry(safeUuid(rs.getString("uuid")), rank, name, rs.getDouble("balance")));
                     }
                 }
             } catch (SQLException e) {
@@ -319,7 +324,7 @@ public class SQLiteStorage {
                     .collect(ArrayList<BalanceEntry>::new,
                         (list, entry) -> {
                             String name = playerNameCache.getOrDefault(entry.getKey(), "Unknown");
-                            list.add(new BalanceEntry(Math.max(0, offset) + list.size() + 1, name, entry.getValue()));
+                            list.add(new BalanceEntry(entry.getKey(), Math.max(0, offset) + list.size() + 1, name, entry.getValue()));
                         },
                         ArrayList::addAll);
             }
@@ -757,5 +762,15 @@ public class SQLiteStorage {
     /**
      * Immutable data class representing a leaderboard entry.
      */
-    public record BalanceEntry(int rank, String playerName, double balance) {}
+    public record BalanceEntry(UUID uuid, int rank, String playerName, double balance) {}
+
+    /** Parses a balance-table uuid column defensively (null-safe for degraded rows). */
+    private static UUID safeUuid(String raw) {
+        if (raw == null || raw.isBlank()) return null;
+        try {
+            return UUID.fromString(raw);
+        } catch (IllegalArgumentException e) {
+            return null;
+        }
+    }
 }
