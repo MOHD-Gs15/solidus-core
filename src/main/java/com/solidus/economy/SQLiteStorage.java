@@ -358,6 +358,82 @@ public class SQLiteStorage {
         }, asyncExecutor);
     }
 
+    /**
+     * Immutable economy-wide aggregates computed entirely inside SQLite.
+     *
+     * @param playerCount     number of registered balance rows
+     * @param avgBalance      mean balance across all rows
+     * @param totalSupply     sum of all balances
+     * @param giniCoefficient Gini inequality coefficient in [0, 1] (0 = perfect
+     *                        equality; (n-1)/n with one player holding everything)
+     */
+    public record EconomyStats(int playerCount, double avgBalance, double totalSupply, double giniCoefficient) {}
+
+    /**
+     * Economy-wide aggregates (count, mean, money supply, Gini) computed with
+     * ONE aggregate SQL query inside SQLite - no rows are pulled into Java.
+     *
+     * <p>R28 fix: companion mods (Solidus Governance anti-inflation checks and
+     * rule-engine context) used to call {@code getTopBalances(100000)} twice an
+     * hour just to compute an average, dragging every balance row over the
+     * reflection boundary onto the economy executor. The Gini coefficient is
+     * computed in SQL from the same windowed scan (rank-weighted formula), so
+     * consumers get the full distribution statistics for the price of one
+     * aggregate query.</p>
+     *
+     * @return CompletableFuture with the current {@link EconomyStats}
+     */
+    public CompletableFuture<EconomyStats> getEconomyStats() {
+        return CompletableFuture.supplyAsync(() -> {
+            ensureInitialized();
+            // Gini for ascending-sorted balances: G = 2*SUM(rank*balance) / (n*SUM(balance)) - (n+1)/n
+            String sql = """
+                WITH ranked AS (
+                    SELECT balance,
+                           ROW_NUMBER() OVER (ORDER BY balance) AS rn,
+                           COUNT(*) OVER () AS n
+                    FROM player_balances
+                )
+                SELECT n AS player_count,
+                       AVG(balance) AS avg_balance,
+                       SUM(balance) AS total_supply,
+                       CASE WHEN n > 1 AND SUM(balance) > 0
+                            THEN MAX(0.0, MIN(1.0,
+                                 (2.0 * SUM(rn * balance)) / (n * SUM(balance)) - (n + 1.0) / n))
+                            ELSE 0.0 END AS gini
+                FROM ranked
+                """;
+            try (Statement stmt = persistentConnection.createStatement();
+                 ResultSet rs = stmt.executeQuery(sql)) {
+                if (rs.next()) {
+                    int count = rs.getInt("player_count");
+                    if (count <= 0) {
+                        return new EconomyStats(0, 0.0, 0.0, 0.0);
+                    }
+                    double avg = rs.getDouble("avg_balance");
+                    double supply = rs.getDouble("total_supply");
+                    double gini = rs.getDouble("gini");
+                    // Degraded/NULL aggregates on an empty or corrupt table
+                    if (Double.isNaN(avg) || Double.isInfinite(avg)) avg = 0.0;
+                    if (Double.isNaN(supply) || Double.isInfinite(supply)) supply = 0.0;
+                    if (Double.isNaN(gini) || Double.isInfinite(gini)) gini = 0.0;
+                    return new EconomyStats(count, avg, supply, gini);
+                }
+            } catch (SQLException e) {
+                LOGGER.error("Failed to compute economy stats from database", e);
+            }
+            // Fallback: cheap cache-derived approximation (SQL failed)
+            int cachedCount = balanceCache.size();
+            double cachedSupply = 0.0;
+            for (double v : balanceCache.values()) {
+                cachedSupply += v;
+            }
+            return cachedCount > 0
+                ? new EconomyStats(cachedCount, cachedSupply / cachedCount, cachedSupply, 0.0)
+                : new EconomyStats(0, 0.0, 0.0, 0.0);
+        }, asyncExecutor);
+    }
+
     // -- Write Operations (via Single-Threaded Executor Queue) --
 
     /**

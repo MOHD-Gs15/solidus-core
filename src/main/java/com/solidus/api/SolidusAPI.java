@@ -259,6 +259,20 @@ public final class SolidusAPI {
         return engine.getBalanceManager().countBalanceEntries();
     }
 
+    /**
+     * Economy-wide aggregates (player count, mean balance, money supply, Gini
+     * coefficient) computed inside SQLite with one aggregate query - no balance
+     * rows are materialized. This is the efficient way for companion mods to
+     * obtain distribution statistics: prefer this over
+     * {@code getTopBalances(100000)} when individual rows are not needed.
+     *
+     * @return CompletableFuture with the current {@link SQLiteStorage.EconomyStats}
+     * @since 2.1.0
+     */
+    public CompletableFuture<SQLiteStorage.EconomyStats> getEconomyStats() {
+        return engine.getBalanceManager().getEconomyStats();
+    }
+
     // -- Transaction Logging -----------------------------
 
     /**

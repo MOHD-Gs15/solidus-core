@@ -366,6 +366,19 @@ public class BalanceManager {
     }
 
     /**
+     * Economy-wide aggregates (player count, mean balance, money supply, Gini
+     * coefficient) computed inside SQLite with one aggregate query - no balance
+     * rows are materialized. Intended for analytics/governance consumers that
+     * only need distribution statistics, not individual rows.
+     *
+     * @return CompletableFuture with the current {@link SQLiteStorage.EconomyStats}
+     * @since 2.1.0
+     */
+    public CompletableFuture<SQLiteStorage.EconomyStats> getEconomyStats() {
+        return storage.getEconomyStats();
+    }
+
+    /**
      * Result of a peer-to-peer transfer operation.
      *
      * @param success           Whether the transfer succeeded
