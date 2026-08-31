@@ -111,10 +111,10 @@ dependencies {
 
     // Standard dependencies
     implementation "com.google.code.gson:gson:2.14.0"
-    implementation "org.xerial:sqlite-jdbc:3.47.2.0"
+    implementation "org.xerial:sqlite-jdbc:3.53.4.0"
 
     // Include sqlite-jdbc in the final JAR for server-side database access
-    include "org.xerial:sqlite-jdbc:3.47.2.0"
+    include "org.xerial:sqlite-jdbc:3.53.4.0"
 
     // ── Testing ──────────────────────────────────────────
     testImplementation "org.junit.jupiter:junit-jupiter:5.10.2"
