@@ -7,10 +7,10 @@
   "authors": ["MOHD_Gs"],
   "contact": {
     "homepage": "https://modrinth.com/user/MOHD_Gs",
-    "sources": "https://github.com/mohd-gs/solidus-core"
+    "sources": "https://github.com/MOHD-Gs15/solidus-core"
   },
   "license": "MIT",
-  "environment": "*",
+  "environment": "server",
   "entrypoints": {
     "server": [
       "com.solidus.SolidusMod"
@@ -20,7 +20,7 @@
     "solidus.mixins.json"
   ],
   "depends": {
-    "fabricloader": ">=0.19.2",
+    "fabricloader": ">=0.19.4",
     "minecraft": "~26.1.2",
     "java": ">=25",
     "fabric-api": "*"
@@ -29,6 +29,7 @@
     "solidus-api"
   ],
   "suggests": {
-    "combatkeep": "*"
+    "solidus-governance": ">=1.2.0",
+    "solidus-analytics": ">=1.1.0"
   }
 }
