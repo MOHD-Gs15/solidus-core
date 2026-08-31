@@ -404,7 +404,7 @@ This is the most architecturally significant class in Solidus. It implements an 
 │                 ▼                            │
 │  ┌──────────────────────────────────────┐   │
 │  │   SQLite Database (WAL mode)         │   │
-│  │   solidus_economy.db                 │   │
+│  │   economy.db                         │   │
 │  │   - Write-Ahead Logging              │   │
 │  │   - Crash-safe persistence           │   │
 │  │   - Concurrent read access           │   │
@@ -519,7 +519,7 @@ Because all operations are serialized through the same single-thread executor, t
 
 The `TransactionLog` serves two purposes:
 
-1. **Persistent Audit Trail** — Every financial operation is logged to the SQLite `transactions` table with type, amount, timestamp, and involved parties
+1. **Persistent Audit Trail** — Every financial operation is logged to the SQLite `transaction_log` table with type, amount, timestamp, and involved parties
 2. **Offline Notification Delivery** — When a transaction affects an offline player, a notification is queued and delivered when they next join
 
 #### Transaction Types
@@ -1559,87 +1559,142 @@ The single-thread executor ensures that **mutations** are never concurrent, but 
 
 ## 15. Database Schema
 
-### Economy Database: `solidus_economy.db`
+Solidus Core owns two SQLite databases, both stored in `config/solidus/`:
 
-#### Table: `balances`
+- `economy.db` — balances, transaction ledger, offline notifications
+- `auctions.db` — auction listings and the settled-listing archive
+
+Both run in WAL mode and are written exclusively through their single-threaded
+executors (`Solidus-Economy-Worker` / `Solidus-Auction-Worker`), so external
+readers (solidus-analytics, Governance recovery, or any plain SQLite client)
+can query them concurrently without blocking the server.
+
+### Economy Database: `config/solidus/economy.db`
+
+#### Table: `player_balances`
 
 | Column | Type | Constraints | Description |
 |--------|------|-------------|-------------|
-| `uuid` | TEXT | PRIMARY KEY | Player UUID (hyphenated) |
-| `name` | TEXT | NOT NULL | Player name (last known) |
-| `balance` | REAL | NOT NULL DEFAULT 500.0 | Current balance |
+| `uuid` | TEXT | PRIMARY KEY NOT NULL | Player UUID (hyphenated) |
+| `player_name` | TEXT | NOT NULL | Last known player name |
+| `balance` | REAL | NOT NULL DEFAULT 0.0 | Current balance (S$) |
+| `last_updated` | INTEGER | NOT NULL | Last mutation (epoch millis) |
 
 ```sql
-CREATE TABLE IF NOT EXISTS balances (
-    uuid TEXT PRIMARY KEY,
-    name TEXT NOT NULL,
-    balance REAL NOT NULL DEFAULT 500.0
+CREATE TABLE IF NOT EXISTS player_balances (
+    uuid TEXT PRIMARY KEY NOT NULL,
+    player_name TEXT NOT NULL,
+    balance REAL NOT NULL DEFAULT 0.0,
+    last_updated INTEGER NOT NULL
 );
+CREATE INDEX IF NOT EXISTS idx_balance_rank
+    ON player_balances (balance DESC);
 ```
 
-**UPSERT pattern**: New players are created with `INSERT OR REPLACE` (or equivalent UPSERT), ensuring atomic creation without separate existence checks.
+**Write pattern**: every mutation is a modern UPSERT
+(`INSERT ... ON CONFLICT(uuid) DO UPDATE SET ...`) executed on the economy
+executor — atomic account creation, no separate existence check. The column
+default is `0.0`; new players are inserted by the application layer with the
+configured starting balance (`shop.json` → `startingBalance`, default 500).
+`idx_balance_rank (balance DESC)` powers `/baltop` ordering and pagination.
 
-#### Table: `transactions`
+#### Table: `transaction_log`
+
+Append-only ledger with one row per affected party: a `/pay` writes a
+`PAY_SEND` row (sender perspective) plus a `PAY_RECEIVE` row (receiver
+perspective), and an auction sale writes `AUCTION_BOUGHT` + `AUCTION_SOLD`
+rows. Consumers that measure money movement must count one side only —
+solidus-analytics, for example, excludes the mirror rows from volume.
 
 | Column | Type | Constraints | Description |
 |--------|------|-------------|-------------|
-| `id` | INTEGER | PRIMARY KEY AUTOINCREMENT | Transaction ID |
-| `uuid` | TEXT | NOT NULL | Player UUID |
-| `type` | INTEGER | NOT NULL | Transaction type code (0-9) |
-| `amount` | REAL | NOT NULL | Transaction amount |
-| `description` | TEXT | | Human-readable description |
+| `id` | INTEGER | PRIMARY KEY AUTOINCREMENT | Ledger ID (also solidus-analytics' polling cursor) |
 | `timestamp` | INTEGER | NOT NULL | Epoch millis |
+| `type` | TEXT | NOT NULL | Transaction type (TEXT enum, see below) |
+| `player_uuid` | TEXT | NOT NULL | Primary party UUID |
+| `player_name` | TEXT | NOT NULL | Primary party name (last known) |
+| `target_uuid` | TEXT | | Counterparty UUID (transfers/auctions) |
+| `target_name` | TEXT | | Counterparty name |
+| `amount` | REAL | NOT NULL | Signed amount from `player_uuid`'s perspective |
+| `item_material` | TEXT | | Material registry key (item flows only) |
+| `item_quantity` | INTEGER | | Stack size (item flows only) |
+| `description` | TEXT | | Human-readable description |
 
 ```sql
-CREATE TABLE IF NOT EXISTS transactions (
+CREATE TABLE IF NOT EXISTS transaction_log (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    uuid TEXT NOT NULL,
-    type INTEGER NOT NULL,
+    timestamp INTEGER NOT NULL,
+    type TEXT NOT NULL,
+    player_uuid TEXT NOT NULL,
+    player_name TEXT NOT NULL,
+    target_uuid TEXT,
+    target_name TEXT,
     amount REAL NOT NULL,
-    description TEXT,
-    timestamp INTEGER NOT NULL
+    item_material TEXT,
+    item_quantity INTEGER,
+    description TEXT
 );
-CREATE INDEX IF NOT EXISTS idx_transactions_uuid ON transactions(uuid);
-CREATE INDEX IF NOT EXISTS idx_transactions_timestamp ON transactions(timestamp);
+CREATE INDEX IF NOT EXISTS idx_transaction_player
+    ON transaction_log (player_uuid, timestamp DESC);
 ```
 
-#### Table: `notifications`
+`type` values (TEXT, not numeric codes): `SHOP_BUY`, `SHOP_SELL`,
+`AUCTION_LIST`, `AUCTION_SOLD`, `AUCTION_BOUGHT`, `AUCTION_EXPIRED`,
+`PAY_SEND`, `PAY_RECEIVE`, `DEATH_PENALTY`, `DEATH_REWARD`.
+
+`idx_transaction_player (player_uuid, timestamp DESC)` serves `/transactions`
+pagination (`getTransactions` with `LIMIT ? OFFSET ?`) and the CSV exports
+(`getTransactionsSince` / `getAllTransactionsSince`).
+
+#### Table: `pending_notifications`
+
+Offline delivery queue: a row is inserted when a transaction benefits a
+player who is currently offline (e.g. an auction seller being paid), delivered
+as chat messages on next login, then deleted.
 
 | Column | Type | Constraints | Description |
 |--------|------|-------------|-------------|
 | `id` | INTEGER | PRIMARY KEY AUTOINCREMENT | Notification ID |
-| `uuid` | TEXT | NOT NULL | Recipient player UUID |
-| `message` | TEXT | NOT NULL | Notification message |
+| `timestamp` | INTEGER | NOT NULL | Queued time (epoch millis) |
+| `player_uuid` | TEXT | NOT NULL | Recipient player UUID |
+| `message` | TEXT | NOT NULL | Pre-rendered chat message |
 
 ```sql
-CREATE TABLE IF NOT EXISTS notifications (
+CREATE TABLE IF NOT EXISTS pending_notifications (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    uuid TEXT NOT NULL,
+    timestamp INTEGER NOT NULL,
+    player_uuid TEXT NOT NULL,
     message TEXT NOT NULL
 );
-CREATE INDEX IF NOT EXISTS idx_notifications_uuid ON notifications(uuid);
+CREATE INDEX IF NOT EXISTS idx_notifications_player
+    ON pending_notifications (player_uuid);
 ```
 
-### Auction Database: `solidus_auctions.db`
+### Auction Database: `config/solidus/auctions.db`
 
 #### Table: `auction_listings`
 
+Live listing queue. A row leaves this table only after being copied into
+`auction_sold_history` — the archive insert and the delete run inside one SQL
+transaction, so a failed ledger write can never erase the only record of a
+completed sale.
+
 | Column | Type | Constraints | Description |
 |--------|------|-------------|-------------|
-| `listing_id` | TEXT | PRIMARY KEY | Listing UUID (hyphenated) |
+| `listing_id` | TEXT | PRIMARY KEY NOT NULL | Listing UUID (hyphenated) |
 | `seller_uuid` | TEXT | NOT NULL | Seller's player UUID |
 | `seller_name` | TEXT | NOT NULL | Seller's display name |
 | `material_name` | TEXT | NOT NULL | Material registry key |
 | `quantity` | INTEGER | NOT NULL | Stack size |
-| `item_nbt` | TEXT | | Serialized NBT data |
-| `price` | REAL | NOT NULL | Listed price |
+| `item_nbt` | TEXT | | Full serialized item data |
+| `price` | REAL | NOT NULL | Buy-now price (S$) |
 | `listed_timestamp` | INTEGER | NOT NULL | Listed time (epoch millis) |
 | `expire_timestamp` | INTEGER | NOT NULL | Expiry time (epoch millis) |
-| `status` | INTEGER | NOT NULL DEFAULT 0 | 0=ACTIVE, 1=SOLD, 2=EXPIRED |
+| `status` | INTEGER | NOT NULL DEFAULT 0 | 0=ACTIVE, 1=SOLD (settlement in flight), 2=EXPIRED (awaiting seller) |
 
 ```sql
 CREATE TABLE IF NOT EXISTS auction_listings (
-    listing_id TEXT PRIMARY KEY,
+    listing_id TEXT PRIMARY KEY NOT NULL,
     seller_uuid TEXT NOT NULL,
     seller_name TEXT NOT NULL,
     material_name TEXT NOT NULL,
@@ -1650,9 +1705,60 @@ CREATE TABLE IF NOT EXISTS auction_listings (
     expire_timestamp INTEGER NOT NULL,
     status INTEGER NOT NULL DEFAULT 0
 );
-CREATE INDEX IF NOT EXISTS idx_auction_status ON auction_listings(status);
-CREATE INDEX IF NOT EXISTS idx_auction_seller ON auction_listings(seller_uuid);
+CREATE INDEX IF NOT EXISTS idx_active_listings
+    ON auction_listings (status, expire_timestamp);
 ```
+
+**Status lifecycle**: `0 → 1` when a buyer pays (the row is then archived and
+deleted once settlement completes); `0 → 2` when the listing expires and is
+awaiting seller collection. If a crash leaves an orphaned `status = 1` row,
+startup reconciliation either archives it as a completed sale (buyer
+attributed from a matching `AUCTION_SOLD` ledger entry) or safely re-lists it
+(`status = 0`) when no payment ever moved. `idx_active_listings
+(status, expire_timestamp)` serves browse, expiry scans, and the guarded
+claim statements.
+
+#### Table: `auction_sold_history`
+
+Append-only archive of every settled listing. `item_nbt` is intentionally not
+archived: audit and analytics need material/quantity/price, not serialized
+item blobs.
+
+| Column | Type | Constraints | Description |
+|--------|------|-------------|-------------|
+| `listing_id` | TEXT | PRIMARY KEY NOT NULL | Original listing UUID |
+| `seller_uuid` | TEXT | NOT NULL | Seller's player UUID |
+| `seller_name` | TEXT | NOT NULL | Seller's display name |
+| `material_name` | TEXT | NOT NULL | Material registry key |
+| `quantity` | INTEGER | NOT NULL | Stack size |
+| `price` | REAL | NOT NULL | Settled price (S$) |
+| `buyer_uuid` | TEXT | | Buyer UUID (null for non-sale settlements) |
+| `buyer_name` | TEXT | | Buyer display name |
+| `listed_timestamp` | INTEGER | NOT NULL | Original listing time (epoch millis) |
+| `settled_timestamp` | INTEGER | NOT NULL | Settlement time (epoch millis) |
+| `settled_reason` | TEXT | NOT NULL | Settlement cause (see below) |
+
+```sql
+CREATE TABLE IF NOT EXISTS auction_sold_history (
+    listing_id TEXT PRIMARY KEY NOT NULL,
+    seller_uuid TEXT NOT NULL,
+    seller_name TEXT NOT NULL,
+    material_name TEXT NOT NULL,
+    quantity INTEGER NOT NULL,
+    price REAL NOT NULL,
+    buyer_uuid TEXT,
+    buyer_name TEXT,
+    listed_timestamp INTEGER NOT NULL,
+    settled_timestamp INTEGER NOT NULL,
+    settled_reason TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_sold_history_time
+    ON auction_sold_history (settled_timestamp DESC);
+```
+
+`settled_reason` values: `SOLD`, `EXPIRED_RETURN`, `EXPIRED_COLLECT`,
+`CANCELLED`, `CORRUPT` (the row's item data could not be deserialized —
+undeliverable).
 
 ---
 
@@ -1661,11 +1767,15 @@ CREATE INDEX IF NOT EXISTS idx_auction_seller ON auction_listings(seller_uuid);
 ### Config Directory Structure
 
 ```
-config/solidus/
-├── permissions.json     // Permission → OP level mapping
-├── shop.json           // Shop sections and item prices
-└── solidus_economy.db  // SQLite economy database
-solidus_auctions.db      // SQLite auction database (server root)
+<server run dir>/
+├── config/
+│   └── solidus/              // Solidus Core data directory
+│       ├── permissions.json  // Permission → OP level mapping
+│       ├── shop.json         // Shop sections and item prices
+│       ├── economy.db        // SQLite economy database (+ WAL files)
+│       └── auctions.db       // SQLite auction database (+ WAL files)
+└── solidus/
+    └── exports/              // /transactions CSV exports (RFC 4180)
 ```
 
 ### shop.json Format
@@ -1848,7 +1958,7 @@ Solidus's virtual GUI pattern can be extended for custom menus:
 
 ### Database Size Estimates
 
-| Player Count | `solidus_economy.db` Size | `solidus_auctions.db` Size |
+| Player Count | `economy.db` Size | `auctions.db` Size |
 |-------------|--------------------------|--------------------------|
 | 100 | ~100 KB | ~50 KB |
 | 1,000 | ~1 MB | ~500 KB |
