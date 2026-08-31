@@ -68,7 +68,8 @@ import java.util.concurrent.TimeUnit;
 public class AuctionManager {
 
     private static final String DATABASE_NAME = "auctions.db";
-    private static final String CREATE_TABLE_SQL = """
+    // Package-private so the settlement-history tests can build the same schema.
+    static final String CREATE_TABLE_SQL = """
         CREATE TABLE IF NOT EXISTS auction_listings (
             listing_id TEXT PRIMARY KEY NOT NULL,
             seller_uuid TEXT NOT NULL,
@@ -82,10 +83,45 @@ public class AuctionManager {
             status INTEGER NOT NULL DEFAULT 0
         )
     """;
-    private static final String CREATE_INDEX_SQL = """
+    static final String CREATE_INDEX_SQL = """
         CREATE INDEX IF NOT EXISTS idx_active_listings
         ON auction_listings (status, expire_timestamp)
     """;
+
+    /**
+     * Append-only archive of settled listings.
+     *
+     * <p>Every row removed from {@code auction_listings} is first (or
+     * atomically, in the same transaction) copied here, so a failed
+     * TransactionLog insert can never erase the only record of a completed
+     * sale. {@code item_nbt} is intentionally not archived: analytics and
+     * audit need material/quantity/price, not serialized NBT blobs.</p>
+     */
+    static final String CREATE_SOLD_HISTORY_SQL = """
+        CREATE TABLE IF NOT EXISTS auction_sold_history (
+            listing_id TEXT PRIMARY KEY NOT NULL,
+            seller_uuid TEXT NOT NULL,
+            seller_name TEXT NOT NULL,
+            material_name TEXT NOT NULL,
+            quantity INTEGER NOT NULL,
+            price REAL NOT NULL,
+            buyer_uuid TEXT,
+            buyer_name TEXT,
+            listed_timestamp INTEGER NOT NULL,
+            settled_timestamp INTEGER NOT NULL,
+            settled_reason TEXT NOT NULL
+        )
+    """;
+    static final String CREATE_SOLD_HISTORY_INDEX_SQL = """
+        CREATE INDEX IF NOT EXISTS idx_sold_history_time
+        ON auction_sold_history (settled_timestamp DESC)
+    """;
+
+    // settled_reason values (package-private for tests)
+    static final String SETTLED_SOLD = "SOLD";
+    static final String SETTLED_EXPIRED_RETURN = "EXPIRED_RETURN";
+    static final String SETTLED_EXPIRED_COLLECT = "EXPIRED_COLLECT";
+    static final String SETTLED_CANCELLED = "CANCELLED";
 
     private final EconomyEngine economyEngine;
     private final ExecutorService asyncExecutor;
@@ -142,9 +178,15 @@ public class AuctionManager {
                 stmt.execute("PRAGMA synchronous=NORMAL");
                 stmt.execute(CREATE_TABLE_SQL);
                 stmt.execute(CREATE_INDEX_SQL);
+                stmt.execute(CREATE_SOLD_HISTORY_SQL);
+                stmt.execute(CREATE_SOLD_HISTORY_INDEX_SQL);
             }
             initialized = true;
             SolidusMod.LOGGER.info("Auction database initialized successfully.");
+            // Startup recovery: status=1 rows are crash residues (purchase marked
+            // SOLD but settlement never finished) or archive failures kept as
+            // evidence. Reconcile them against TransactionLog now.
+            recoverOrphanedSoldRowsFromEconomy();
         } catch (SQLException e) {
             SolidusMod.LOGGER.error("Failed to initialize auction database!", e);
         }
@@ -521,9 +563,12 @@ public class AuctionManager {
                                     );
 
                                     // Housekeeping: the sale is fully settled (money moved both
-                                    // ways, item delivered). Delete the SOLD row so the table
-                                    // cannot grow unbounded; TransactionLog retains the audit trail.
-                                    deleteSettledListing(entry.listingId());
+                                    // ways, item delivered). The SOLD row is only deleted AFTER
+                                    // it has been durably archived into auction_sold_history
+                                    // (buyer attributed), so a failed TransactionLog insert can
+                                    // no longer erase the only record of the sale. If archiving
+                                    // fails, the SOLD row is kept and the startup sweep retries.
+                                    settleSoldListing(entry, buyer);
 
                                     // Success notification
                                     buyer.sendSystemMessage(
@@ -569,6 +614,11 @@ public class AuctionManager {
      * @return CompletableFuture with a list of active AuctionEntry objects
      */
     public CompletableFuture<List<AuctionEntry>> getActiveListings(SortOrder sortOrder) {
+        if (!initialized) {
+            // Pre-initialize call (e.g. a GUI refresh racing startup): report an
+            // empty market instead of blowing up on the null connection.
+            return CompletableFuture.completedFuture(new ArrayList<>());
+        }
         return CompletableFuture.supplyAsync(() -> {
             List<AuctionEntry> entries = new ArrayList<>();
             String orderBy = switch (sortOrder) {
@@ -614,6 +664,9 @@ public class AuctionManager {
      * Gets all active listings by a specific seller.
      */
     public CompletableFuture<List<AuctionEntry>> getListingsBySeller(UUID sellerUuid) {
+        if (!initialized) {
+            return CompletableFuture.completedFuture(new ArrayList<>());
+        }
         return CompletableFuture.supplyAsync(() -> {
             List<AuctionEntry> entries = new ArrayList<>();
             String sql = "SELECT * FROM auction_listings WHERE seller_uuid = ? AND status = 0 AND expire_timestamp > ? ORDER BY listed_timestamp DESC";
@@ -775,18 +828,14 @@ public class AuctionManager {
 
     /**
      * Claims an ACTIVE expired row for DIRECT return to an online seller by
-     * deleting it inside the caller's serialized executor step.
-     * Returns true only when THIS call performed the claim (exactly-once
-     * semantics enforced by the "AND status = 0" guard).
+     * atomically archiving + deleting it inside the caller's serialized
+     * executor step. The exactly-once semantics are still enforced by the
+     * "AND status = 0" guard - now inside the same transaction as the archive.
+     * Returns true only when THIS call performed the claim.
      */
     private boolean claimExpiredRowForReturn(UUID listingId) {
-        String sql = "DELETE FROM auction_listings WHERE listing_id = ? AND status = 0";
-        try (PreparedStatement ps = persistentConnection.prepareStatement(sql)) {
-            return ps.executeUpdate() > 0;
-        } catch (SQLException e) {
-            SolidusMod.LOGGER.error("Failed to claim expired listing {}: {}", listingId, e.getMessage());
-            return false;
-        }
+        return archiveAndDeleteListing(persistentConnection, listingId,
+            SETTLED_EXPIRED_RETURN, null, null, System.currentTimeMillis(), SolidusMod.LOGGER);
     }
 
     /**
@@ -924,18 +973,18 @@ public class AuctionManager {
             // inside this same serialized executor step - BEFORE any items are handed
             // out. Hand-over itself is guaranteed by the inventory-add/drop fallback.
             if (!expired.isEmpty()) {
-                String deleteSql = "DELETE FROM auction_listings WHERE seller_uuid = ? AND status = 2";
-                try (PreparedStatement ps = persistentConnection.prepareStatement(deleteSql)) {
-                    ps.setString(1, player.getUUID().toString());
-                    int deleted = ps.executeUpdate();
-                    SolidusMod.LOGGER.info("Claimed {} collected listings for seller: {}",
-                        deleted, player.getUUID());
-                } catch (SQLException e) {
-                    SolidusMod.LOGGER.error("Failed to delete collected listings for seller: {}", player.getUUID(), e);
-                    // Deletion failed - do NOT hand out items, or they could be
-                    // re-claimed later. Return an empty list so the retry is safe.
+                // Atomic archive+delete: rows land in auction_sold_history in the
+                // same transaction that removes them - no hand-out without evidence.
+                int claimed = archiveAndDeleteCollectibles(persistentConnection,
+                    player.getUUID(), System.currentTimeMillis(), SolidusMod.LOGGER);
+                if (claimed != expired.size()) {
+                    // Archive+delete failed or claimed fewer rows than selected -
+                    // do NOT hand out items, or they could be re-claimed later.
+                    // Return an empty list so the retry is safe.
                     return new ArrayList<AuctionEntry>();
                 }
+                SolidusMod.LOGGER.info("Claimed {} collected listings for seller: {}",
+                    claimed, player.getUUID());
             }
             return expired;
         }, asyncExecutor).thenAccept(expired -> {
@@ -1005,16 +1054,14 @@ public class AuctionManager {
                 // handed back. The leftover row matched /ah collect's query (every
                 // status=2 row of this seller), so collecting afterwards paid out a
                 // SECOND copy of the exact same stack - trivially repeatable, no
-                // timing required. The row is now DELETED (claimed) inside this same
-                // serialized executor step; the hand-out follows on the server thread.
-                String deleteSql = "DELETE FROM auction_listings WHERE listing_id = ? AND status = 0";
-                try (PreparedStatement ps = persistentConnection.prepareStatement(deleteSql)) {
-                    ps.setString(1, listingId.toString());
-                    if (ps.executeUpdate() == 0) {
-                        // A buy, expiry sweep or another cancel consumed the listing
-                        // between our SELECT and DELETE - nothing was changed.
-                        return "NOT_FOUND";
-                    }
+                // timing required. The row is now atomically ARCHIVED + DELETED
+                // (claimed) inside this same serialized executor step; the hand-out
+                // follows on the server thread.
+                if (!archiveAndDeleteListing(persistentConnection, listingId,
+                        SETTLED_CANCELLED, null, null, System.currentTimeMillis(), SolidusMod.LOGGER)) {
+                    // A buy, expiry sweep or another cancel consumed the listing
+                    // between our SELECT and DELETE - nothing was changed.
+                    return "NOT_FOUND";
                 }
 
                 return entry;
@@ -1061,6 +1108,9 @@ public class AuctionManager {
      * @return CompletableFuture with a list of EXPIRED AuctionEntry objects
      */
     public CompletableFuture<List<AuctionEntry>> getExpiredListingsBySeller(UUID sellerUuid) {
+        if (!initialized) {
+            return CompletableFuture.completedFuture(new ArrayList<>());
+        }
         return CompletableFuture.supplyAsync(() -> {
             List<AuctionEntry> entries = new ArrayList<>();
             String sql = "SELECT * FROM auction_listings WHERE seller_uuid = ? AND status = 2 ORDER BY expire_timestamp DESC";
@@ -1078,22 +1128,342 @@ public class AuctionManager {
         }, asyncExecutor);
     }
 
+    // -- Settlement History & Startup Recovery ------------
+
     /**
-     * Deletes a single settled listing by ID from the database.
-     * Used when an expired item has been physically returned to an ONLINE
-     * seller - the row must be removed so /ah collect can never return a
-     * second copy of the same item.
+     * Archives a fully-settled sale, then removes the SOLD row.
+     *
+     * <p>Ordering is evidence-first: the listing row is copied into
+     * {@code auction_sold_history} (with the buyer attributed) and only deleted
+     * once that INSERT is confirmed durable. If the archive write fails, the
+     * SOLD row is deliberately kept - it becomes input for the startup sweep
+     * ({@link #recoverOrphanedSoldRows(Connection, Connection, String, Logger)})
+     * which retries the settlement on the next restart. This closes the audit
+     * gap where a failed TransactionLog insert left a completed sale with no
+     * record at all.</p>
      */
-    private void deleteSettledListing(UUID listingId) {
+    private void settleSoldListing(AuctionEntry entry, ServerPlayer buyer) {
+        final UUID buyerUuid = buyer.getUUID();
+        final String buyerName = buyer.getName().getString();
+        final long settledAt = System.currentTimeMillis();
         CompletableFuture.runAsync(() -> {
-            String sql = "DELETE FROM auction_listings WHERE listing_id = ?";
-            try (PreparedStatement ps = persistentConnection.prepareStatement(sql)) {
-                ps.setString(1, listingId.toString());
+            boolean archived = insertSoldHistory(persistentConnection, entry,
+                buyerUuid, buyerName, SETTLED_SOLD, settledAt, SolidusMod.LOGGER);
+            if (!archived) {
+                SolidusMod.LOGGER.error(
+                    "Settled listing {} could NOT be archived - keeping SOLD row for startup recovery",
+                    entry.listingId());
+                return;
+            }
+            try (PreparedStatement ps = persistentConnection.prepareStatement(
+                    "DELETE FROM auction_listings WHERE listing_id = ? AND status = 1")) {
+                ps.setString(1, entry.listingId().toString());
                 ps.executeUpdate();
             } catch (SQLException e) {
-                SolidusMod.LOGGER.error("Failed to delete settled listing: {}", listingId, e);
+                SolidusMod.LOGGER.error("Failed to delete archived sold listing: {}", entry.listingId(), e);
             }
         }, asyncExecutor);
+    }
+
+    /**
+     * Startup reconciliation for orphaned {@code status = 1} rows.
+     *
+     * <p>A row left in SOLD state by a crash is either:</p>
+     * <ul>
+     *   <li>a completed sale whose archive/delete step never ran -
+     *       TransactionLog then contains a matching AUCTION_SOLD entry, so the
+     *       row is archived (buyer attributed from the log) and removed; or</li>
+     *   <li>a purchase that never finished - no payment moved, no log entry
+     *       exists, and the item is safely re-listed ({@code status = 0}).</li>
+     * </ul>
+     *
+     * <p>Runs synchronously on the init thread before the server accepts
+     * connections; the auction executor has no competing work yet.</p>
+     */
+    private void recoverOrphanedSoldRowsFromEconomy() {
+        // The auction database and the economy database are separate SQLite
+        // files, so matching against TransactionLog needs a second connection.
+        String economyUrl = "jdbc:sqlite:" + com.solidus.util.ConfigManager.getConfigDir().toAbsolutePath()
+            + "/" + com.solidus.economy.SQLiteStorage.DATABASE_NAME;
+        try (Connection economyConn = DriverManager.getConnection(economyUrl)) {
+            int[] result = recoverOrphanedSoldRows(persistentConnection, economyConn,
+                TransactionLog.Type.AUCTION_SOLD.code(), SolidusMod.LOGGER);
+            if (result[0] > 0 || result[1] > 0) {
+                SolidusMod.LOGGER.info("Auction startup recovery: {} orphaned SOLD row(s) archived, {} re-listed",
+                    result[0], result[1]);
+            }
+        } catch (SQLException e) {
+            SolidusMod.LOGGER.error(
+                "Auction startup recovery failed - orphaned SOLD rows left for the next restart", e);
+        }
+    }
+
+    /** Archive insert column list shared by the settlement helpers. */
+    private static final String HISTORY_INSERT_COLUMNS =
+        "(listing_id, seller_uuid, seller_name, material_name, quantity, price,"
+        + " buyer_uuid, buyer_name, listed_timestamp, settled_timestamp, settled_reason)";
+
+    /**
+     * Inserts one settled row into {@code auction_sold_history}.
+     * Package-private and Minecraft-free so the settlement tests can drive it
+     * directly against a plain JDBC connection.
+     *
+     * @return true when the history row is (now) present - a duplicate insert
+     *         is tolerated as success so callers can proceed with the delete
+     */
+    static boolean insertSoldHistory(Connection conn, AuctionEntry entry,
+                                     UUID buyerUuid, String buyerName,
+                                     String reason, long settledTimestamp, org.slf4j.Logger log) {
+        String sql = "INSERT OR IGNORE INTO auction_sold_history " + HISTORY_INSERT_COLUMNS
+            + " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
+        try (PreparedStatement ps = conn.prepareStatement(sql)) {
+            ps.setString(1, entry.listingId().toString());
+            ps.setString(2, entry.sellerUuid().toString());
+            ps.setString(3, entry.sellerName());
+            ps.setString(4, entry.materialName());
+            ps.setInt(5, entry.quantity());
+            ps.setDouble(6, entry.price());
+            ps.setString(7, buyerUuid != null ? buyerUuid.toString() : null);
+            ps.setString(8, buyerName);
+            ps.setLong(9, entry.listedTimestamp());
+            ps.setLong(10, settledTimestamp);
+            ps.setString(11, reason);
+            if (ps.executeUpdate() == 1) {
+                return true;
+            }
+            // OR IGNORE swallowed a duplicate - success only if the row exists
+            try (PreparedStatement chk = conn.prepareStatement(
+                    "SELECT 1 FROM auction_sold_history WHERE listing_id = ?")) {
+                chk.setString(1, entry.listingId().toString());
+                try (ResultSet rs = chk.executeQuery()) {
+                    return rs.next();
+                }
+            }
+        } catch (SQLException e) {
+            log.error("Failed to archive settled listing {}: {}", entry.listingId(), e.getMessage());
+            return false;
+        }
+    }
+
+    /**
+     * Atomically archives one ACTIVE listing and deletes it. The exactly-once
+     * claim guard ({@code AND status = 0}) now lives inside the same
+     * transaction as the archive, so a claim can never leave "row removed but
+     * nothing archived". Used by the expiry-return and cancel flows.
+     *
+     * @return true when THIS call claimed (archived + deleted) the row
+     */
+    static boolean archiveAndDeleteListing(Connection conn, UUID listingId, String reason,
+                                           UUID buyerUuid, String buyerName,
+                                           long settledTimestamp, org.slf4j.Logger log) {
+        String insertSql = "INSERT INTO auction_sold_history " + HISTORY_INSERT_COLUMNS
+            + " SELECT listing_id, seller_uuid, seller_name, material_name, quantity, price,"
+            + " ?, ?, listed_timestamp, ?, ?"
+            + " FROM auction_listings WHERE listing_id = ? AND status = 0";
+        String deleteSql = "DELETE FROM auction_listings WHERE listing_id = ? AND status = 0";
+        try {
+            conn.createStatement().execute("BEGIN IMMEDIATE");
+            boolean claimed;
+            try (PreparedStatement ins = conn.prepareStatement(insertSql)) {
+                ins.setString(1, buyerUuid != null ? buyerUuid.toString() : null);
+                ins.setString(2, buyerName);
+                ins.setLong(3, settledTimestamp);
+                ins.setString(4, reason);
+                ins.setString(5, listingId.toString());
+                claimed = ins.executeUpdate() > 0;
+            }
+            if (claimed) {
+                try (PreparedStatement del = conn.prepareStatement(deleteSql)) {
+                    del.setString(1, listingId.toString());
+                    del.executeUpdate();
+                }
+            }
+            conn.createStatement().execute("COMMIT");
+            return claimed;
+        } catch (SQLException e) {
+            tryRollback(conn);
+            log.error("Failed to archive-and-delete listing {}: {}", listingId, e.getMessage());
+            return false;
+        }
+    }
+
+    /**
+     * Atomically archives and deletes every collectible ({@code status = 2})
+     * row of one seller - used by /ah collect. Same evidence guarantee as
+     * {@link #archiveAndDeleteListing}: rows and their archived copies are
+     * committed together or not at all.
+     *
+     * @return the number of rows claimed, or -1 on failure (the caller must
+     *         not hand out items then - a retry stays safe)
+     */
+    static int archiveAndDeleteCollectibles(Connection conn, UUID sellerUuid,
+                                            long settledTimestamp, org.slf4j.Logger log) {
+        String insertSql = "INSERT INTO auction_sold_history " + HISTORY_INSERT_COLUMNS
+            + " SELECT listing_id, seller_uuid, seller_name, material_name, quantity, price,"
+            + " NULL, NULL, listed_timestamp, ?, ?"
+            + " FROM auction_listings WHERE seller_uuid = ? AND status = 2";
+        String deleteSql = "DELETE FROM auction_listings WHERE seller_uuid = ? AND status = 2";
+        try {
+            conn.createStatement().execute("BEGIN IMMEDIATE");
+            int claimed;
+            try (PreparedStatement ins = conn.prepareStatement(insertSql)) {
+                ins.setLong(1, settledTimestamp);
+                ins.setString(2, SETTLED_EXPIRED_COLLECT);
+                ins.setString(3, sellerUuid.toString());
+                claimed = ins.executeUpdate();
+            }
+            try (PreparedStatement del = conn.prepareStatement(deleteSql)) {
+                del.setString(1, sellerUuid.toString());
+                claimed = del.executeUpdate();
+            }
+            conn.createStatement().execute("COMMIT");
+            return claimed;
+        } catch (SQLException e) {
+            tryRollback(conn);
+            log.error("Failed to archive-and-delete collectibles for seller {}: {}",
+                sellerUuid, e.getMessage());
+            return -1;
+        }
+    }
+
+    /**
+     * Startup sweep for orphaned {@code status = 1} rows (see the instance
+     * javadoc above). Package-private and Minecraft-free for tests.
+     *
+     * <p>Log matching is best-effort: AUCTION_SOLD entries are paired to orphan
+     * rows by (seller, amount, material, quantity, listed_timestamp), oldest
+     * to oldest, each log row consumed once. Money and item flows are never
+     * altered by this sweep - it only restores bookkeeping.</p>
+     *
+     * @return {@code int[]{archived, relisted}}
+     */
+    static int[] recoverOrphanedSoldRows(Connection auctionConn, Connection economyConn,
+                                         String soldTypeCode, org.slf4j.Logger log) {
+        // The economy side may not exist yet (fresh install) - nothing to match
+        try (Statement st = economyConn.createStatement();
+             ResultSet rs = st.executeQuery(
+                 "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'transaction_log'")) {
+            if (!rs.next()) {
+                log.warn("Startup sweep skipped: economy database has no transaction_log table yet");
+                return new int[]{0, 0};
+            }
+        } catch (SQLException e) {
+            log.error("Startup sweep skipped: cannot inspect economy database: {}", e.getMessage());
+            return new int[]{0, 0};
+        }
+
+        List<AuctionEntry> orphans = new ArrayList<>();
+        String selectSql = "SELECT * FROM auction_listings WHERE status = 1 ORDER BY listed_timestamp ASC";
+        try (PreparedStatement ps = auctionConn.prepareStatement(selectSql);
+             ResultSet rs = ps.executeQuery()) {
+            while (rs.next()) {
+                orphans.add(new AuctionEntry(
+                    UUID.fromString(rs.getString("listing_id")),
+                    UUID.fromString(rs.getString("seller_uuid")),
+                    rs.getString("seller_name"),
+                    rs.getString("material_name"),
+                    rs.getInt("quantity"),
+                    rs.getString("item_nbt"),
+                    rs.getDouble("price"),
+                    rs.getLong("listed_timestamp"),
+                    rs.getLong("expire_timestamp"),
+                    ListingStatus.SOLD));
+            }
+        } catch (SQLException e) {
+            log.error("Startup sweep aborted: cannot read orphaned SOLD rows: {}", e.getMessage());
+            return new int[]{0, 0};
+        }
+
+        Set<Long> consumedLogRows = new HashSet<>();
+        int archived = 0;
+        int relisted = 0;
+        for (AuctionEntry entry : orphans) {
+            Long matchedRowid = null;
+            UUID buyerUuid = null;
+            String buyerName = null;
+            long logTimestamp = 0L;
+
+            StringBuilder notIn = new StringBuilder();
+            if (!consumedLogRows.isEmpty()) {
+                notIn.append(" AND rowid NOT IN (");
+                boolean first = true;
+                for (Long ignored : consumedLogRows) {
+                    if (!first) notIn.append(",");
+                    notIn.append("?");
+                    first = false;
+                }
+                notIn.append(")");
+            }
+            String matchSql = "SELECT rowid, target_uuid, target_name, timestamp FROM transaction_log"
+                + " WHERE type = ? AND player_uuid = ? AND amount = ? AND item_material = ?"
+                + " AND item_quantity = ? AND timestamp >= ?" + notIn
+                + " ORDER BY timestamp ASC LIMIT 1";
+            try (PreparedStatement ps = economyConn.prepareStatement(matchSql)) {
+                int idx = 1;
+                ps.setString(idx++, soldTypeCode);
+                ps.setString(idx++, entry.sellerUuid().toString());
+                ps.setDouble(idx++, entry.price());
+                ps.setString(idx++, entry.materialName());
+                ps.setInt(idx++, entry.quantity());
+                ps.setLong(idx++, entry.listedTimestamp());
+                for (Long used : consumedLogRows) {
+                    ps.setLong(idx++, used);
+                }
+                try (ResultSet rs = ps.executeQuery()) {
+                    if (rs.next()) {
+                        matchedRowid = rs.getLong("rowid");
+                        String targetUuid = rs.getString("target_uuid");
+                        buyerUuid = targetUuid != null ? UUID.fromString(targetUuid) : null;
+                        buyerName = rs.getString("target_name");
+                        logTimestamp = rs.getLong("timestamp");
+                    }
+                }
+            } catch (SQLException ex) {
+                log.error("Startup sweep: log match failed for listing {} - leaving SOLD row in place: {}",
+                    entry.listingId(), ex.getMessage());
+                continue;
+            }
+
+            if (matchedRowid != null && insertSoldHistory(auctionConn, entry,
+                    buyerUuid, buyerName, SETTLED_SOLD, logTimestamp, log)) {
+                try (PreparedStatement del = auctionConn.prepareStatement(
+                        "DELETE FROM auction_listings WHERE listing_id = ? AND status = 1")) {
+                    del.setString(1, entry.listingId().toString());
+                    del.executeUpdate();
+                } catch (SQLException ex) {
+                    log.error("Startup sweep: archived but could not delete listing {}: {}",
+                        entry.listingId(), ex.getMessage());
+                    continue; // duplicate insert on the next run is idempotent
+                }
+                consumedLogRows.add(matchedRowid);
+                archived++;
+            } else {
+                // No matching sale log: the purchase never completed (no payment
+                // had moved) - safely put the item back on the market.
+                try (PreparedStatement upd = auctionConn.prepareStatement(
+                        "UPDATE auction_listings SET status = 0 WHERE listing_id = ? AND status = 1")) {
+                    upd.setString(1, entry.listingId().toString());
+                    upd.executeUpdate();
+                } catch (SQLException ex) {
+                    log.error("Startup sweep: could not re-list orphaned row {}: {}",
+                        entry.listingId(), ex.getMessage());
+                    continue;
+                }
+                relisted++;
+                log.warn("Startup sweep: re-listed orphaned SOLD row {} - no matching sale in TransactionLog",
+                    entry.listingId());
+            }
+        }
+        return new int[]{archived, relisted};
+    }
+
+    /** Best-effort transaction rollback that never throws. */
+    private static void tryRollback(Connection conn) {
+        try (Statement st = conn.createStatement()) {
+            st.execute("ROLLBACK");
+        } catch (SQLException ignored) {
+            // no open transaction or the connection is already broken
+        }
     }
 
     // -- Getters -------------------------------------------

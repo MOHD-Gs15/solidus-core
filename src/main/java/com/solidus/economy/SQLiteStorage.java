@@ -62,7 +62,7 @@ import java.util.concurrent.TimeUnit;
 public class SQLiteStorage {
 
     private static final Logger LOGGER = LoggerFactory.getLogger(SQLiteStorage.class);
-    private static final String DATABASE_NAME = "economy.db";
+    public static final String DATABASE_NAME = "economy.db";
     private static final String CREATE_TABLE_SQL = """
         CREATE TABLE IF NOT EXISTS player_balances (
             uuid TEXT PRIMARY KEY NOT NULL,
