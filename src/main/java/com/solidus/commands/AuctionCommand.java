@@ -2,15 +2,22 @@ package com.solidus.commands;
 
 import com.solidus.api.PermissionChecker;
 import com.solidus.api.SolidusPermissions;
+import com.solidus.auction.AuctionEntry;
 import com.solidus.auction.AuctionManager;
 
 import com.mojang.brigadier.CommandDispatcher;
 import com.mojang.brigadier.arguments.DoubleArgumentType;
+import com.mojang.brigadier.arguments.StringArgumentType;
+import net.minecraft.ChatFormatting;
 import net.minecraft.commands.CommandSourceStack;
 import net.minecraft.commands.Commands;
 import net.minecraft.commands.arguments.UuidArgument;
+import net.minecraft.network.chat.Component;
 import net.minecraft.server.level.ServerPlayer;
 
+import com.solidus.util.CurrencyUtil;
+
+import java.util.List;
 import java.util.UUID;
 
 /**
@@ -22,6 +29,7 @@ import java.util.UUID;
  *   /ah collect            - Collect expired auction items
  *   /ah cancel <uuid>      - Cancel your own active listing
  *   /ah sort <newest|price_low|price_high|material> - View sorted listings
+ *   /ah search <term>      - Free-text search across active listings
  *
  * Permissions:
  *   solidus.command.auction        - View auction house (default: all players)
@@ -110,6 +118,59 @@ public class AuctionCommand {
                     })
                 )
             )
+            // /ah search <term> - Free-text search across active listings
+            .then(Commands.literal("search")
+                .requires(PermissionChecker.require(SolidusPermissions.AUCTION_VIEW, 0))
+                .then(Commands.argument("term", StringArgumentType.greedyString())
+                    .executes(context -> {
+                        ServerPlayer player = context.getSource().getPlayerOrException();
+                        String term = StringArgumentType.getString(context, "term");
+                        executeSearch(player, auctionManager, term);
+                        return 1;
+                    })
+                )
+            )
         );
+    }
+
+    private static void executeSearch(ServerPlayer player, AuctionManager auctionManager, String term) {
+        auctionManager.searchListings(term).thenAccept(entries ->
+            player.level().getServer().execute(() -> sendSearchResults(player, term, entries)));
+    }
+
+    private static void sendSearchResults(ServerPlayer player, String term, List<AuctionEntry> entries) {
+        if (entries.isEmpty()) {
+            player.sendSystemMessage(Component.literal("\u00a77No active listings matching '")
+                .append(Component.literal(term).withStyle(ChatFormatting.AQUA))
+                .append(Component.literal("'.")));
+            return;
+        }
+        player.sendSystemMessage(Component.literal("\u00a76[AH] ")
+            .append(Component.literal("Active listings matching '").withStyle(ChatFormatting.YELLOW))
+            .append(Component.literal(term).withStyle(ChatFormatting.AQUA))
+            .append(Component.literal("' (cheapest first):").withStyle(ChatFormatting.YELLOW)));
+        long now = System.currentTimeMillis();
+        for (AuctionEntry entry : entries) {
+            long remainingMs = Math.max(0L, entry.expireTimestamp() - now);
+            player.sendSystemMessage(Component.literal(String.format("\u00a77  %dx \u00a7f%s%s \u00a7e- \u00a7b%s \u00a77- \u00a7a%s \u00a77- ends in %s",
+                entry.quantity(),
+                entry.materialName(),
+                entry.itemNbt() != null && !entry.itemNbt().isBlank() ? " \u00a7d[nbt]" : "",
+                CurrencyUtil.format(entry.price()),
+                entry.sellerName(),
+                humanizeDuration(remainingMs))));
+        }
+        if (entries.size() >= AuctionManager.MAX_SEARCH_RESULTS) {
+            player.sendSystemMessage(Component.literal("\u00a77(showing first " + AuctionManager.MAX_SEARCH_RESULTS
+                + " results - refine your search to see more)"));
+        }
+    }
+
+    private static String humanizeDuration(long ms) {
+        long minutes = ms / 60000L;
+        if (minutes < 60L) return minutes + "m";
+        long hours = minutes / 60L;
+        if (hours < 48L) return hours + "h " + (minutes % 60L) + "m";
+        return (hours / 24L) + "d " + (hours % 24L) + "h";
     }
 }

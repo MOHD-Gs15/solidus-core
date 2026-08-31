@@ -24,6 +24,7 @@ import java.sql.Statement;
 import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.List;
+import java.util.Locale;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
@@ -642,6 +643,80 @@ public class AuctionManager {
         }, asyncExecutor);
     }
 
+    /** Maximum number of results returned by {@link #searchListings}. */
+    public static final int MAX_SEARCH_RESULTS = 15;
+
+    /** Maximum accepted length of a search term. */
+    public static final int MAX_SEARCH_TERM_LENGTH = 64;
+
+    /**
+     * Searches ACTIVE listings with a free-text term matched case-insensitively
+     * against the material name (e.g. "diamond" matches minecraft:diamond_sword)
+     * and the seller name. Results are ordered cheapest first and capped at
+     * {@link #MAX_SEARCH_RESULTS}.
+     *
+     * @param term the raw search term as typed by the player
+     * @return CompletableFuture with matching listings (empty for blank/oversized terms)
+     */
+    public CompletableFuture<List<AuctionEntry>> searchListings(String term) {
+        String sanitized = sanitizeSearchTerm(term);
+        if (sanitized == null || !initialized) {
+            // Blank term or pre-initialize race: report an empty result set.
+            return CompletableFuture.completedFuture(new ArrayList<>());
+        }
+        return CompletableFuture.supplyAsync(() -> {
+            try {
+                return searchListingsVia(persistentConnection, sanitized, MAX_SEARCH_RESULTS);
+            } catch (SQLException e) {
+                SolidusMod.LOGGER.error("Failed to search auction listings", e);
+                return new ArrayList<>();
+            }
+        }, asyncExecutor);
+    }
+
+    /**
+     * Validates and normalizes a search term.
+     * @return the trimmed term, or null when blank/oversized/null
+     */
+    static String sanitizeSearchTerm(String term) {
+        if (term == null) return null;
+        String t = term.trim();
+        if (t.isEmpty() || t.length() > MAX_SEARCH_TERM_LENGTH) return null;
+        return t;
+    }
+
+    /**
+     * Static, connection-injected core of the search so tests can drive it
+     * against a plain SQLite database without the Minecraft server.
+     * LIKE wildcards in the user term (%, _) are escaped and matched literally.
+     */
+    static List<AuctionEntry> searchListingsVia(Connection conn, String term, int limit) throws SQLException {
+        List<AuctionEntry> entries = new ArrayList<>();
+        String like = "%" + term.toLowerCase(Locale.ROOT)
+                .replace("\\", "\\\\")
+                .replace("%", "\\%")
+                .replace("_", "\\_") + "%";
+        String sql = """
+            SELECT * FROM auction_listings
+            WHERE status = 0 AND expire_timestamp > ?
+              AND (LOWER(material_name) LIKE ? ESCAPE '\\'
+                   OR LOWER(seller_name) LIKE ? ESCAPE '\\')
+            ORDER BY price ASC
+            LIMIT ?""";
+        try (PreparedStatement ps = conn.prepareStatement(sql)) {
+            ps.setLong(1, System.currentTimeMillis());
+            ps.setString(2, like);
+            ps.setString(3, like);
+            ps.setInt(4, Math.max(1, limit));
+            try (ResultSet rs = ps.executeQuery()) {
+                while (rs.next()) {
+                    entries.add(mapResultSetToEntry(rs));
+                }
+            }
+        }
+        return entries;
+    }
+
     /** Sort order options for auction listings */
     public enum SortOrder {
         NEWEST("Newest First"),
@@ -855,7 +930,7 @@ public class AuctionManager {
         }
     }
 
-    private AuctionEntry mapResultSetToEntry(ResultSet rs) throws SQLException {
+    private static AuctionEntry mapResultSetToEntry(ResultSet rs) throws SQLException {
         int statusCode = rs.getInt("status");
         ListingStatus status = ListingStatus.fromCode(statusCode);
         return new AuctionEntry(
