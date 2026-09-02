@@ -24,6 +24,7 @@ import java.time.Duration;
 import java.time.ZoneOffset;
 import java.time.format.DateTimeFormatter;
 import java.util.List;
+import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 
 /**
@@ -54,6 +55,14 @@ public class TransactionsCommand {
     private static final DateTimeFormatter EXPORT_STAMP =
         DateTimeFormatter.ofPattern("yyyyMMdd_HHmmss");
 
+    /** Export cooldown: one export (own or full) per player per 30s. The
+     *  export path runs an unbounded ledger query on the single-threaded DB
+     *  executor and writes up to MAX_EXPORT_ROWS rows to disk - a command
+     *  macro could otherwise hammer the economy executor and fill the disk. */
+    private static final long EXPORT_COOLDOWN_MS = 30_000L;
+    private static final java.util.concurrent.ConcurrentHashMap<UUID, Long> lastExportAt =
+        new java.util.concurrent.ConcurrentHashMap<>();
+
     public static void register(CommandDispatcher<CommandSourceStack> dispatcher, EconomyEngine economyEngine) {
         dispatcher.register(Commands.literal("transactions")
             .requires(PermissionChecker.require(SolidusPermissions.TRANSACTIONS, 0))
@@ -62,7 +71,7 @@ public class TransactionsCommand {
                 executeTransactions(player, economyEngine, 1);
                 return 1;
             })
-            .then(Commands.argument("page", com.mojang.brigadier.arguments.IntegerArgumentType.integer(1))
+            .then(Commands.argument("page", com.mojang.brigadier.arguments.IntegerArgumentType.integer(1, 1_000_000))
                 .executes(context -> {
                     ServerPlayer player = context.getSource().getPlayerOrException();
                     int page = com.mojang.brigadier.arguments.IntegerArgumentType.getInteger(context, "page");
@@ -88,8 +97,14 @@ public class TransactionsCommand {
                 )
             )
             // /transactions exportall [days] - full ledger as CSV (OP 2+)
+            // SECURITY FIX (audit 2.1.3): the registration fallback was 0 (all
+            // players), contradicting the documented OP-2+ intent, the javadoc
+            // and SolidusPermissions.getDefaultOpLevel (which only feeds the
+            // generated permissions.json - a file that never emitted this node
+            // either, so nothing ever raised the level). Any player could dump
+            // the whole server ledger and hammer the DB executor unthrottled.
             .then(Commands.literal("exportall")
-                .requires(PermissionChecker.require(SolidusPermissions.TRANSACTIONS_EXPORT_ALL, 0))
+                .requires(PermissionChecker.require(SolidusPermissions.TRANSACTIONS_EXPORT_ALL, 2))
                 .executes(context -> {
                     ServerPlayer player = context.getSource().getPlayerOrException();
                     executeExport(player, economyEngine, DEFAULT_EXPORT_DAYS, true);
@@ -165,6 +180,17 @@ public class TransactionsCommand {
     private static void executeExport(ServerPlayer player, EconomyEngine economyEngine, int days, boolean allPlayers) {
         TransactionLog transactionLog = economyEngine.getTransactionLog();
         long sinceMs = System.currentTimeMillis() - Duration.ofDays(days).toMillis();
+
+        // Export cooldown (audit 2.1.3): cheap anti-spam gate BEFORE the DB work.
+        long now = System.currentTimeMillis();
+        Long last = lastExportAt.get(player.getUUID());
+        if (last != null && now - last < EXPORT_COOLDOWN_MS) {
+            long wait = (EXPORT_COOLDOWN_MS - (now - last) + 999) / 1000;
+            player.sendSystemMessage(TextUtil.error(
+                "Please wait " + wait + "s before exporting again."));
+            return;
+        }
+        lastExportAt.put(player.getUUID(), now);
 
         CompletableFuture<List<TransactionLog.TransactionEntry>> fetch = allPlayers
             ? transactionLog.getAllTransactionsSince(sinceMs)

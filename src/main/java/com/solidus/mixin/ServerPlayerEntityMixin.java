@@ -39,10 +39,12 @@ import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
  * items for free. This causes "ghost items" - items that exist only in the
  * client's inventory prediction while the server never moved anything.
  *
- * THE FIX: after canceling, we force a FULL container resync via
- * broadcastFullState(), which re-sends every slot (display slots AND the
- * player inventory section) plus the carried stack and resets the incremental
- * sync markers. Any phantom item is erased in the same moment it was created.
+ * THE FIX: after canceling, PacketHandler forces a FULL container resync via
+ * broadcastFullState() (re-sends every slot plus the carried stack and resets
+ * the incremental sync markers) after every PROCESSED Solidus click. For
+ * clicks DROPPED by the rate limiter the resync is throttled to at most one
+ * per 200ms so a flooded packet stream cannot amplify into a stream of
+ * multi-KB broadcasts. See PacketHandler for the full policy.
  *
  * Why broadcastChanges() was NOT enough (the 2.1.0 bug):
  * broadcastChanges() only sends slots whose server-side state CHANGED since
@@ -90,30 +92,35 @@ public abstract class ServerPlayerEntityMixin {
         PacketHandler packetHandler = SolidusMod.getPacketHandler();
         if (packetHandler == null) return;
 
+        // Defense-in-depth (audit 2.1.3): vanilla's handleContainerClick
+        // validates the packet's containerId against the open menu BEFORE
+        // acting. Running at HEAD bypassed that guard, letting a stale
+        // containerId click land on whatever Solidus menu is currently open.
+        // Restore the check here so routing is strictly desync-safe.
+        if (player.containerMenu == null
+            || packet.containerId() != player.containerMenu.containerId) {
+            return;
+        }
+
         // Extract click data from the packet (accessors verified via javap
         // against the 26.1.2 mojmap-mapped jar)
         int slotIndex = packet.slotNum();
         int button = packet.buttonNum();
         ContainerInput containerInput = packet.containerInput();
 
-        // Check if this is a Solidus GUI click
+        // Check if this is a Solidus GUI click. PacketHandler now owns the
+        // full resync policy: a broadcastFullState() after every PROCESSED
+        // Solidus click (anti-ghost guarantee, PR#13) and a THROTTLED
+        // broadcast (max 1 per 200ms) for clicks dropped by the rate
+        // limiter, so a flooded packet stream cannot amplify into a stream
+        // of multi-KB container resyncs.
         boolean handled = packetHandler.handleContainerClick(
             player, slotIndex, button, containerInput);
 
         if (handled) {
-            // Cancel vanilla processing - the click has been handled by Solidus
+            // Cancel vanilla processing - the click has been handled (or
+            // rate-limited and dropped) by Solidus.
             ci.cancel();
-
-            // FORCE FULL RESYNC: the client menu is a vanilla ChestMenu that
-            // optimistically predicted this click locally (possibly moving a
-            // display item into its inventory view for free). Since we rejected
-            // or reinterpreted the click, the server state is the single source
-            // of truth again - broadcastFullState() re-sends EVERY slot (display
-            // area + player inventory + carried stack) and resets the incremental
-            // sync markers, so any phantom/ghost item is erased immediately.
-            // (broadcastChanges() was insufficient here: it only sends slots that
-            // CHANGED server-side, and a rejected click changes nothing.)
-            player.containerMenu.broadcastFullState();
         }
     }
 }

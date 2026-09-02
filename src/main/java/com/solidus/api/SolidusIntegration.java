@@ -75,6 +75,19 @@ public final class SolidusIntegration {
      * dependency on Solidus. If Solidus is not loaded, this method
      * returns immediately without doing anything.</p>
      *
+     * <p><b>Audit 2.1.3 rewrite:</b> the previous reference implementation
+     * chained subtractBalance(victim) then addBalance(killer) as two separate
+     * transactions with a manual refund ladder - exactly the crash-window
+     * money-destruction pattern Solidus Core eliminated with
+     * {@code transferAtomic} (a crash between the legs, or a failed refund,
+     * destroyed the penalty money with no record). It also bypassed the
+     * transaction-hook veto/notify contract, so Governance-style limits and
+     * taxes never saw death transfers. Companion mods that copied this file
+     * faithfully replicated the bug. The replacement performs ONE atomic
+     * {@code SolidusAPI.transferOffline} call: both legs commit inside one
+     * SQLite transaction, hooks see the transfer, and no refund path is
+     * needed because there is no window between the legs.</p>
+     *
      * @param victim         The player who died
      * @param killer         The player who killed them
      * @param penaltyPercent The percentage to transfer (0.15 = 15%)
@@ -93,99 +106,90 @@ public final class SolidusIntegration {
 
             Class<?> apiClass = api.getClass();
 
-            // Step 1: Get victim's balance via reflection
+            // Step 1: Get the victim's balance via reflection
             java.lang.reflect.Method getBalance = apiClass.getMethod(
                 "getBalance", net.minecraft.server.level.ServerPlayer.class);
             java.util.concurrent.CompletableFuture<Double> balanceFuture =
                 (java.util.concurrent.CompletableFuture<Double>) getBalance.invoke(api, victim);
 
-            // Step 2: Calculate penalty and perform transfer
             balanceFuture.thenAccept(balance -> {
                 if (balance == null || balance <= 0) return;
 
                 double penalty = Math.floor(balance * penaltyPercent * 100) / 100.0;
                 if (penalty < 0.01) return; // Below minimum transaction
 
-                // Subtract from victim
                 try {
-                    java.lang.reflect.Method subtract = apiClass.getMethod(
-                        "subtractBalance",
-                        net.minecraft.server.level.ServerPlayer.class, double.class);
-                    java.util.concurrent.CompletableFuture<Double> subFuture =
-                        (java.util.concurrent.CompletableFuture<Double>) subtract.invoke(api, victim, penalty);
+                    // Step 2: ONE atomic transfer - both legs (deduct victim,
+                    // credit killer) commit inside a single SQLite transaction.
+                    // No crash window, no manual refund ladder, and the
+                    // transfer hooks (limits / freezes / taxes) see it.
+                    java.lang.reflect.Method transferOffline = apiClass.getMethod(
+                        "transferOffline",
+                        java.util.UUID.class, String.class,
+                        java.util.UUID.class, String.class,
+                        double.class);
+                    java.util.concurrent.CompletableFuture<Object> transferFuture =
+                        (java.util.concurrent.CompletableFuture<Object>) transferOffline.invoke(
+                            api,
+                            victim.getUUID(), victim.getName().getString(),
+                            killer.getUUID(), killer.getName().getString(),
+                            penalty);
 
-                    subFuture.thenAccept(newVictimBalance -> {
-                        if (newVictimBalance == null || newVictimBalance < 0) {
-                            return; // Insufficient funds or failure
-                        }
+                    transferFuture.thenAccept(transferResult -> {
+                        if (transferResult == null) return;
 
-                        // Add to killer
                         try {
-                            java.lang.reflect.Method add = apiClass.getMethod(
-                                "addBalance",
-                                net.minecraft.server.level.ServerPlayer.class, double.class);
-                            java.util.concurrent.CompletableFuture<Double> addFuture =
-                                (java.util.concurrent.CompletableFuture<Double>) add.invoke(api, killer, penalty);
+                            java.lang.reflect.Method success = transferResult.getClass().getMethod("success");
+                            boolean ok = (boolean) success.invoke(transferResult);
 
-                            addFuture.thenAccept(newKillerBalance -> {
-                                if (newKillerBalance != null && newKillerBalance >= 0) {
-                                    // Success - notify both players on the server thread
-                                    victim.level().getServer().execute(() -> {
-                                        String formattedPenalty = String.format("%,.2f S$", penalty);
+                            victim.level().getServer().execute(() -> {
+                                String formattedPenalty = String.format("%,.2f S$", penalty);
+                                if (ok) {
+                                    victim.sendSystemMessage(
+                                        net.minecraft.network.chat.Component.literal(
+                                            "[Solidus] Death penalty: -" + formattedPenalty)
+                                        .withStyle(net.minecraft.ChatFormatting.RED));
+                                    killer.sendSystemMessage(
+                                        net.minecraft.network.chat.Component.literal(
+                                            "[Solidus] Kill reward: +" + formattedPenalty)
+                                        .withStyle(net.minecraft.ChatFormatting.GREEN));
+                                } else {
+                                    // Atomic transfer rejected (insufficient funds,
+                                    // balance cap, or a hook veto) - NOTHING was moved,
+                                    // so there is nothing to refund.
+                                    java.lang.reflect.Method message = null;
+                                    try {
+                                        message = transferResult.getClass().getMethod("message");
+                                        String reason = (String) message.invoke(transferResult);
                                         victim.sendSystemMessage(
                                             net.minecraft.network.chat.Component.literal(
-                                                "[Solidus] Death penalty: -" + formattedPenalty)
-                                            .withStyle(net.minecraft.ChatFormatting.RED));
-                                        killer.sendSystemMessage(
+                                                "[Solidus] Death penalty failed: " + reason)
+                                            .withStyle(net.minecraft.ChatFormatting.YELLOW));
+                                    } catch (Exception ignored) {
+                                        victim.sendSystemMessage(
                                             net.minecraft.network.chat.Component.literal(
-                                                "[Solidus] Kill reward: +" + formattedPenalty)
-                                            .withStyle(net.minecraft.ChatFormatting.GREEN));
-                                    });
-
-                                    // Log the transactions via reflection
-                                    logDeathTransaction(api, victim, killer, penalty, penaltyPercent);
-                                } else {
-                                    // CRITICAL: Killer addBalance failed after victim was deducted!
-                                    // Refund the victim to prevent money destruction
-                                    try {
-                                        java.lang.reflect.Method refundAdd = apiClass.getMethod(
-                                            "addBalance",
-                                            net.minecraft.server.level.ServerPlayer.class, double.class);
-                                        refundAdd.invoke(api, victim, penalty);
-                                        victim.level().getServer().execute(() ->
-                                            victim.sendSystemMessage(
-                                                net.minecraft.network.chat.Component.literal(
-                                                    "[Solidus] Death penalty transfer failed. Your balance has been restored.")
-                                                .withStyle(net.minecraft.ChatFormatting.YELLOW)));
-                                    } catch (Exception refundEx) {
-                                        // CATASTROPHIC: Both add to killer AND refund to victim failed
-                                        victim.level().getServer().execute(() ->
-                                            victim.sendSystemMessage(
-                                                net.minecraft.network.chat.Component.literal(
-                                                    "[Solidus] CRITICAL: Death penalty failed and refund also failed. Contact admin!")
-                                                .withStyle(net.minecraft.ChatFormatting.RED)));
+                                                "[Solidus] Death penalty failed.")
+                                            .withStyle(net.minecraft.ChatFormatting.YELLOW));
                                     }
                                 }
                             });
-                        } catch (Exception e) {
-                            // Add to killer failed - refund the victim to prevent money destruction
-                            try {
-                                java.lang.reflect.Method refundAdd = apiClass.getMethod(
-                                    "addBalance",
-                                    net.minecraft.server.level.ServerPlayer.class, double.class);
-                                refundAdd.invoke(api, victim, penalty);
-                            } catch (Exception refundEx) {
-                                // Refund also failed - logged but can't do anything more
+
+                            // Log the transactions via reflection (best-effort,
+                            // non-critical)
+                            if (ok) {
+                                logDeathTransaction(api, victim, killer, penalty, penaltyPercent);
                             }
+                        } catch (Exception ignored) {
+                            // Reading the TransferResult failed - the money itself
+                            // moved atomically or not at all, nothing to compensate.
                         }
                     });
                 } catch (Exception e) {
-                    // Subtract from victim failed - non-critical
+                    // transferOffline unavailable - nothing has moved, no refund needed
                 }
             });
-
         } catch (Exception e) {
-            // Solidus API call failed - expected if Solidus is not loaded
+            // Solidus present but API shape changed / not initialized - no-op
         }
     }
 

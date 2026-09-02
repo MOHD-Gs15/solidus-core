@@ -218,12 +218,43 @@ public class PayCommand {
             return;
         }
 
-        // Look up target UUID from the name cache
+        // Look up target UUID from the name cache.
+        // Audit 2.1.3 (two fixes):
+        // 1. Exact-case match wins over case-insensitive match - two distinct
+        //    accounts can share a case-insensitive name (Mojang renames,
+        //    offline-mode proxies), and the old single equalsIgnoreCase pass
+        //    routed /pay offline bob to whichever map entry iteration hit
+        //    first (effectively arbitrary).
+        // 2. The CANONICAL cached name (not the typed string) is used for the
+        //    transfer and the ledger. The old code persisted the raw typed
+        //    string as the recipient's player_name via the transfer UPSERT -
+        //    Unicode case folding (long-s, Kelvin sign, ...) let equalsIgnoreCase
+        //    match "ſteve" to "Steve" and then poison the stored name with the
+        //    homoglyph variant.
         UUID targetUuid = null;
+        String canonicalName = null;
         for (var entry : storage.getPlayerNameCache().entrySet()) {
-            if (entry.getValue().equalsIgnoreCase(targetName)) {
+            if (entry.getValue().equals(targetName)) {
                 targetUuid = entry.getKey();
+                canonicalName = entry.getValue();
                 break;
+            }
+        }
+        if (targetUuid == null) {
+            for (var entry : storage.getPlayerNameCache().entrySet()) {
+                if (entry.getValue().equalsIgnoreCase(targetName)) {
+                    // Only accept the case-insensitive match when it is UNIQUE -
+                    // an ambiguous case-insensitive collision must not route money.
+                    if (targetUuid != null) {
+                        sender.sendSystemMessage(TextUtil.error(
+                            "Ambiguous player name (multiple case-insensitive matches: '"
+                                + canonicalName + "' / '" + entry.getValue()
+                                + "'). Type the exact capitalization."));
+                        return;
+                    }
+                    targetUuid = entry.getKey();
+                    canonicalName = entry.getValue();
+                }
             }
         }
 
@@ -232,6 +263,7 @@ public class PayCommand {
                 "Player '" + targetName + "' not found. They must have joined the server at least once."));
             return;
         }
+        final String receiverCanonicalName = canonicalName;
 
         // Prevent self-transfer
         if (sender.getUUID().equals(targetUuid)) {
@@ -243,9 +275,12 @@ public class PayCommand {
 
         // Offline transfer: use atomic transferOffline() which handles
         // deduct-then-add with automatic rollback on failure.
+        // Audit 2.1.3: receiverCanonicalName (from the server's own cache) is
+        // persisted instead of the typed string - the UPSERT writes this name
+        // into the recipient's balance row.
         balanceManager.transferOffline(
             sender.getUUID(), sender.getName().getString(),
-            receiverUuid, targetName,
+            receiverUuid, receiverCanonicalName,
             amount
         ).thenAccept(result -> {
             var server = sender.level().getServer();
@@ -263,7 +298,7 @@ public class PayCommand {
 
                 // Notify sender
                 sender.sendSystemMessage(
-                    TextUtil.success("You paid " + targetName + " (offline) ")
+                    TextUtil.success("You paid " + receiverCanonicalName + " (offline) ")
                         .append(TextUtil.currency(CurrencyUtil.format(amount)))
                         .append(TextUtil.plain(". "))
                         .append(TextUtil.styled("New balance: ", net.minecraft.ChatFormatting.GRAY))
@@ -276,15 +311,15 @@ public class PayCommand {
                         sender.getName().getString() + " while you were offline.",
                     server);
 
-                // Log transactions
+                // Log transactions (canonical receiver name - audit 2.1.3)
                 transactionLog.log(TransactionLog.Type.PAY_SEND,
                     sender.getUUID(), sender.getName().getString(),
-                    receiverUuid, targetName,
+                    receiverUuid, receiverCanonicalName,
                     amount, null, 0,
-                    "Paid " + targetName + " (offline)");
+                    "Paid " + receiverCanonicalName + " (offline)");
 
                 transactionLog.log(TransactionLog.Type.PAY_RECEIVE,
-                    receiverUuid, targetName,
+                    receiverUuid, receiverCanonicalName,
                     sender.getUUID(), sender.getName().getString(),
                     amount, null, 0,
                     "Received from " + sender.getName().getString() + " (offline)");

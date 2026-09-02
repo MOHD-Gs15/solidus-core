@@ -144,6 +144,8 @@ External mods should not need to compile against Solidus. The `SolidusAPI` class
 - No version coupling — the API contract is method names and parameter types
 - Mods can gracefully degrade if Solidus is not installed
 
+**Trust boundary (audit 2.1.3):** the reflection API is a *cooperation* surface, not a *security* boundary. Any mod loaded into the same JVM already shares Solidus's classes, heap and file system — a hostile mod can bypass `SolidusAPI` entirely (reflect into `BalanceManager`, open the SQLite file directly, or hook the same vanilla packets Solidus hooks). Treat every mod you install as trusted code; vet companion mods before adding them to `mods/`. Two mitigations exist for honest-but-buggy (not hostile) companions: hook-name collisions are rejected and logged at `ERROR` (a silent duplicate registration is the classic way a companion's enforcement quietly disappears), and the `SolidusIntegration` reference example demonstrates the atomic `transferOffline` pattern instead of the crash-prone subtract-then-add ladder.
+
 ---
 
 ## 3. High-Level System Architecture

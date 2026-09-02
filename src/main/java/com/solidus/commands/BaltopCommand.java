@@ -43,7 +43,7 @@ public class BaltopCommand {
                 executeBaltop(player, balanceManager, 1);
                 return 1;
             })
-            .then(Commands.argument("page", com.mojang.brigadier.arguments.IntegerArgumentType.integer(1))
+            .then(Commands.argument("page", com.mojang.brigadier.arguments.IntegerArgumentType.integer(1, 1_000_000))
                 .executes(context -> {
                     ServerPlayer player = context.getSource().getPlayerOrException();
                     int page = com.mojang.brigadier.arguments.IntegerArgumentType.getInteger(context, "page");

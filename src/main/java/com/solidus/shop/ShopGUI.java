@@ -243,6 +243,26 @@ public final class ShopGUI {
     }
 
     /**
+     * Resolves the actual max stack size for a material (static version of
+     * ShopScreenHandler.getMaxStackSize - the lore builder runs in a static
+     * context). Not all items stack to 64 (ender pearls = 16, mace = 1);
+     * falls back to 64 if the item can't be resolved.
+     */
+    private static int resolveMaxStackSize(String material) {
+        try {
+            Item item = BuiltInRegistries.ITEM
+                .get(Identifier.tryParse(material.toLowerCase()))
+                .map(net.minecraft.core.Holder::value).orElse(null);
+            if (item != null) {
+                return item.getDefaultMaxStackSize();
+            }
+        } catch (Exception e) {
+            // Fall through to default
+        }
+        return 64;
+    }
+
+    /**
      * Creates a shop item display ItemStack with price information in the lore.
      * Left-click = Buy 1, Right-click = Sell 1, Shift+Left = Buy stack, Shift+Right = Sell All
      */
@@ -267,8 +287,12 @@ public final class ShopGUI {
 
         if (shopItem.buyPrice() > 0) {
             lore.add(TextUtil.buyPriceLore(shopItem.buyPrice()));
-            lore.add(TextUtil.styled("  Shift+L-Click: Buy x64 for "
-                + CurrencyUtil.format(shopItem.buyPrice() * 64), ChatFormatting.DARK_GREEN));
+            // Audit 2.1.3: use the material's REAL max stack size - the fixed
+            // "x64" line was wrong for ENDER_PEARL (16) and MACE (1), showing
+            // 64x the actual quantity and price the purchase delivers.
+            int bulk = resolveMaxStackSize(shopItem.material());
+            lore.add(TextUtil.styled("  Shift+L-Click: Buy x" + bulk + " for "
+                + CurrencyUtil.format(shopItem.buyPrice() * bulk), ChatFormatting.DARK_GREEN));
         } else {
             lore.add(TextUtil.styled("Buy: Not Available", ChatFormatting.GRAY));
         }

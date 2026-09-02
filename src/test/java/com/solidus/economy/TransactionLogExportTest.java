@@ -220,6 +220,28 @@ class TransactionLogExportTest {
     }
 
     @Test
+    @DisplayName("csvEscape: spreadsheet formula prefixes are neutralized (audit 2.1.3)")
+    void csvEscapeNeutralizesFormulaInjection() {
+        // A field starting with = + - @ or TAB/CR must never reach a privileged
+        // spreadsheet consumer as executable content - it gets a leading apostrophe.
+        assertEquals("'=cmd|'/c calc'!A0", TransactionLog.csvEscape("=cmd|'/c calc'!A0"));
+        assertEquals("\"'=HYPERLINK(\"\"http://evil\"\", \"\"click\"\")\"",
+            TransactionLog.csvEscape("=HYPERLINK(\"http://evil\", \"click\")"));
+        assertEquals("'+SUM(A1:A2)", TransactionLog.csvEscape("+SUM(A1:A2)"));
+        assertEquals("'-1+1", TransactionLog.csvEscape("-1+1"));
+        assertEquals("'@cmd", TransactionLog.csvEscape("@cmd"));
+        assertEquals("'\ttab-prefixed", TransactionLog.csvEscape("\ttab-prefixed"));
+
+        // Formula prefix + comma: apostrophe inside the RFC 4180 quotes
+        assertEquals("\"'=a,b\"", TransactionLog.csvEscape("=a,b"));
+
+        // Fields that merely CONTAIN these characters stay untouched
+        assertEquals("a=b", TransactionLog.csvEscape("a=b"));
+        assertEquals("plain-name", TransactionLog.csvEscape("plain-name"));
+        assertEquals("1+1", TransactionLog.csvEscape("1+1"));
+    }
+
+    @Test
     @DisplayName("writeCsvFile writes UTF-8 content matching buildCsv")
     void writeCsvFileRoundTrip(@TempDir Path dir) throws Exception {
         List<TransactionLog.TransactionEntry> entries = List.of(
