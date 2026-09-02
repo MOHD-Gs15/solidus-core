@@ -257,6 +257,13 @@ public class TransactionLog {
                 }
             } catch (SQLException e) {
                 LOGGER.error("Failed to get transactions for player: {}", playerUuid, e);
+            } catch (RuntimeException e) {
+                // Audit 2.1.3: a corrupt player_uuid row (IllegalArgumentException
+                // from UUID.fromString) previously escaped the SQLException-only
+                // catch, failed the whole future, and silently rendered the
+                // player's history empty. A single corrupt row now skips.
+                LOGGER.warn("Skipping corrupt transaction row for player {}: {}",
+                    playerUuid, e.getMessage());
             }
             return entries;
         }, asyncExecutor);
@@ -459,6 +466,14 @@ public class TransactionLog {
      * RFC 4180 field escaping: quotes a field when it contains a comma,
      * quote, CR, or LF, and doubles any inner quotes. Null becomes empty.
      * Package-private so the export behavior is directly unit-testable.
+     *
+     * <p>Audit 2.1.3 - spreadsheet formula injection guard: a field that BEGINS
+     * with {@code =}, {@code +}, {@code -}, {@code @} (or TAB/CR) would be
+     * passed through unquoted and executed as a formula when an admin opens
+     * the export in Excel/LibreOffice. Player-controlled fields (names from
+     * offline-mode servers or companion-mod ledger rows) must never reach a
+     * privileged consumer as executable content, so such fields get a leading
+     * apostrophe - the standard neutralizing prefix.</p>
      */
     static String csvEscape(String field) {
         if (field == null) return "";
@@ -466,8 +481,16 @@ public class TransactionLog {
             || field.indexOf('"') >= 0
             || field.indexOf('\n') >= 0
             || field.indexOf('\r') >= 0;
-        if (!needsQuoting) return field;
-        return '"' + field.replace("\"", "\"\"") + '"';
+        boolean formulaPrefix = !field.isEmpty() && isFormulaPrefix(field.charAt(0));
+        if (!needsQuoting && !formulaPrefix) return field;
+        String escaped = formulaPrefix ? "'" + field : field;
+        if (!needsQuoting) return escaped;
+        return '"' + escaped.replace("\"", "\"\"") + '"';
+    }
+
+    /** Characters that start a spreadsheet formula when placed at cell start. */
+    private static boolean isFormulaPrefix(char c) {
+        return c == '=' || c == '+' || c == '-' || c == '@' || c == '\t' || c == '\r';
     }
 
     // -- Offline Notification System -----------------------

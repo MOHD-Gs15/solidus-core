@@ -143,8 +143,17 @@ public class ShopManager {
 
             if (root.has("listingFee") && root.get("listingFee").isJsonPrimitive()) {
                 // Config uses whole-percent units: 2 => 0.02
-                AuctionEntry.setListingFeePercent(root.get("listingFee").getAsDouble() / 100.0);
-                SolidusMod.LOGGER.info("Applied shop.json listingFee override.");
+                // Audit 2.1.3: validate - a negative or non-finite fee was
+                // pushed into AuctionEntry unchecked.
+                double listingFee = root.get("listingFee").getAsDouble();
+                if (listingFee < 0 || !Double.isFinite(listingFee) || listingFee > 100) {
+                    SolidusMod.LOGGER.warn(
+                        "shop.json: invalid listingFee {} (expected 0-100 whole percent) - ignored.",
+                        listingFee);
+                } else {
+                    AuctionEntry.setListingFeePercent(listingFee / 100.0);
+                    SolidusMod.LOGGER.info("Applied shop.json listingFee override.");
+                }
             }
         } catch (Exception e) {
             SolidusMod.LOGGER.warn("Ignored invalid global setting in shop.json: {}", e.getMessage());
@@ -177,13 +186,39 @@ public class ShopManager {
 
     /**
      * Parses a shop item from JSON.
+     *
+     * Audit 2.1.3: prices are validated at parse time. Gson's getAsDouble()
+     * happily accepts "NaN", "Infinity" and 1e999 - and NaN bypasses every
+     * `<= 0` sentinel check downstream (NaN <= 0 is false) while rounding to
+     * 0.0 at payout time. A corrupted/mis-edited config then silently turned
+     * every sale of that item into item destruction (items removed, credit
+     * rejected). Reject non-finite/negative prices other than the -1 sentinel.
      */
     private ShopItem parseShopItem(JsonObject obj) {
         String material = obj.get("material").getAsString();
         double buyPrice = obj.has("buy-price") ? obj.get("buy-price").getAsDouble() : -1;
         double sellPrice = obj.has("sell-price") ? obj.get("sell-price").getAsDouble() : -1;
 
+        if (!isValidPrice(buyPrice)) {
+            SolidusMod.LOGGER.warn(
+                "shop.json: invalid buy-price {} for material {} - treating as not purchasable (-1).",
+                buyPrice, material);
+            buyPrice = -1;
+        }
+        if (!isValidPrice(sellPrice)) {
+            SolidusMod.LOGGER.warn(
+                "shop.json: invalid sell-price {} for material {} - treating as not sellable (-1).",
+                sellPrice, material);
+            sellPrice = -1;
+        }
+
         return new ShopItem(material, buyPrice, sellPrice);
+    }
+
+    /** A price is either the -1 "not available" sentinel or a finite value in [0, MAX_TRANSACTION]. */
+    private static boolean isValidPrice(double price) {
+        if (price == -1) return true;
+        return CurrencyUtil.isValidAmount(price);
     }
 
     /**

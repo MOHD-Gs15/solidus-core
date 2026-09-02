@@ -380,14 +380,23 @@ public class SellCommand {
 
         // Then try partial match (contains) - only one-direction: material contains search term
         // The reverse direction (normalized contains material) is too broad and matches unrelated items
+        // Audit 2.1.3: deterministic resolution - the previous scan returned whichever
+        // item a ConcurrentHashMap's hash order surfaced first (changed across restarts),
+        // so "/sell all iron" could nondeterministically sell IRON_AXE instead of IRON_INGOT.
+        // Shortest material wins (closest match); ties broken alphabetically.
+        ShopManager.ShopItem best = null;
         for (Map.Entry<String, ShopManager.ShopSection> sectionEntry : shopManager.getSections().entrySet()) {
             for (ShopManager.ShopItem item : sectionEntry.getValue().items()) {
                 if (item.material().toUpperCase().contains(normalized)) {
-                    return item;
+                    if (best == null
+                        || item.material().length() < best.material().length()
+                        || (item.material().length() == best.material().length()
+                            && item.material().compareTo(best.material()) < 0)) {
+                        best = item;
+                    }
                 }
             }
         }
-
-        return null;
+        return best;
     }
 }

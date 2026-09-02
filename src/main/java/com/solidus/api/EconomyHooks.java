@@ -39,6 +39,13 @@ public final class EconomyHooks {
     /**
      * Registers a transaction hook.
      *
+     * <p>Audit 2.1.3: a duplicate-name rejection is now logged at ERROR. The
+     * registry is first-come-first-served, so a hostile mod that registers a
+     * do-nothing hook under a companion mod's name (e.g. "solidus-governance")
+     * silently disables that mod's veto enforcement - the failure mode
+     * SolidusMod documents as "fell back to standalone mode (no limits, no
+     * freezes, no taxes)". Operators must be able to see this in the log.</p>
+     *
      * @param hook the hook to register
      * @return true if registered, false if a hook with the same name is
      *         already registered (or the hook was null)
@@ -50,7 +57,12 @@ public final class EconomyHooks {
         }
         for (SolidusTransactionHook existing : HOOKS) {
             if (existing.name().equals(hook.name())) {
-                LOGGER.warn("Hook '{}' is already registered. Ignoring duplicate.", hook.name());
+                LOGGER.error(
+                    "Hook name '{}' is already registered by another mod - the new registration is IGNORED. "
+                        + "If you did not expect two mods to claim this hook name, the SECOND one may be "
+                        + "impersonating the first to disable its enforcement (all limits/taxes/vetoes). "
+                        + "Active hooks: {}",
+                    hook.name(), HOOKS.stream().map(SolidusTransactionHook::name).toList());
                 return false;
             }
         }
