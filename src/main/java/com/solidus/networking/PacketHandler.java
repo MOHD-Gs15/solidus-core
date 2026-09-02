@@ -63,6 +63,24 @@ public class PacketHandler {
                 shopManager.clearPendingTransactions(playerUuid);
             }
 
+            // Sell GUI item recovery (2.1.2): vanilla never invokes
+            // AbstractContainerMenu.removed() for a menu left open at
+            // disconnect, so any items the player had already placed in the
+            // sell input area (slots 9-53) would be silently LOST together
+            // with the discarded SellContainer. This event fires on the
+            // server thread BEFORE PlayerList.save() serializes the player,
+            // so running the standard removed() processing here (sell
+            // sellables, return the rest) is persisted correctly.
+            // removed() empties the container, so a later invocation (if any)
+            // is a harmless no-op - no double-payout / dupe risk.
+            ServerPlayer disconnectedPlayer = handler.getPlayer();
+            if (disconnectedPlayer.containerMenu instanceof SellScreenHandler sellHandler) {
+                SolidusMod.LOGGER.info(
+                    "Player {} disconnected with the sell GUI open - processing placed items now.",
+                    disconnectedPlayer.getName().getString());
+                sellHandler.removed(disconnectedPlayer);
+            }
+
             SolidusMod.LOGGER.debug("Cleaned up rate limiter + pending transactions for disconnected player: {}",
                 handler.getPlayer().getName().getString());
         });
