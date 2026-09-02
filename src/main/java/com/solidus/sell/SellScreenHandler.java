@@ -438,13 +438,18 @@ public class SellScreenHandler extends AbstractContainerMenu {
      * Without explicit cursor syncing, the client would show a "ghost cursor"
      * from its optimistic click processing that doesn't match the server state.
      *
-     * This method sends a ClientboundContainerSetSlotPacket with slot -1
-     * (which represents the cursor/carried item) to force the client's
-     * cursor state to match the server's.
+     * MC 26.1.x: the cursor (carried) stack has a DEDICATED packet:
+     * ClientboundSetCursorItemPacket. Sending the legacy-style
+     * ClientboundContainerSetSlotPacket with slot -1 is INVALID here - the
+     * vanilla client calls AbstractContainerMenu.setItem(-1, ...) which throws
+     * IndexOutOfBoundsException (Index -1 out of bounds) and instantly
+     * disconnects the player ("Too many suspicious packets" / network
+     * protocol error). This was the crash that kicked players out of the
+     * sell GUI on every item placement in 2.1.1.
      */
     private void syncCursorToClient() {
-        player.connection.send(new net.minecraft.network.protocol.game.ClientboundContainerSetSlotPacket(
-            this.containerId, 0, -1, this.getCarried()));
+        player.connection.send(new net.minecraft.network.protocol.game.ClientboundSetCursorItemPacket(
+            this.getCarried()));
     }
 
     /**
