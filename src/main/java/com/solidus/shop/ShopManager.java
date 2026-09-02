@@ -383,6 +383,16 @@ public class ShopManager {
                     pendingBuys.remove(playerId);
                 }
             });
+        }).exceptionally(ex -> {
+            // Audit 2.1.3: an exceptionally-completed future skipped thenAccept
+            // (and its finally block) - the pending-buy lock leaked until
+            // disconnect, permanently blocking further purchases.
+            player.level().getServer().execute(() -> {
+                pendingBuys.remove(playerId);
+                SolidusMod.LOGGER.error("Buy deduction future failed for {} - lock released.",
+                    player.getName().getString(), ex);
+            });
+            return null;
         });
     }
 
@@ -447,7 +457,13 @@ public class ShopManager {
         // New flow: remove the items SYNCHRONOUSLY first, then pay for exactly
         // what was actually removed. If crediting fails, the items are restored
         // to the player. Nothing can be duplicated and nothing gets lost.
-        int removedCount = removeItemFromInventory(player, material, quantity);
+        //
+        // Audit 2.1.3: the restore now returns the ACTUAL removed stacks
+        // (with all data components - enchantments, names, durability) instead
+        // of manufacturing fresh registry stacks, which silently stripped every
+        // NBT component from restored items.
+        java.util.List<net.minecraft.world.item.ItemStack> removedStacks = new java.util.ArrayList<>();
+        int removedCount = removeItemFromInventory(player, material, quantity, removedStacks);
         if (removedCount <= 0) {
             pendingSells.remove(playerId);
             player.sendSystemMessage(TextUtil.error("You don't have " + quantity + "x " + material + " in your inventory."));
@@ -463,9 +479,10 @@ public class ShopManager {
                 try {
                     if (newBalance < 0) {
                         // Balance add failed - give the items back so nothing is lost.
+                        // The actual removed stacks (NBT included) are restored.
                         SolidusMod.LOGGER.error("Sell balance add failed for {}! Restoring {}x {}.",
                             player.getName().getString(), removedCount, material);
-                        restoreItemsToPlayer(player, material, removedCount);
+                        restoreRemovedStacks(player, removedStacks);
                         player.sendSystemMessage(TextUtil.error(
                             "Transaction error. Your items have been returned. Please try again."));
                         return;
@@ -497,7 +514,33 @@ public class ShopManager {
                     pendingSells.remove(playerId);
                 }
             });
+        }).exceptionally(ex -> {
+            // Audit 2.1.3: an exceptionally-completed future skipped thenAccept
+            // entirely (and its finally block) - the pending-sell lock leaked
+            // until disconnect AND the removed items were never restored.
+            player.level().getServer().execute(() -> {
+                pendingSells.remove(playerId);
+                SolidusMod.LOGGER.error("Sell payout future failed for {} - restoring {}x {}.",
+                    player.getName().getString(), removedCount, material, ex);
+                restoreRemovedStacks(player, removedStacks);
+                player.sendSystemMessage(TextUtil.error(
+                    "Transaction error. Your items have been returned. Please try again."));
+            });
+            return null;
         });
+    }
+
+    /**
+     * Restores the actual removed stacks to the player (inventory first,
+     * feet-drop fallback) - preserving all data components.
+     */
+    private void restoreRemovedStacks(ServerPlayer player, java.util.List<net.minecraft.world.item.ItemStack> stacks) {
+        for (net.minecraft.world.item.ItemStack stack : stacks) {
+            if (stack == null || stack.isEmpty()) continue;
+            if (!player.getInventory().add(stack.copy())) {
+                player.drop(stack.copy(), false);
+            }
+        }
     }
 
     /**
@@ -505,7 +548,13 @@ public class ShopManager {
      * Re-adds stacks using each item's real max stack size; whatever does not
      * fit into the inventory is dropped at the player's feet so no value can
      * ever be silently destroyed.
+     *
+     * @deprecated superseded by {@link #restoreRemovedStacks} (audit 2.1.3):
+     * this rebuilds items from the registry and strips all data components
+     * (enchantments, custom names, durability). Kept as a last-resort
+     * fallback for callers without a stack snapshot.
      */
+    @Deprecated
     private void restoreItemsToPlayer(ServerPlayer player, String material, int count) {
         net.minecraft.world.item.Item resolvedItem = resolveItem(material);
         if (resolvedItem == null) {
@@ -585,8 +634,17 @@ public class ShopManager {
      * Armor slots (36-39) and offhand (40) are protected - this prevents
      * players from accidentally selling equipped armor via the shop GUI.
      * The same safety pattern is used in SellCommand.java.
+     *
+     * Audit 2.1.3: optionally collects a snapshot of every removed partial
+     * stack (with data components) so a failed payout can restore the exact
+     * items instead of manufacturing fresh NBT-less ones.
      */
     private int removeItemFromInventory(ServerPlayer player, String material, int quantity) {
+        return removeItemFromInventory(player, material, quantity, null);
+    }
+
+    private int removeItemFromInventory(ServerPlayer player, String material, int quantity,
+                                         java.util.List<net.minecraft.world.item.ItemStack> removedSink) {
         int remaining = quantity;
         int removed = 0;
         // Only remove from main inventory (slots 0-35), skip armor and offhand
@@ -594,6 +652,11 @@ public class ShopManager {
             net.minecraft.world.item.ItemStack stack = player.getInventory().getItem(i);
             if (!stack.isEmpty() && getMaterialName(stack).equalsIgnoreCase(material)) {
                 int toRemove = Math.min(stack.getCount(), remaining);
+                if (removedSink != null && toRemove > 0) {
+                    net.minecraft.world.item.ItemStack snapshot = stack.copy();
+                    snapshot.setCount(toRemove);
+                    removedSink.add(snapshot);
+                }
                 stack.shrink(toRemove);
                 remaining -= toRemove;
                 removed += toRemove;
@@ -606,19 +669,43 @@ public class ShopManager {
      * Processes earnings from a bulk sell operation (sell all / sell GUI).
      * Adds the total earnings to the player's balance and logs the transaction.
      *
+     * Audit 2.1.3: accepts a snapshot of every consumed stack (regular items,
+     * shulker contents, sold shulker boxes). Previously a failed credit
+     * (reached via the MAX_TRANSACTION payout cap or a DB error) logged
+     * "Items lost" and destroyed them. Now every consumed stack is restored.
+     *
      * @param player        The selling player
      * @param totalEarnings The total amount earned from selling
      * @param totalItemsSold The total number of items sold
      */
     public void processSellAllEarnings(ServerPlayer player, double totalEarnings, int totalItemsSold) {
+        processSellAllEarnings(player, totalEarnings, totalItemsSold, null);
+    }
+
+    /**
+     * Processes earnings from a bulk sell with a restore snapshot.
+     *
+     * @param consumedStacks Exact stacks consumed for this payout (null = none
+     *                       recorded; e.g. a caller with nothing to restore)
+     */
+    public void processSellAllEarnings(ServerPlayer player, double totalEarnings, int totalItemsSold,
+                                        java.util.List<net.minecraft.world.item.ItemStack> consumedStacks) {
         BalanceManager balanceManager = economyEngine.getBalanceManager();
 
         balanceManager.addBalance(player, totalEarnings).thenAccept(newBalance -> {
             player.level().getServer().execute(() -> {
                 if (newBalance < 0) {
-                    SolidusMod.LOGGER.error("CRITICAL: Sell-all balance add failed for {}! Items lost. Amount: {}",
-                        player.getName().getString(), totalEarnings);
-                    player.sendSystemMessage(TextUtil.error("Transaction error. Please contact an admin."));
+                    // Audit 2.1.3: credit failed (payout cap / DB error) -
+                    // restore every consumed stack instead of destroying it.
+                    SolidusMod.LOGGER.error(
+                        "Sell-all balance add failed for {}! Restoring {} consumed stack(s). Amount: {}",
+                        player.getName().getString(),
+                        consumedStacks != null ? consumedStacks.size() : 0, totalEarnings);
+                    if (consumedStacks != null) {
+                        restoreRemovedStacks(player, consumedStacks);
+                    }
+                    player.sendSystemMessage(TextUtil.error(
+                        "Transaction error. Your items have been returned. Please try again."));
                     return;
                 }
 
@@ -645,6 +732,19 @@ public class ShopManager {
                         .append(TextUtil.currency(CurrencyUtil.format(newBalance)))
                 );
             });
+        }).exceptionally(ex -> {
+            // Audit 2.1.3: exceptionally-completed futures skipped thenAccept -
+            // restore the consumed stacks and never silently destroy them.
+            player.level().getServer().execute(() -> {
+                SolidusMod.LOGGER.error("Sell-all payout future failed for {} - restoring consumed stacks.",
+                    player.getName().getString(), ex);
+                if (consumedStacks != null) {
+                    restoreRemovedStacks(player, consumedStacks);
+                }
+                player.sendSystemMessage(TextUtil.error(
+                    "Transaction error. Your items have been returned. Please try again."));
+            });
+            return null;
         });
     }
 

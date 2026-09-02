@@ -168,6 +168,16 @@ public class SellScreenHandler extends AbstractContainerMenu {
     @Override
     // TODO: 26.1.x - ClickType -> ContainerInput; button param may be removed (absorbed into ContainerInput)
     public void clicked(int slotIndex, int button, ContainerInput containerInput, Player player) {
+        // Defensive: only the player who owns this handler may interact.
+        // Today the only reachable caller (PacketHandler) routes each click
+        // through the clicking player's own menu, but this invariant must not
+        // depend on the dispatcher staying correct - mirror ShopScreenHandler.
+        if (player != this.player) {
+            SolidusMod.LOGGER.warn("Rejected click on sell GUI of {} from a different actor.",
+                this.player.getName().getString());
+            return;
+        }
+
         // Handle clicks outside the container (drop cursor item)
         if (slotIndex == -999) {
             ItemStack cursor = getCarried();
@@ -204,7 +214,12 @@ public class SellScreenHandler extends AbstractContainerMenu {
         }
 
         // Handle player inventory slots (54+)
-        if (slotIndex >= 54) {
+        // SECURITY FIX (audit 2.1.3): slotIndex comes straight from a network
+        // packet and the mixin runs BEFORE vanilla's bounds validation, so a
+        // forged slotNum >= this.slots.size() reached slots.get() and threw an
+        // uncaught IndexOutOfBoundsException through the mixin - kicking the
+        // sender. Hard upper bound, mirroring ShopScreenHandler.
+        if (slotIndex >= 54 && slotIndex < this.slots.size()) {
             handleInventorySlotClick(slotIndex, button, containerInput);
             syncCursorToClient();
             return;
@@ -469,6 +484,12 @@ public class SellScreenHandler extends AbstractContainerMenu {
         // the PacketHandler intercepts all clicks for Solidus GUIs,
         // this method should never be reached. We implement it as a safety net.
 
+        // Bounds guard (audit 2.1.3): index is an int surface that a future
+        // caller could pass unvalidated; slots.get() must stay in range.
+        if (index < 0 || index >= this.slots.size()) {
+            return ItemStack.EMPTY;
+        }
+
         if (index < 9) {
             // UI slot - block
             return ItemStack.EMPTY;
@@ -567,6 +588,14 @@ public class SellScreenHandler extends AbstractContainerMenu {
                 totalEarnings += result.earnings;
                 totalItemsSold += result.itemsSold;
 
+                // Audit 2.1.3: snapshot exactly what was consumed - the sold
+                // contents, plus the (emptied) box itself when it was sold too.
+                // Previously shulker payouts were excluded from the failure
+                // restore, silently destroying contents + box on credit failure.
+                if (result.earnings > 0) {
+                    soldForCredit.addAll(result.soldStacks);
+                }
+
                 if (result.hasRemainingItems()) {
                     // Shulker box still has unsellable items - return it
                     unsellableItems.add(result.updatedShulkerBox);
@@ -577,6 +606,8 @@ public class SellScreenHandler extends AbstractContainerMenu {
                     if (shulkerShopItem != null && shulkerShopItem.sellPrice() > 0) {
                         totalEarnings += shulkerShopItem.sellPrice();
                         totalItemsSold += 1;
+                        // The emptied box is consumed - snapshot it for restore.
+                        soldForCredit.add(result.updatedShulkerBox.copy());
                     } else {
                         // Return empty shulker box
                         ItemStack emptyShulker = stack.copy();
@@ -668,6 +699,21 @@ public class SellScreenHandler extends AbstractContainerMenu {
                             .append(TextUtil.currency(CurrencyUtil.format(newBalance)))
                     );
                 });
+            }).exceptionally(ex -> {
+                // Audit 2.1.3: an exceptionally-completed payout future
+                // skipped thenAccept entirely - the consumed stacks were
+                // never restored. Restore them here.
+                this.player.level().getServer().execute(() -> {
+                    SolidusMod.LOGGER.error(
+                        "Sell GUI payout future failed for {} - restoring {} consumed stack(s).",
+                        this.player.getName().getString(), finalSoldStacks.size(), ex);
+                    for (ItemStack restore : finalSoldStacks) {
+                        returnItemToPlayer(restore);
+                    }
+                    this.player.sendSystemMessage(TextUtil.error(
+                        "Transaction error. Your placed items have been returned. Please try again."));
+                });
+                return null;
             });
         } else if (unsellableItems.isEmpty()) {
             // No items were placed in the GUI
@@ -689,7 +735,8 @@ public class SellScreenHandler extends AbstractContainerMenu {
     private record ShulkerProcessResult(
         double earnings,
         int itemsSold,
-        ItemStack updatedShulkerBox
+        ItemStack updatedShulkerBox,
+        java.util.List<ItemStack> soldStacks
     ) {
         boolean hasRemainingItems() {
             ItemContainerContents contents = updatedShulkerBox.get(DataComponents.CONTAINER);
@@ -711,7 +758,7 @@ public class SellScreenHandler extends AbstractContainerMenu {
     private ShulkerProcessResult processShulkerBox(ItemStack shulkerStack) {
         ItemContainerContents contents = shulkerStack.get(DataComponents.CONTAINER);
         if (contents == null) {
-            return new ShulkerProcessResult(0, 0, shulkerStack.copy());
+            return new ShulkerProcessResult(0, 0, shulkerStack.copy(), java.util.List.of());
         }
 
         // Read items from the shulker box into a mutable list
@@ -721,6 +768,7 @@ public class SellScreenHandler extends AbstractContainerMenu {
 
         double earnings = 0.0;
         int itemsSold = 0;
+        java.util.List<ItemStack> soldStacks = new java.util.ArrayList<>();
 
         // Process each item in the shulker box
         for (int i = 0; i < shulkerItems.size(); i++) {
@@ -735,6 +783,7 @@ public class SellScreenHandler extends AbstractContainerMenu {
                 double value = CurrencyUtil.round(shopItem.sellPrice() * item.getCount());
                 earnings += value;
                 itemsSold += item.getCount();
+                soldStacks.add(item.copy()); // snapshot for restore (audit 2.1.3)
                 shulkerItems.set(i, ItemStack.EMPTY); // Remove sold item
             }
             // Unsellable items remain in their slot
@@ -744,7 +793,7 @@ public class SellScreenHandler extends AbstractContainerMenu {
         ItemStack updatedShulker = shulkerStack.copy();
         updatedShulker.set(DataComponents.CONTAINER, ItemContainerContents.fromItems(shulkerItems));
 
-        return new ShulkerProcessResult(earnings, itemsSold, updatedShulker);
+        return new ShulkerProcessResult(earnings, itemsSold, updatedShulker, soldStacks);
     }
 
     // -- Utility Methods -------------------------------------

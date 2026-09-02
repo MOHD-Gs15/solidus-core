@@ -111,6 +111,14 @@ public class AuctionScreenHandler extends AbstractContainerMenu {
 
     @Override
     public void clicked(int slotIndex, int button, net.minecraft.world.inventory.ContainerInput containerInput, Player player) {
+        // Defensive (audit 2.1.3): only the player who owns this handler may
+        // interact - mirrors ShopScreenHandler's invariant.
+        if (player != this.player) {
+            com.solidus.SolidusMod.LOGGER.warn("Rejected click on auction GUI of {} from a different actor.",
+                this.player.getName().getString());
+            return;
+        }
+
         // Player inventory clicks (slot >= 54) - return without action.
         // Note: Vanilla processing is already cancelled by the ServerPlayerEntityMixin,
         // so player inventory interaction is blocked while the auction GUI is open.
@@ -123,6 +131,16 @@ public class AuctionScreenHandler extends AbstractContainerMenu {
 
         GuiSlot guiSlot = slotMap.get(slotIndex);
         if (guiSlot == null) {
+            return;
+        }
+
+        // Audit 2.1.3: the GUI advertises "Left-Click to Purchase" (see the
+        // listing lore), but ANY click type (right-click, number-key SWAP,
+        // drag, THROW) previously triggered a full purchase attempt. Accept
+        // only a plain left PICKUP for item slots so forged/unusual gestures
+        // can't initiate settlement, matching the documented interaction.
+        if (guiSlot.type() == GuiSlot.Type.AUCTION_ITEM
+            && (containerInput != net.minecraft.world.inventory.ContainerInput.PICKUP || button != 0)) {
             return;
         }
 
