@@ -597,7 +597,63 @@ public class SQLiteStorage {
         final double roundedAmount = CurrencyUtil.round(amount);
 
         return CompletableFuture.supplyAsync(() ->
-            executeAtomicTransfer(senderUuid, senderName, receiverUuid, receiverName, roundedAmount),
+            executeAtomicTransfer(senderUuid, senderName, receiverUuid, receiverName,
+                roundedAmount, java.util.List.of()),
+            asyncExecutor);
+    }
+
+    /**
+     * One ledger row to be committed atomically with a transfer. The row is
+     * inserted INSIDE the transfer's BEGIN IMMEDIATE ... COMMIT block, so the
+     * evidence that money moved becomes durable at the same instant as the
+     * money itself - a crash can never leave committed money with no ledger
+     * row (which the auction recovery sweep treats as "never paid" and
+     * re-lists, printing money).
+     *
+     * @param type         ledger row type (e.g. AUCTION_SOLD for the seller side)
+     * @param playerUuid   primary player UUID
+     * @param playerName   primary player name
+     * @param targetUuid   secondary player UUID (nullable)
+     * @param targetName   secondary player name (nullable)
+     * @param amount       currency amount
+     * @param itemMaterial item material (nullable)
+     * @param itemQuantity item quantity
+     * @param description  human-readable description
+     */
+    public record AtomicLedgerRow(
+        TransactionLog.Type type,
+        UUID playerUuid, String playerName,
+        UUID targetUuid, String targetName,
+        double amount,
+        String itemMaterial, int itemQuantity,
+        String description
+    ) {}
+
+    /**
+     * Atomic transfer with in-transaction ledger evidence (audit 2.1.3).
+     *
+     * <p>Identical atomicity guarantees to {@link #transferAtomic}, plus the
+     * supplied ledger rows are inserted inside the SAME SQLite transaction as
+     * the two balance updates. Used by auction settlement so the
+     * AUCTION_BOUGHT / AUCTION_SOLD evidence commits atomically with the
+     * buyer-to-seller payment.</p>
+     *
+     * <p>If any ledger insert fails, the whole transaction (money included)
+     * rolls back - evidence and money stay consistent in both directions.</p>
+     */
+    public CompletableFuture<TransferOutcome> transferAtomicWithLedger(
+            UUID senderUuid, String senderName,
+            UUID receiverUuid, String receiverName,
+            double amount,
+            java.util.List<AtomicLedgerRow> ledgerRows) {
+        ensureInitialized();
+        final double roundedAmount = CurrencyUtil.round(amount);
+        final java.util.List<AtomicLedgerRow> rows =
+            ledgerRows != null ? ledgerRows : java.util.List.of();
+
+        return CompletableFuture.supplyAsync(() ->
+            executeAtomicTransfer(senderUuid, senderName, receiverUuid, receiverName,
+                roundedAmount, rows),
             asyncExecutor);
     }
 
@@ -617,6 +673,15 @@ public class SQLiteStorage {
             UUID senderUuid, String senderName,
             UUID receiverUuid, String receiverName,
             double roundedAmount) {
+        return executeAtomicTransfer(senderUuid, senderName, receiverUuid, receiverName,
+            roundedAmount, java.util.List.of());
+    }
+
+    private TransferOutcome executeAtomicTransfer(
+            UUID senderUuid, String senderName,
+            UUID receiverUuid, String receiverName,
+            double roundedAmount,
+            java.util.List<AtomicLedgerRow> ledgerRows) {
 
         if (!CurrencyUtil.isValidAmount(roundedAmount)) {
             LOGGER.warn("Atomic transfer rejected: invalid amount {}", roundedAmount);
@@ -652,6 +717,23 @@ public class SQLiteStorage {
 
             upsertBalanceInTx(senderUuid, senderName, senderNew);
             upsertBalanceInTx(receiverUuid, receiverName, receiverNew);
+
+            // Audit 2.1.3: ledger evidence commits WITH the money. A failure
+            // rolls the whole transaction back (money + rows together) - the
+            // recovery sweep can never again mistake paid money for unpaid.
+            for (AtomicLedgerRow row : ledgerRows) {
+                boolean inserted = TransactionLog.insertRowSync(
+                    persistentConnection, row.type(),
+                    row.playerUuid(), row.playerName(),
+                    row.targetUuid(), row.targetName(),
+                    row.amount(), row.itemMaterial(), row.itemQuantity(),
+                    row.description());
+                if (!inserted) {
+                    LOGGER.warn("Atomic transfer: ledger insert failed - rolling back money + ledger together");
+                    rollbackTransfer();
+                    return new TransferOutcome(TransferStatus.PERSIST_ERROR, 0, 0);
+                }
+            }
 
             try (Statement tx = persistentConnection.createStatement()) {
                 tx.execute("COMMIT");

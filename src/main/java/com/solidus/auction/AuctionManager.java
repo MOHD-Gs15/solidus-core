@@ -509,20 +509,43 @@ public class AuctionManager {
                     return;
                 }
 
-                // ATOMIC SETTLEMENT FIX: move buyer -> seller payment inside ONE
-                // SQLite transaction (BEGIN IMMEDIATE ... COMMIT). The previous
-                // subtract-then-add chain left a crash window where the buyer was
-                // charged, the seller never paid, and the startup sweep re-listed
-                // the item - buyer money silently lost. transferAtomic rolls back
-                // both legs together, so an interrupted settlement leaves an
-                // unpaid (re-listable) listing and intact balances. This path
-                // deliberately does NOT fire the generic transfer hooks: the
-                // auction flow has its own lifecycle (allowAuctionPurchase veto
-                // ran above; afterAuctionSale notification fires below).
+                // ATOMIC SETTLEMENT FIX + AUDIT 2.1.3: move buyer -> seller
+                // payment AND write the AUCTION_BOUGHT / AUCTION_SOLD ledger
+                // rows inside ONE SQLite transaction (BEGIN IMMEDIATE ... COMMIT).
+                //
+                // The ledger rows used to be queued as separate fire-and-forget
+                // tasks AFTER the money committed. A hard crash in that window
+                // left committed money with no AUCTION_SOLD evidence - the
+                // startup sweep treats that as "never paid" and re-lists the
+                // item, so the seller gets paid AND the item sells again:
+                // money printing. With the rows inside the transaction, money
+                // and evidence are always consistent.
+                //
+                // This path deliberately does NOT fire the generic transfer
+                // hooks: the auction flow has its own lifecycle
+                // (allowAuctionPurchase veto ran above; afterAuctionSale
+                // notification fires below).
+                java.util.List<com.solidus.economy.SQLiteStorage.AtomicLedgerRow> settlementLedger =
+                    java.util.List.of(
+                        new com.solidus.economy.SQLiteStorage.AtomicLedgerRow(
+                            TransactionLog.Type.AUCTION_BOUGHT,
+                            buyer.getUUID(), buyer.getName().getString(),
+                            entry.sellerUuid(), entry.sellerName(),
+                            entry.price(), entry.materialName(), entry.quantity(),
+                            "Bought " + entry.quantity() + "x " + entry.materialName()
+                                + " from " + entry.sellerName()),
+                        new com.solidus.economy.SQLiteStorage.AtomicLedgerRow(
+                            TransactionLog.Type.AUCTION_SOLD,
+                            entry.sellerUuid(), entry.sellerName(),
+                            buyer.getUUID(), buyer.getName().getString(),
+                            entry.price(), entry.materialName(), entry.quantity(),
+                            "Sold " + entry.quantity() + "x " + entry.materialName()
+                                + " to " + buyer.getName().getString()));
+
                 balanceManager.settleAuctionPurchase(
                         buyer.getUUID(), buyer.getName().getString(),
                         entry.sellerUuid(), entry.sellerName(),
-                        entry.price())
+                        entry.price(), settlementLedger)
                     .thenAccept(transferResult -> {
                         buyer.level().getServer().execute(() -> {
                             if (!transferResult.success()) {
@@ -544,23 +567,11 @@ public class AuctionManager {
                                 buyer.sendSystemMessage(TextUtil.warning("Inventory full! Item dropped at your feet."));
                             }
 
-                            // Log transaction for buyer
-                            economyEngine.getTransactionLog().log(
-                                TransactionLog.Type.AUCTION_BOUGHT,
-                                buyer.getUUID(), buyer.getName().getString(),
-                                entry.sellerUuid(), entry.sellerName(),
-                                entry.price(), entry.materialName(), entry.quantity(),
-                                "Bought " + entry.quantity() + "x " + entry.materialName() + " from " + entry.sellerName()
-                            );
-
-                            // Log transaction for seller (may be offline)
-                            economyEngine.getTransactionLog().log(
-                                TransactionLog.Type.AUCTION_SOLD,
-                                entry.sellerUuid(), entry.sellerName(),
-                                buyer.getUUID(), buyer.getName().getString(),
-                                entry.price(), entry.materialName(), entry.quantity(),
-                                "Sold " + entry.quantity() + "x " + entry.materialName() + " to " + buyer.getName().getString()
-                            );
+                            // The AUCTION_BOUGHT / AUCTION_SOLD ledger rows were
+                            // committed INSIDE the money transaction above
+                            // (audit 2.1.3) - no separate post-hoc logging here
+                            // (it would duplicate the rows and reopen the crash
+                            // window the in-transaction write just closed).
 
                             // Queue notification for seller (delivers immediately if online)
                             economyEngine.getTransactionLog().queueNotification(
@@ -857,7 +868,17 @@ public class AuctionManager {
             currentServer.execute(() -> {
                 for (AuctionEntry entry : toReturn) {
                     ServerPlayer seller = currentServer.getPlayerList().getPlayer(entry.sellerUuid());
-                    if (seller == null) continue; // disconnected in the meantime - harmless
+                    if (seller == null) {
+                        // Audit 2.1.3: the row was already archived + deleted
+                        // when claimed (claimExpiredRowForReturn) and the
+                        // onlineSellers snapshot is stale by now - the player
+                        // disconnected between the snapshot and the hand-out.
+                        // Previously this silently DESTROYED the item (row gone,
+                        // hand-out skipped). Re-insert it as a collectible
+                        // status=2 row so /ah collect recovers it.
+                        reinsertAsCollectible(entry);
+                        continue;
+                    }
 
                     ItemStack returnedItem = deserializeItemStack(
                         entry.itemNbt(), entry.materialName(), entry.quantity());
@@ -870,6 +891,44 @@ public class AuctionManager {
                 }
             });
         });
+    }
+
+    /**
+     * Audit 2.1.3: re-inserts an expired listing row (status = 2, collectible
+     * via /ah collect) after a direct hand-out could not be delivered because
+     * the seller disconnected between the online-seller snapshot and the
+     * hand-out. Runs on the auction executor so it serializes with every other
+     * listing mutation. Idempotent: an INSERT OR IGNORE on the primary key
+     * protects against a duplicate hand-out race.
+     */
+    private void reinsertAsCollectible(AuctionEntry entry) {
+        CompletableFuture.runAsync(() -> {
+            String sql = """
+                INSERT OR IGNORE INTO auction_listings
+                (listing_id, seller_uuid, seller_name, material_name, quantity,
+                 item_nbt, price, listed_timestamp, expire_timestamp, status)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 2)
+            """;
+            try (PreparedStatement ps = persistentConnection.prepareStatement(sql)) {
+                ps.setString(1, entry.listingId().toString());
+                ps.setString(2, entry.sellerUuid().toString());
+                ps.setString(3, entry.sellerName());
+                ps.setString(4, entry.materialName());
+                ps.setInt(5, entry.quantity());
+                ps.setString(6, entry.itemNbt());
+                ps.setDouble(7, entry.price());
+                ps.setLong(8, entry.listedTimestamp());
+                ps.setLong(9, entry.expireTimestamp());
+                ps.executeUpdate();
+                SolidusMod.LOGGER.warn(
+                    "Expired listing {} re-inserted as collectible - seller {} disconnected before hand-out.",
+                    entry.listingId(), entry.sellerName());
+            } catch (SQLException e) {
+                SolidusMod.LOGGER.error(
+                    "Could not re-insert expired listing {} as collectible - item may be lost; check auction_sold_history.",
+                    entry.listingId(), e);
+            }
+        }, asyncExecutor);
     }
 
     // -- Internal Helpers ----------------------------------
@@ -908,7 +967,11 @@ public class AuctionManager {
 
     private void markAsUnsold(UUID listingId) {
         CompletableFuture.runAsync(() -> {
-            String sql = "UPDATE auction_listings SET status = 0 WHERE listing_id = ?";
+            // Audit 2.1.3: claim guard added - flip 1 -> 0 ONLY. Every other
+            // state mutation in this file carries an "AND status = ..." guard;
+            // the unconditional UPDATE could resurrect any state a future
+            // caller or a concurrent recovery sweep left behind.
+            String sql = "UPDATE auction_listings SET status = 0 WHERE listing_id = ? AND status = 1";
             try (PreparedStatement ps = persistentConnection.prepareStatement(sql)) {
                 ps.setString(1, listingId.toString());
                 ps.executeUpdate();

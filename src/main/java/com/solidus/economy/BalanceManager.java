@@ -298,6 +298,41 @@ public class BalanceManager {
             UUID buyerUuid, String buyerName,
             UUID sellerUuid, String sellerName,
             double amount) {
+        return settleAuctionPurchase(buyerUuid, buyerName, sellerUuid, sellerName, amount, null);
+    }
+
+    /**
+     * Moves an auction buyer's payment to the seller inside ONE atomic SQLite
+     * transaction, <b>with the AUCTION_BOUGHT / AUCTION_SOLD ledger rows
+     * inserted inside the same transaction</b> (audit 2.1.3).
+     *
+     * <p>Previously the ledger rows were queued as separate fire-and-forget
+     * tasks AFTER the money committed. A hard crash in that window (executor
+     * backlog widens it considerably) left committed money with no
+     * AUCTION_SOLD evidence - and the startup recovery sweep treats a
+     * status=SOLD row with no matching log entry as "never paid", re-listing
+     * an item the seller was already paid for: money printing. With the rows
+     * inside the transaction, money and evidence are always consistent:
+     * committed money implies a matching ledger row, and an absent row
+     * implies no money moved.</p>
+     *
+     * <p>If a ledger insert fails, the ENTIRE transaction rolls back - money
+     * and rows stay consistent in both directions.</p>
+     *
+     * @param buyerUuid   the buyer's UUID
+     * @param buyerName   the buyer's name
+     * @param sellerUuid  the seller's UUID
+     * @param sellerName  the seller's name
+     * @param amount      the listing price to move buyer -> seller
+     * @param ledgerRows  ledger rows to commit with the transfer (null = none);
+     *                    callers must NOT log the same rows again afterwards
+     * @return CompletableFuture with TransferResult indicating outcome
+     */
+    public CompletableFuture<TransferResult> settleAuctionPurchase(
+            UUID buyerUuid, String buyerName,
+            UUID sellerUuid, String sellerName,
+            double amount,
+            java.util.List<SQLiteStorage.AtomicLedgerRow> ledgerRows) {
         // Defense-in-depth validation (the auction already validates price > 0
         // and rejects self-purchases; these guards protect against future
         // callers bypassing those checks).
@@ -313,7 +348,7 @@ public class BalanceManager {
             return CompletableFuture.completedFuture(
                 new TransferResult(false, "You cannot buy your own listing.", 0, 0));
         }
-        return storage.transferAtomic(buyerUuid, buyerName, sellerUuid, sellerName, amount)
+        return storage.transferAtomicWithLedger(buyerUuid, buyerName, sellerUuid, sellerName, amount, ledgerRows)
             .thenApply(outcome -> switch (outcome.status()) {
                 case SUCCESS ->
                     new TransferResult(true, "Transfer successful.",

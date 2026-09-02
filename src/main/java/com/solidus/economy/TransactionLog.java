@@ -167,6 +167,13 @@ public class TransactionLog {
      * Logs a transaction to the persistent database.
      * This is fire-and-forget - no return value needed.
      *
+     * <p><b>Audit 2.1.3:</b> durability-critical callers (auction settlement)
+     * must NOT use this method - the row is queued as a separate executor task
+     * AFTER the money movement commits, so a crash between the two leaves
+     * committed money with no ledger evidence. Those callers use
+     * {@code SQLiteStorage.transferAtomicWithLedger}, which inserts the ledger
+     * rows INSIDE the same SQLite transaction as the balance updates.
+     *
      * @param type         The transaction type
      * @param playerUuid   The primary player's UUID
      * @param playerName   The primary player's name
@@ -181,30 +188,52 @@ public class TransactionLog {
                     UUID targetUuid, String targetName,
                     double amount, String itemMaterial, int itemQuantity,
                     String description) {
-        CompletableFuture.runAsync(() -> {
-            String sql = """
-                INSERT INTO transaction_log
-                (timestamp, type, player_uuid, player_name, target_uuid, target_name,
-                 amount, item_material, item_quantity, description)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """;
-            try (PreparedStatement ps = persistentConnection.prepareStatement(sql)) {
-                long now = System.currentTimeMillis();
-                ps.setLong(1, now);
-                ps.setString(2, type.code());
-                ps.setString(3, playerUuid.toString());
-                ps.setString(4, playerName);
-                ps.setString(5, targetUuid != null ? targetUuid.toString() : null);
-                ps.setString(6, targetName);
-                ps.setDouble(7, amount);
-                ps.setString(8, itemMaterial);
-                ps.setInt(9, itemQuantity);
-                ps.setString(10, description);
-                ps.executeUpdate();
-            } catch (SQLException e) {
-                LOGGER.error("Failed to log transaction: {} for player: {}", type, playerName, e);
-            }
-        }, asyncExecutor);
+        CompletableFuture.runAsync(() ->
+            insertRowSync(persistentConnection, type, playerUuid, playerName,
+                targetUuid, targetName, amount, itemMaterial, itemQuantity, description),
+            asyncExecutor);
+    }
+
+    /**
+     * Synchronously inserts one ledger row on the given connection.
+     *
+     * <p>Used two ways: (a) as the body of the async {@link #log} helper, and
+     * (b) by {@code SQLiteStorage.transferAtomicWithLedger} to write auction
+     * settlement evidence INSIDE the money transaction itself - money and
+     * evidence then commit atomically, so the startup recovery sweep can
+     * always distinguish "paid" from "never paid" listings.
+     *
+     * @return true if the row was inserted, false on SQLException (caller
+     *         decides whether to roll back the surrounding transaction)
+     */
+    static boolean insertRowSync(Connection conn, Type type, UUID playerUuid, String playerName,
+                                 UUID targetUuid, String targetName,
+                                 double amount, String itemMaterial, int itemQuantity,
+                                 String description) {
+        String sql = """
+            INSERT INTO transaction_log
+            (timestamp, type, player_uuid, player_name, target_uuid, target_name,
+             amount, item_material, item_quantity, description)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """;
+        try (PreparedStatement ps = conn.prepareStatement(sql)) {
+            long now = System.currentTimeMillis();
+            ps.setLong(1, now);
+            ps.setString(2, type.code());
+            ps.setString(3, playerUuid.toString());
+            ps.setString(4, playerName);
+            ps.setString(5, targetUuid != null ? targetUuid.toString() : null);
+            ps.setString(6, targetName);
+            ps.setDouble(7, amount);
+            ps.setString(8, itemMaterial);
+            ps.setInt(9, itemQuantity);
+            ps.setString(10, description);
+            ps.executeUpdate();
+            return true;
+        } catch (SQLException e) {
+            LOGGER.error("Failed to log transaction: {} for player: {}", type, playerName, e);
+            return false;
+        }
     }
 
     /**
