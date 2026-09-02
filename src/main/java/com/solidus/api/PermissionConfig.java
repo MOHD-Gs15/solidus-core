@@ -176,6 +176,13 @@ public final class PermissionConfig {
             addPermissionEntry(root, SolidusPermissions.AUCTION_CANCEL, 0, "Cancel your listing - /ah cancel");
             addPermissionEntry(root, SolidusPermissions.AUCTION_SORT, 0, "Sort listings - /ah sort");
             addPermissionEntry(root, SolidusPermissions.TRANSACTIONS, 0, "View transaction history - /transactions");
+            // SECURITY FIX (audit 2.1.3): both export nodes were missing from
+            // the generated permissions.json, so the registration-time fallback
+            // was the ONLY effective level - and exportall's fallback was 0.
+            // Emitting them here makes the config the single visible source of
+            // truth and matches the documented OP levels.
+            addPermissionEntry(root, SolidusPermissions.TRANSACTIONS_EXPORT, 0, "Export own history as CSV - /transactions export");
+            addPermissionEntry(root, SolidusPermissions.TRANSACTIONS_EXPORT_ALL, 2, "Export the FULL server ledger - /transactions exportall (moderator only)");
 
             // Analytics commands
             addPermissionEntry(root, SolidusPermissions.ANALYTICS, 2, "View analytics dashboard - /analytics");
