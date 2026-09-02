@@ -6,6 +6,7 @@ import com.solidus.api.SolidusTransactionHook;
 import com.solidus.economy.BalanceManager;
 import com.solidus.economy.EconomyEngine;
 import com.solidus.economy.TransactionLog;
+import com.solidus.gui.DisplaySlot;
 import com.solidus.sell.SellGUI.GuiSlot;
 import com.solidus.shop.ShopManager;
 import com.solidus.util.CurrencyUtil;
@@ -15,7 +16,6 @@ import net.minecraft.ChatFormatting;
 import net.minecraft.core.component.DataComponents;
 import net.minecraft.network.chat.Component;
 import net.minecraft.server.level.ServerPlayer;
-import net.minecraft.world.Container;
 import net.minecraft.world.entity.player.Inventory;
 import net.minecraft.world.entity.player.Player;
 import net.minecraft.world.inventory.AbstractContainerMenu;
@@ -104,8 +104,10 @@ public class SellScreenHandler extends AbstractContainerMenu {
 
         // Add sell container slots:
         // Slots 0-8: UI elements (read-only, block item placement)
+        // DisplaySlot: mayPlace/mayPickup/set are all blocked - no vanilla
+        // code path can ever move an item through these slots.
         for (int i = 0; i < 9; i++) {
-            this.addSlot(new ReadOnlySlot(sellContainer, i));
+            this.addSlot(new DisplaySlot(sellContainer, i, 0, 0));
         }
 
         // Slots 9-53: Input area (accept item placement)
@@ -763,30 +765,7 @@ public class SellScreenHandler extends AbstractContainerMenu {
 
     // -- Custom Slot Implementation --------------------------
 
-    /**
-     * Read-Only Slot for UI elements (slots 0-8).
-     * Blocks item placement and pickup to keep the UI layout static.
-     * This prevents vanilla's item movement code from overwriting UI items.
-     */
-    private static class ReadOnlySlot extends Slot {
-        ReadOnlySlot(Container container, int index) {
-            super(container, index, 0, 0);
-        }
-
-        @Override
-        public boolean mayPlace(ItemStack stack) {
-            return false; // Block item insertion
-        }
-
-        @Override
-        public boolean mayPickup(Player player) {
-            return false; // Block item pickup
-        }
-
-        @Override
-        public void set(ItemStack stack) {
-            // Allow setting display items during construction only
-            // (The container's setItem is used for initialization)
-        }
-    }
+    // (UI slots 0-8 now use the shared com.solidus.gui.DisplaySlot class,
+    //  which replaces the previous private ReadOnlySlot with identical
+    //  semantics: mayPlace=false, mayPickup=false, set() is a no-op.)
 }

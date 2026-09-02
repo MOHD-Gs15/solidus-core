@@ -1,6 +1,7 @@
 package com.solidus.shop;
 
 import com.solidus.SolidusMod;
+import com.solidus.gui.DisplaySlot;
 import com.solidus.shop.ShopGUI.GuiSlot;
 import com.solidus.util.TextUtil;
 
@@ -13,7 +14,6 @@ import net.minecraft.world.inventory.ContainerInput;
 import net.minecraft.world.inventory.MenuType;
 import net.minecraft.world.inventory.Slot;
 import net.minecraft.world.item.ItemStack;
-
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -104,10 +104,12 @@ public class ShopScreenHandler extends AbstractContainerMenu {
         }
 
         // Add container slots (the virtual shop inventory)
-        // Using a dummy container that we control completely
+        // Using a dummy container that we control completely.
+        // DisplaySlot: mayPlace/mayPickup/set are all blocked - no vanilla
+        // code path can ever move an item through these slots.
         ShopDummyContainer container = new ShopDummyContainer(slots);
         for (int i = 0; i < 54; i++) {
-            this.addSlot(new Slot(container, i, 0, 0));
+            this.addSlot(new DisplaySlot(container, i, 0, 0));
         }
 
         // Add player inventory slots (standard 9x3 + hotbar layout offset)
@@ -144,6 +146,8 @@ public class ShopScreenHandler extends AbstractContainerMenu {
         // Vanilla processing is already cancelled by the ServerPlayerEntityMixin,
         // so player inventory interaction is blocked while the shop GUI is open.
         // This is intentional for security - prevents item manipulation exploits.
+        // The mixin then calls broadcastFullState(), erasing any optimistic
+        // client-side prediction (ghost items) in the same moment.
         if (slotIndex < 0 || slotIndex >= INVENTORY_SIZE) {
             return;
         }

@@ -34,10 +34,22 @@ import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
  * Ghost Item Prevention:
  * When the mixin cancels a container click packet on the server side, the
  * client does not immediately know about the cancellation due to network
- * latency (ping). This causes "ghost items" to appear in the player's
- * screen - items that exist on the client but not on the server.
- * After canceling, we force a container resync via broadcastChanges(),
- * which ensures the client's inventory state matches the server immediately.
+ * latency (ping). The client menu is a vanilla ChestMenu (GENERIC_9x6) that
+ * optimistically predicts every click locally, including picking up display
+ * items for free. This causes "ghost items" - items that exist only in the
+ * client's inventory prediction while the server never moved anything.
+ *
+ * THE FIX: after canceling, we force a FULL container resync via
+ * broadcastFullState(), which re-sends every slot (display slots AND the
+ * player inventory section) plus the carried stack and resets the incremental
+ * sync markers. Any phantom item is erased in the same moment it was created.
+ *
+ * Why broadcastChanges() was NOT enough (the 2.1.0 bug):
+ * broadcastChanges() only sends slots whose server-side state CHANGED since
+ * the last sync. When we REJECT a click, nothing changed on the server - so
+ * nothing is sent - and the client's ghost prediction survives until the
+ * next full sync (typically reopening the GUI). broadcastFullState() always
+ * sends the complete state, which is exactly what a rejected click needs.
  */
 @Mixin(ServerGamePacketListenerImpl.class)
 public abstract class ServerPlayerEntityMixin {
@@ -64,9 +76,11 @@ public abstract class ServerPlayerEntityMixin {
      * ServerboundContainerClickPacket is a Record class in Minecraft 26.1.x,
      * using record-style accessors (slotNum(), containerInput() - no get prefix).
      *
-     * In 26.1.x, ServerboundContainerClickPacket now uses ContainerInput
+     * In 26.1.x, ServerboundContainerClickPacket uses ContainerInput
      * instead of ClickType + separate buttonNum(). The button info is
-     * absorbed into the ContainerInput.
+     * partially absorbed into the ContainerInput, but buttonNum() still
+     * carries the physical button (0 = left, 1 = right) - verified against
+     * the 26.1.2 mapped jar via javap.
      */
     @Inject(method = "handleContainerClick", at = @At("HEAD"), cancellable = true)
     private void onContainerClick(
@@ -76,12 +90,9 @@ public abstract class ServerPlayerEntityMixin {
         PacketHandler packetHandler = SolidusMod.getPacketHandler();
         if (packetHandler == null) return;
 
-        // Extract click data from the packet
-        // TODO: 26.1.x - ServerboundContainerClickPacket now uses ContainerInput instead of
-        //  ClickType + buttonNum(). The button is likely absorbed into ContainerInput.
-        //  Verify the exact accessor names at compile time.
+        // Extract click data from the packet (accessors verified via javap
+        // against the 26.1.2 mojmap-mapped jar)
         int slotIndex = packet.slotNum();
-        // TODO: 26.1.x - buttonNum() may no longer exist (absorbed into ContainerInput)
         int button = packet.buttonNum();
         ContainerInput containerInput = packet.containerInput();
 
@@ -93,14 +104,16 @@ public abstract class ServerPlayerEntityMixin {
             // Cancel vanilla processing - the click has been handled by Solidus
             ci.cancel();
 
-            // FORCE RESYNC: After canceling the packet on the server, the client
-            // still has the pre-click state due to network latency. This causes
-            // "ghost items" - items that appear to be in the container on the client
-            // side but were never actually moved on the server side. By calling
-            // broadcastChanges(), we force the client to receive a fresh snapshot
-            // of the container's actual state, making any phantom items disappear
-            // in the same moment.
-            player.containerMenu.broadcastChanges();
+            // FORCE FULL RESYNC: the client menu is a vanilla ChestMenu that
+            // optimistically predicted this click locally (possibly moving a
+            // display item into its inventory view for free). Since we rejected
+            // or reinterpreted the click, the server state is the single source
+            // of truth again - broadcastFullState() re-sends EVERY slot (display
+            // area + player inventory + carried stack) and resets the incremental
+            // sync markers, so any phantom/ghost item is erased immediately.
+            // (broadcastChanges() was insufficient here: it only sends slots that
+            // CHANGED server-side, and a rejected click changes nothing.)
+            player.containerMenu.broadcastFullState();
         }
     }
 }

@@ -1,6 +1,7 @@
 package com.solidus.auction;
 
 import com.solidus.auction.AuctionGUI.GuiSlot;
+import com.solidus.gui.DisplaySlot;
 
 import net.minecraft.network.chat.Component;
 import net.minecraft.server.level.ServerPlayer;
@@ -86,10 +87,12 @@ public class AuctionScreenHandler extends AbstractContainerMenu {
             slotMap.put(guiSlot.index(), guiSlot);
         }
 
-        // Add auction container slots
+        // Add auction container slots.
+        // DisplaySlot: mayPlace/mayPickup/set are all blocked - no vanilla
+        // code path can ever move an item through these slots.
         AuctionDummyContainer container = new AuctionDummyContainer(slots);
         for (int i = 0; i < 54; i++) {
-            this.addSlot(new Slot(container, i, 0, 0));
+            this.addSlot(new DisplaySlot(container, i, 0, 0));
         }
 
         // Add player inventory slots
@@ -107,12 +110,13 @@ public class AuctionScreenHandler extends AbstractContainerMenu {
     }
 
     @Override
-    // TODO: 26.1.x - ClickType -> ContainerInput; button param may be removed (absorbed into ContainerInput)
     public void clicked(int slotIndex, int button, net.minecraft.world.inventory.ContainerInput containerInput, Player player) {
         // Player inventory clicks (slot >= 54) - return without action.
         // Note: Vanilla processing is already cancelled by the ServerPlayerEntityMixin,
         // so player inventory interaction is blocked while the auction GUI is open.
         // This is intentional for security - prevents item manipulation exploits.
+        // The mixin then calls broadcastFullState(), erasing any optimistic
+        // client-side prediction (ghost items) in the same moment.
         if (slotIndex < 0 || slotIndex >= 54) {
             return;
         }
