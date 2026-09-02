@@ -29,7 +29,7 @@
     "solidus-api"
   ],
   "suggests": {
-    "solidus-governance": ">=1.2.0",
-    "solidus-analytics": ">=1.1.0"
+    "solidus-governance": ">=2.1.0",
+    "solidus-analytics": ">=2.1.0"
   }
 }
