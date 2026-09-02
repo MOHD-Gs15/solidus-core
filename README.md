@@ -26,8 +26,8 @@ Stable economies · Vanilla compatibility · Zero client installation · Minecra
   "runtimePlatform": "Fabric Loader 0.19.2+",
   "license": "MIT",
   "description": "Server-side economy engine for Minecraft Fabric with virtual currency, GUI shop, auction house, and crash-resilient persistence. No client mods required.",
-  "author": { "@type": "Person", "name": "MOHD_Gs", "url": "https://github.com/mohd-gs" },
-  "url": "https://github.com/mohd-gs/solidus-core",
+  "author": { "@type": "Person", "name": "MOHD-Gs15", "url": "https://github.com/MOHD-Gs15" },
+  "url": "https://github.com/MOHD-Gs15/solidus-core",
   "offers": { "@type": "Offer", "price": "0", "priceCurrency": "USD" }
 }
 -->
@@ -59,10 +59,10 @@ Solidus Core is the foundation of the **Solidus Economy Ecosystem** — a suite 
 | Module | License | Description |
 |--------|---------|-------------|
 | **solidus-core** | **MIT** | **Economy engine, server shop, auction house** (this repo) |
-| [solidus-analytics](https://github.com/mohd-gs/solidus-analytics) | Proprietary | Economy intelligence dashboard, inflation tracking, fraud detection, live web dashboard (AES-256-GCM encrypted) |
-| [Solidus-Enforcer](https://github.com/mohd-gs/Solidus-Enforcer) | MIT | Bounty hunting, hunter license system, alliance rewards, autonomous anti-monopoly bounties |
-| [Solidus-Governance](https://github.com/mohd-gs/Solidus-Governance) | Proprietary | Economy administration, progressive taxation, immutable audit logging, point-in-time rollback recovery |
-| [solidus-territory](https://github.com/mohd-gs/solidus-territory) | MIT | Polygon-based land claiming, rent system, territory trading, visual particle borders |
+| [solidus-analytics](https://github.com/MOHD-Gs15/solidus-analytics) | Proprietary | Economy intelligence dashboard, inflation tracking, fraud detection, live web dashboard (AES-256-GCM encrypted) |
+| [Solidus-Enforcer](https://github.com/MOHD-Gs15/Solidus-Enforcer) | MIT | Bounty hunting, hunter license system, alliance rewards, autonomous anti-monopoly bounties |
+| [Solidus-Governance](https://github.com/MOHD-Gs15/Solidus-Governance) | Proprietary | Economy administration, progressive taxation, immutable audit logging, point-in-time rollback recovery |
+| [solidus-territory](https://github.com/MOHD-Gs15/solidus-territory) | MIT | Polygon-based land claiming, rent system, territory trading, visual particle borders |
 
 Each module integrates with Solidus Core through **reflection-based bridges** — zero compile dependency, automatic activation when Core is present, graceful degradation when absent.
 
@@ -156,7 +156,7 @@ A veto denial aborts the transaction cleanly — balances untouched, items stay 
 
 1. Install [Fabric Loader](https://fabricmc.net/use/) on your server
 2. Install [Fabric API](https://modrinth.com/mod/fabric-api) on the server
-3. Download the latest Solidus release from [Releases](https://github.com/mohd-gs/solidus-core/releases)
+3. Download the latest Solidus release from [Releases](https://github.com/MOHD-Gs15/solidus-core/releases)
 4. Place both `.jar` files into your server's `mods/` folder
 5. Start the server
 6. Configure `config/solidus/shop.json` to customize your economy
@@ -181,10 +181,10 @@ Once Solidus Core is running, you can add any combination of ecosystem modules:
 
 | Module | What It Adds | Installation |
 |--------|-------------|-------------|
-| [solidus-analytics](https://github.com/mohd-gs/solidus-analytics) | Live economy dashboard, inflation tracking, fraud detection | Drop JAR in `mods/` |
-| [Solidus-Enforcer](https://github.com/mohd-gs/Solidus-Enforcer) | Bounty hunting, hunter licenses, anti-monopoly system | Drop JAR in `mods/` |
-| [Solidus-Governance](https://github.com/mohd-gs/Solidus-Governance) | Taxation, audit logging, rollback recovery | Drop JAR in `mods/` |
-| [solidus-territory](https://github.com/mohd-gs/solidus-territory) | Polygon land claiming, rent, territory trading | Drop JAR in `mods/` |
+| [solidus-analytics](https://github.com/MOHD-Gs15/solidus-analytics) | Live economy dashboard, inflation tracking, fraud detection | Drop JAR in `mods/` |
+| [Solidus-Enforcer](https://github.com/MOHD-Gs15/Solidus-Enforcer) | Bounty hunting, hunter licenses, anti-monopoly system | Drop JAR in `mods/` |
+| [Solidus-Governance](https://github.com/MOHD-Gs15/Solidus-Governance) | Taxation, audit logging, rollback recovery | Drop JAR in `mods/` |
+| [solidus-territory](https://github.com/MOHD-Gs15/solidus-territory) | Polygon land claiming, rent, territory trading | Drop JAR in `mods/` |
 
 All modules auto-detect Solidus Core via reflection and activate automatically. No additional configuration needed for basic integration.
 
@@ -332,7 +332,7 @@ All transactions are persisted through SQLite with WAL (Write-Ahead Logging) jou
 
 | Platform | Link |
 | --- | --- |
-| GitHub Releases | [Latest Release](https://github.com/mohd-gs/solidus-core/releases) |
+| GitHub Releases | [Latest Release](https://github.com/MOHD-Gs15/solidus-core/releases) |
 | Modrinth | [MOHD_Gs on Modrinth](https://modrinth.com/user/MOHD_Gs) |
 
 ---
@@ -341,7 +341,7 @@ All transactions are persisted through SQLite with WAL (Write-Ahead Logging) jou
 
 Contributions are welcome.
 
-* Report issues via [GitHub Issues](https://github.com/mohd-gs/solidus-core/issues)
+* Report issues via [GitHub Issues](https://github.com/MOHD-Gs15/solidus-core/issues)
 * Suggest features or improvements
 * Submit pull requests
 
@@ -361,4 +361,4 @@ This project is licensed under the **MIT License** — see [LICENSE](LICENSE) fo
 
 ---
 
-Built by [MOHD_Gs](https://github.com/mohd-gs) · [Email](mailto:mohdmxmxm@gmail.com) · Discord: **mohd_gs** · Part of the [Solidus Economy Ecosystem](https://github.com/mohd-gs)
+Built by [MOHD-Gs15](https://github.com/MOHD-Gs15) · [Email](mailto:mohdmxmxm@gmail.com) · Discord: **mohd_gs** · Part of the [Solidus Economy Ecosystem](https://github.com/MOHD-Gs15)
