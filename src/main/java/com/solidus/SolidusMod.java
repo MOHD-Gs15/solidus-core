@@ -30,7 +30,7 @@ import org.slf4j.LoggerFactory;
 
 /**
  * Solidus - Advanced Server-Side Economy & Commerce Engine
- * Copyright (c) 2026 MOHD_Gs. All rights reserved.
+ * Copyright (c) 2026 MOHD-Gs15. All rights reserved.
  *
  * Main entry point for the dedicated server mod.
  *

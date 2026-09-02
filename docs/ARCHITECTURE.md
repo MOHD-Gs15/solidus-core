@@ -1377,7 +1377,7 @@ If you prefer type-safe integration, add solidus-core as a dependency in your `b
 
 ```groovy
 dependencies {
-    modImplementation "com.github.mohd-gs:solidus-core:v2.0.0"
+    modImplementation "com.github.MOHD-Gs15:solidus-core:v2.0.0"
 }
 ```
 
@@ -1997,5 +1997,5 @@ Transaction log size grows with usage; consider periodic pruning for high-traffi
 
 ---
 
-> **For questions, issues, or contributions**, visit [github.com/mohd-gs/solidus-core](https://github.com/mohd-gs/solidus-core)  
-> **Author**: MOHD_Gs | **License**: MIT
+> **For questions, issues, or contributions**, visit [github.com/MOHD-Gs15/solidus-core](https://github.com/MOHD-Gs15/solidus-core)  
+> **Author**: MOHD-Gs15 | **License**: MIT
