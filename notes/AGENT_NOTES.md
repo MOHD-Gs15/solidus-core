@@ -1,4 +1,4 @@
-# AGENT NOTES — Solidus 2.2.0 Implementation Notes
+# AGENT NOTES — Solidus 2.1.4 Implementation Notes
 
 > ملاحظات منفصلة من الوكيل المنفّذ — للمراجعة التقنية وقرارات التصميم
 > والمخاطر المتبقية واختبارات القبول المقترحة. ليست بديلاً عن
@@ -16,10 +16,12 @@
 | البناء | ✅ `compileJava` ناجح (Java 25 / Gradle 9.5.1) |
 | الاختبارات | ✅ 309+ اختبار ناجح، منها ~25 اختباراً جديداً |
 
-**قرار الإصدار**: رفعت `mod_version` إلى `2.2.0` لأن التغيير يشمل تخطيط
-قاعدة البيانات (جداول جديدة) حسب قواعد `VERSIONING.md`. الإضافات **إضافية
-بحتة** (additive) — لا كسر توافق للماودات المرافقة بفضل آلية `fromCode`
-الآمنة.
+**قرار الإصدار (مُحدّث بقرار المالك 2026-09-06)**: الترقيم النهائي هو
+`2.1.4` داخل عائلة `2.1.x` — الإضافات (أوامر `/trade` والمزايدة) **إضافية
+بحتة** (additive) ولا تكسر توافق الماودات المرافقة بفضل آلية `fromCode`
+الآمنة، لذا لا تستدعي قفزة عائلة. كانت قد رُقّمت مؤقتاً `2.2.0` ثم أُعيد
+الترقيم بقرار المالك؛ عائلة `2.2.x` **محجوزة** حصرياً لعصر المالتي
+سيرفر/إعادة هيكلة التخزين القادمة (انظر `VERSIONING.md`).
 
 ---
 
@@ -169,6 +171,6 @@ BalanceManager.java        (لم يتغير فعلياً — الفحص فقط)
 SolidusPermissions.java    AUCTION_BID + TRADE
 TransactionsCommand.java   تغطية الأنواع الجديدة في switch
 PacketHandler.java         توجيه نقرات TradeScreenHandler + hasSolidusScreenOpen
-gradle.properties          mod_version = 2.2.0
+gradle.properties          mod_version = 2.1.4
 README.md                  أوامر جديدة في جدول الأوامر
 ```

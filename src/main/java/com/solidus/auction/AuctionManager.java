@@ -119,7 +119,7 @@ public class AuctionManager {
     """;
 
     // ───────────────────────────────────────────────────────────
-    //  BIDDING SYSTEM (v2.2.0)
+    //  BIDDING SYSTEM (v2.1.4)
     //
     //  Bid state lives in its OWN table, keyed by listing id, instead of
     //  adding columns to auction_listings. This keeps AuctionEntry - and

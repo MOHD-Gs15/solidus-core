@@ -1,8 +1,8 @@
-# Solidus 2.2.0 — Bidding System & Direct Trade
+# Solidus 2.1.4 — Bidding System & Direct Trade
 
 > **New in this release** | Minecraft 26.1.x | Fabric Loader 0.19.4+ | Java 25 | 100% Server-Side
 >
-> This document is the full reference for the two features added in 2.2.0:
+> This document is the full reference for the two features added in 2.1.4:
 > the auction **bidding system** (escrow model) and the **direct trade window**
 > (`/trade`). Companion documentation: `docs/DB_SCALING_PLAN.md` (the
 > MySQL/MariaDB/Redis roadmap) and `notes/AGENT_NOTES.md` (implementation

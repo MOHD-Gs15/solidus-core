@@ -6,12 +6,19 @@ server owner, at a glance, which releases are built and tested to work together.
 
 | Bump | Meaning | Can you update one mod alone? |
 |------|---------|-------------------------------|
-| **Patch** `2.1.0 → 2.1.1` | Bug fixes and safe improvements. | Yes — any `2.1.x` works with any other `2.1.y`. |
-| **Minor** `2.1.x → 2.2.0` | Breaking change: API, hook signature, config schema, or database layout. | No — the other mods must move to the `2.2` family in lockstep. |
+| **Patch** `2.1.0 → 2.1.1` | Bug fixes, new features (commands, GUIs), and additive schema changes. Companions are never broken. | Yes — any `2.1.x` works with any other `2.1.y`. |
+| **Family (Minor)** `2.1.x → 2.2.0` | **Owner-designated architecture era** — never used for ordinary feature additions. The `2.2` family is **reserved** for the cross-server / multi-server storage era. | No — the other mods must move to the new family in lockstep. |
 | **Major** `2.x → 3.0.0` | Architectural reset of the ecosystem contract. | No — full coordinated release. |
 
-Current family: **2.2.0** — Core is on it; companions declare the minimum family
+Current family: **2.1.4** — Core is on it; companions declare the minimum family
 they were integration-tested against in their own `fabric.mod.json`.
+
+> **Owner rule (2026-09-06):** feature additions such as `/trade` and the
+> auction bidding system stay inside the current `2.1.x` family — they shipped
+> as `2.1.4`, NOT as a family jump. The `2.2.x` family is reserved exclusively
+> for the upcoming multi-server / storage rewrite and will advance in patches
+> (`2.2.0`, `2.2.1`, ...) as that era lands. Breaking API / hook-signature
+> changes remain impossible inside a patch family.
 
 Each mod's `fabric.mod.json` `suggests` entry declares the **minimum family version** it
 was integration-tested against (e.g. Core ships `"solidus-governance": ">=2.1.0",
@@ -22,7 +29,7 @@ was integration-tested against (e.g. Core ships `"solidus-governance": ">=2.1.0"
 Each mod's version has exactly one source of truth — a single line in `gradle.properties`:
 
 ```properties
-mod_version = 2.2.0
+mod_version = 2.1.4
 ```
 
 `fabric.mod.json` picks it up through the `${version}` expansion at build time — never

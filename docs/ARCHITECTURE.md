@@ -1,6 +1,6 @@
 # Solidus-Core Architecture Documentation
 
-> **Version**: 2.2.0 | **Minecraft**: 26.1.x | **Fabric**: 0.19.4+ | **Java**: 25  
+> **Version**: 2.1.4 | **Minecraft**: 26.1.x | **Fabric**: 0.19.4+ | **Java**: 25  
 > **License**: MIT | **Environment**: 100% Server-Side Only
 
 ---
@@ -312,7 +312,7 @@ com.solidus
 │   ├── AuctionScreenHandler.java // Click handler (left=buy, right=bid prompt)
 │   └── AuctionDummyContainer.java // Display-only container
 ├── chat/                         // Chat-driven input
-│   └── ChatPrompts.java          // "Type amount in chat" prompt service (2.2.0+)
+│   └── ChatPrompts.java          // "Type amount in chat" prompt service (2.1.4+)
 ├── commands/                     // Brigadier command registrations
 │   ├── BalanceCommand.java       // /bal
 │   ├── PayCommand.java           // /pay (online + offline)
@@ -320,14 +320,14 @@ com.solidus
 │   ├── ShopCommand.java          // /shop, /shop search, /shop reload
 │   ├── SellCommand.java          // /sell gui, /sell all [item] (+shulkers)
 │   ├── AuctionCommand.java       // /ah sell/bid/collect/cancel/sort/search
-│   ├── TradeCommand.java         // /trade <player>|accept|deny|cancel (2.2.0+)
+│   ├── TradeCommand.java         // /trade <player>|accept|deny|cancel (2.1.4+)
 │   └── TransactionsCommand.java  // /transactions [page] [export [days] | exportall [days]]
 ├── economy/                      // Core economy engine
 │   ├── EconomyEngine.java        // Central coordinator
 │   ├── SQLiteStorage.java        // Async persistent backend (941 lines)
 │   ├── BalanceManager.java       // High-level balance API
 │   ├── TransactionLog.java       // Audit trail + notifications + CSV export
-│   └── EscrowAccount.java        // Bid-escrow system account (2.2.0+)
+│   └── EscrowAccount.java        // Bid-escrow system account (2.1.4+)
 ├── gui/                          // Shared GUI primitives
 │   └── DisplaySlot.java          // Display-only Slot (no place/pickup/set)
 ├── mixin/                        // Mixin injections
@@ -345,7 +345,7 @@ com.solidus
 │   ├── ShopGUILayout.java        // Pure-Java centering layout engine
 │   ├── ShopScreenHandler.java    // Click rewriting handler
 │   └── ShopDummyContainer.java   // Display-only container
-├── trade/                        // Direct trade subsystem (2.2.0+)
+├── trade/                        // Direct trade subsystem (2.1.4+)
 │   ├── TradeManager.java         // Requests, sessions, execution, reaping
 │   ├── TradeSession.java         // Player-agnostic session state machine
 │   ├── TradeContainer.java       // 54-slot session container (item escrow)
@@ -573,7 +573,7 @@ The `TransactionLog` serves two purposes:
 
 #### Transaction Types
 
-The `type` column stores TEXT codes (not numeric). 15 types exist (2.2.0):
+The `type` column stores TEXT codes (not numeric). 15 types exist (2.1.4):
 
 | Code | Direction | Description |
 |------|-----------|-------------|
@@ -585,11 +585,11 @@ The `type` column stores TEXT codes (not numeric). 15 types exist (2.2.0):
 | `AUCTION_SOLD` | money in | Auction listing sold (seller side) |
 | `AUCTION_BOUGHT` | money out | Purchased auction listing (buyer side) |
 | `AUCTION_EXPIRED` | item flow | Auction listing expired |
-| `BID_PLACED` | money out (2.2.0) | Escrowed bid placed — amount moved to escrow |
-| `BID_REFUNDED` | money in (2.2.0) | Escrowed amount returned to the bidder |
-| `AUCTION_WON` | money in (2.2.0) | Bidding auction settled to the highest bidder |
-| `TRADE_SEND` | money/items out (2.2.0) | Direct trade: what this player gave |
-| `TRADE_RECEIVE` | money/items in (2.2.0) | Direct trade: what this player received |
+| `BID_PLACED` | money out (2.1.4) | Escrowed bid placed — amount moved to escrow |
+| `BID_REFUNDED` | money in (2.1.4) | Escrowed amount returned to the bidder |
+| `AUCTION_WON` | money in (2.1.4) | Bidding auction settled to the highest bidder |
+| `TRADE_SEND` | money/items out (2.1.4) | Direct trade: what this player gave |
+| `TRADE_RECEIVE` | money/items in (2.1.4) | Direct trade: what this player received |
 | `DEATH_PENALTY` | money out | Lost money from being killed |
 | `DEATH_REWARD` | money in | Gained money from killing another player |
 
@@ -760,7 +760,7 @@ The auction house is a peer-to-peer marketplace where players list items for sal
 
 ### 8.1 AuctionManager — Race-Condition-Free Controller
 
-**File**: `com.solidus.auction.AuctionManager` (2,570 lines — the largest class in the mod; it now also owns the 2.2.0 bidding system, see `docs/FEATURES_TRADE_BIDDING.md`)
+**File**: `com.solidus.auction.AuctionManager` (2,570 lines — the largest class in the mod; it now also owns the 2.1.4 bidding system, see `docs/FEATURES_TRADE_BIDDING.md`)
 
 The auction house faces the most complex concurrency challenges in Solidus. Two players might attempt to purchase the same listing simultaneously, or a player might try to cancel a listing at the same moment another player buys it.
 
@@ -1075,7 +1075,7 @@ private void onContainerClick(ServerboundContainerClickPacket packet, CallbackIn
 
 ### 10.2 ScreenHandler-Level Protections (No Second Mixin)
 
-**Note (2.2.0 audit):** an older revision of this document described a
+**Note (2.1.4 audit):** an older revision of this document described a
 `ScreenHandlerMixin` safety net. **That mixin does not exist** —
 `solidus.mixins.json` registers exactly one mixin,
 `ServerPlayerEntityMixin`. Vanilla `clicked()` never runs for Solidus display
@@ -1121,7 +1121,7 @@ Incoming Click
 │  ShopScreenHandler?    → shop.clicked()  │
 │  AuctionScreenHandler? → auction.clicked()│
 │  SellScreenHandler?    → sell.clicked()  │ (manual item movement)
-│  TradeScreenHandler?   → trade.clicked() │ (manual item movement, 2.2.0+)
+│  TradeScreenHandler?   → trade.clicked() │ (manual item movement, 2.1.4+)
 │                                          │
 │  After EVERY processed click:            │
 │  broadcastFullState() (anti-ghost, PR#13)│
@@ -1194,11 +1194,11 @@ OP 0 unless noted). The authoritative list lives in `SolidusPermissions`:
 | `solidus.command.sell` | 0 | `/sell gui`, `/sell all [item]` |
 | `solidus.command.auction` | 0 | `/ah` |
 | `solidus.command.auction.sell` | 0 | `/ah sell <price> [startbid]` |
-| `solidus.command.auction.bid` | 0 | `/ah bid <uuid> <amount>` + GUI right-click bid (2.2.0+) |
+| `solidus.command.auction.bid` | 0 | `/ah bid <uuid> <amount>` + GUI right-click bid (2.1.4+) |
 | `solidus.command.auction.collect` | 0 | `/ah collect` |
 | `solidus.command.auction.cancel` | 0 | `/ah cancel <uuid>` |
 | `solidus.command.auction.sort` | 0 | `/ah sort <order>` |
-| `solidus.command.trade` | 0 | the whole `/trade` family (2.2.0+) |
+| `solidus.command.trade` | 0 | the whole `/trade` family (2.1.4+) |
 | `solidus.command.transactions` | 0 | `/transactions [page]` |
 | `solidus.command.transactions.export` | 0 | `/transactions export [days]` |
 | `solidus.command.transactions.exportall` | **2** | `/transactions exportall [days]` |
@@ -1453,7 +1453,7 @@ If you prefer type-safe integration, add solidus-core as a dependency in your `b
 
 ```groovy
 dependencies {
-    modImplementation "com.github.MOHD-Gs15:solidus-core:v2.2.0"
+    modImplementation "com.github.MOHD-Gs15:solidus-core:v2.1.4"
 }
 ```
 
@@ -1838,7 +1838,7 @@ a winning bid, buyer attributed), `EXPIRED_RETURN`, `EXPIRED_COLLECT`,
 `CANCELLED`, `CORRUPT` (the row's item data could not be deserialized —
 undeliverable).
 
-#### Table: `auction_bid_state` (2.2.0)
+#### Table: `auction_bid_state` (2.1.4)
 
 Bid state for bidding-enabled listings — one optional row per listing, keyed by
 listing id. A listing WITHOUT a row is a buy-now-only listing; the feature is
@@ -1858,7 +1858,7 @@ The top-bid slot is claimed with a conditional
 `UPDATE ... WHERE current_bid IS NULL OR current_bid < ?` (exactly-once), and
 refund/release flows move money through `transferAtomicWithLedger`.
 
-#### Table: `auction_bids` (2.2.0)
+#### Table: `auction_bids` (2.1.4)
 
 Append-only bid history (audit/analytics):
 
@@ -1873,7 +1873,7 @@ Append-only bid history (audit/analytics):
 
 `CREATE INDEX idx_bids_listing ON auction_bids (listing_id, bid_timestamp DESC)`.
 
-#### Table: `auction_won_items` (2.2.0)
+#### Table: `auction_won_items` (2.1.4)
 
 Offline winner delivery queue (claimed and deleted by `/ah collect`):
 
@@ -2004,8 +2004,8 @@ tests run on plain SQLite or pure Java — no Minecraft bootstrap required:
 | `TransactionLogPaginationTest` (10) | LIMIT/OFFSET pages, counts |
 | `BaltopPaginationTest` (10) | Paged leaderboard, rank continuity, escrow exclusion |
 | `EconomyStatsTest` (5) | Aggregates: count, mean, supply, Gini |
-| `BidEscrowFlowTest` (13) | 2.2.0: escrow charge/refund/release, exactly-once claims, BidRules arithmetic |
-| `TradeSessionStateTest` (8) | 2.2.0: anti bait-and-switch, empty-trade rejection, lifecycle, isolation |
+| `BidEscrowFlowTest` (13) | 2.1.4: escrow charge/refund/release, exactly-once claims, BidRules arithmetic |
+| `TradeSessionStateTest` (8) | 2.1.4: anti bait-and-switch, empty-trade rejection, lifecycle, isolation |
 | `AuctionSettlementTest` (5) | Buy-now settlement claims |
 | `AuctionSettlementHistoryTest` (10) | Archive + delete invariants, startup recovery sweeps |
 | `AuctionSearchTest` (8) | Sanitized free-text search, escaping, caps |

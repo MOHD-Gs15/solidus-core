@@ -1,6 +1,6 @@
 # Solidus — Database Scaling Plan: MySQL / MariaDB / Redis
 
-> **Status: PLAN (not yet implemented)** | Target: 2.3.0+ | Author: agent implementation notes
+> **Status: PLAN (not yet implemented)** | Target: 2.2.x (multi-server era family) | Author: agent implementation notes
 >
 > This document is the engineering plan for the third community request:
 > *"SQLite only — no MySQL/MariaDB/Redis: impossible to run on a server
@@ -50,7 +50,7 @@ database, and every claim must survive two servers racing the same row.
 
 ## 2. Current Architecture Inventory
 
-What exists today (2.2.0) and how it maps to the plan:
+What exists today (2.1.4) and how it maps to the plan:
 
 | Component | File | Coupling to SQLite |
 | --- | --- | --- |
@@ -105,7 +105,7 @@ Design decisions up front:
    most important property to preserve.
 2. **One shared database, not per-server DBs with sync.** Sync-based
    (session-per-server + replication) designs reintroduce every dupe window
-   this codebase spent 2.1.x-2.2.0 closing. A single authority with row
+   this codebase spent 2.1.x closing. A single authority with row
    locks is the only model that keeps `transferAtomic` semantics.
 3. **SQLite remains the default.** Networks opt in via config; single
    servers never pay the MySQL tax.
@@ -298,7 +298,7 @@ The invariant that makes the network actually trustworthy:
 
 > **Global supply conservation**: at any moment, `SUM(all balances) + SUM(escrow)`
 > equals the initial supply + all shop faucets − all shop sinks. The startup
-> escrow-consistency check from 2.2.0 generalizes to a network-wide invariant
+> escrow-consistency check from 2.1.4 generalizes to a network-wide invariant
 > checker (scheduled job on one elected server, warning on drift > 0.01).
 
 Additional network flows:
@@ -315,7 +315,8 @@ Additional network flows:
 
 ## 8. Migration & Rollout
 
-1. **Prereq**: deploy Phase 1 (abstraction) as 2.3.0 — pure refactor.
+1. **Prereq**: deploy Phase 1 (abstraction) as 2.1.5 (current-family patch,
+   pure refactor).
 2. **Cutover tool**: `/solidus-admin storage migrate --to mysql --batch 500`
    (admin command, OP 4) — drains executors, begins: read all SQLite rows →
    bulk insert into MySQL inside per-table transactions → verify counts +
@@ -325,8 +326,9 @@ Additional network flows:
    refuses to run while players are online unless `--force`.
 4. **Rollback**: keep the SQLite files read-only; config flip back is enough
    if the MySQL cutover is rejected before players transact.
-5. **Family version**: per `VERSIONING.md`, the storage backend addition is a
-   minor bump (`2.3.0`); companions keep working (safe `fromCode` fallbacks),
+5. **Family version**: per `VERSIONING.md`, the multi-server era is the
+   owner-reserved family bump (`2.2.0`); companions keep working (safe
+   `fromCode` fallbacks),
    but Analytics should be re-verified against a MySQL-backed ledger.
 
 ## 9. Risks & Mitigations
@@ -351,7 +353,8 @@ Additional network flows:
 | 4 — Network integrity | Invariant checker, notification routing, baltop polish | ~1 week |
 | Migration tooling + docs | Cutover command, SQL scripts, runbook | ~3–4 days |
 
-Phases 1 and 2 are the critical path and can ship as 2.3.0 (MySQL-ready,
-SQLite default) and 2.4.0 (Redis + network features). Phase 3/4 can ship
-independently — a MySQL-only network is already fully functional without
-Redis.
+Phase 1 can ship early as 2.1.5 (pure abstraction refactor, current
+family); Phase 2 lands as 2.2.0 (MySQL-ready, SQLite default) and Phases
+3/4 as 2.2.1 (Redis + network features) — the whole multi-server era stays
+inside the owner-reserved 2.2.x family. A MySQL-only network is already
+fully functional without Redis.
