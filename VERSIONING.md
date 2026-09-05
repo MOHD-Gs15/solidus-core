@@ -10,7 +10,7 @@ server owner, at a glance, which releases are built and tested to work together.
 | **Family (Minor)** `2.1.x → 2.2.0` | **Owner-designated architecture era** — never used for ordinary feature additions. The `2.2` family is **reserved** for the cross-server / multi-server storage era. | No — the other mods must move to the new family in lockstep. |
 | **Major** `2.x → 3.0.0` | Architectural reset of the ecosystem contract. | No — full coordinated release. |
 
-Current family: **2.1.4** — Core is on it; companions declare the minimum family
+Current family: **2.1.5** — Core is on it; companions declare the minimum family
 they were integration-tested against in their own `fabric.mod.json`.
 
 > **Owner rule (2026-09-06):** feature additions such as `/trade` and the

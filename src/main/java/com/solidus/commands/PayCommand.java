@@ -5,7 +5,7 @@ import com.solidus.api.PermissionChecker;
 import com.solidus.api.SolidusPermissions;
 import com.solidus.economy.BalanceManager;
 import com.solidus.economy.EconomyEngine;
-import com.solidus.economy.SQLiteStorage;
+import com.solidus.economy.StorageBackend;
 import com.solidus.economy.TransactionLog;
 import com.solidus.networking.RateLimiter;
 import com.solidus.util.TextUtil;
@@ -76,7 +76,7 @@ public class PayCommand {
                 .then(Commands.argument("name", StringArgumentType.word())
                     .suggests((context, builder) -> {
                         // Suggest known player names from the database cache
-                        SQLiteStorage storage = economyEngine.getStorage();
+                        StorageBackend storage = economyEngine.getStorage();
                         return SharedSuggestionProvider.suggest(
                             storage.getPlayerNameCache().values().stream(), builder);
                     })
@@ -200,7 +200,7 @@ public class PayCommand {
                                            double amount, EconomyEngine economyEngine) {
         BalanceManager balanceManager = economyEngine.getBalanceManager();
         TransactionLog transactionLog = economyEngine.getTransactionLog();
-        SQLiteStorage storage = economyEngine.getStorage();
+        StorageBackend storage = economyEngine.getStorage();
 
         // Rate limit: max 1 payment per second per sender (anti-spam gate)
         if (!allowByRateLimit(sender)) return;

@@ -1,0 +1,13 @@
+{
+  "type": "sqlite",
+  "_comment": "Storage backend selection. 'sqlite' (default) = single-file local storage. 'mysql' (or 'mariadb') = shared database for multi-server networks with unified balances (Solidus 2.2.0+). The mysql.password value may be overridden with the SOLIDUS_DB_PASSWORD environment variable (recommended).",
+  "mysql": {
+    "host": "127.0.0.1",
+    "port": 3306,
+    "database": "solidus",
+    "user": "solidus",
+    "password": "CHANGE_ME",
+    "pool": { "maxSize": 10, "connectionTimeoutMs": 5000 },
+    "useSsl": false
+  }
+}

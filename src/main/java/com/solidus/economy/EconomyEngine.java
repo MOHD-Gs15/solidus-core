@@ -20,7 +20,7 @@ import net.fabricmc.loader.api.FabricLoader;
  */
 public class EconomyEngine {
 
-    private SQLiteStorage storage;
+    private StorageBackend storage;
     private BalanceManager balanceManager;
     private volatile boolean initialized = false;
 
@@ -43,10 +43,21 @@ public class EconomyEngine {
         // regardless of where the JVM was started from.
         ConfigManager.initialize(FabricLoader.getInstance().getConfigDir().getParent());
 
-        // Initialize SQLite storage
+        // Select the storage backend from config/solidus/storage.json
+        // (DB scaling plan Phase 1/2): "sqlite" (default) or "mysql" (2.2.0+).
+        StorageConfig storageConfig = StorageConfig.load();
+        if (storageConfig.type() == StorageConfig.Type.MYSQL) {
+            // Phase 2 (2.2.0) activates the shared MySQL/MariaDB backend.
+            // Until then the network-capable branch degrades safely to SQLite
+            // so a misconfigured network server never boots without an economy.
+            SolidusMod.LOGGER.warn(
+                "storage.json: type=mysql requires Solidus 2.2.0+ - falling back to SQLite.");
+        }
         String dbPath = ConfigManager.getConfigDir().toAbsolutePath().toString();
-        storage = new SQLiteStorage(dbPath);
-        storage.initialize();
+        SQLiteStorage sqlite = new SQLiteStorage(dbPath);
+        sqlite.initialize();
+        storage = sqlite;
+        SolidusMod.LOGGER.info("Storage backend: SQLite (single-server mode)");
 
         // Pre-create the bid-escrow system account with balance 0. Without
         // this, the first atomic transfer INTO escrow would create the row as
@@ -89,10 +100,11 @@ public class EconomyEngine {
     }
 
     /**
-     * Gets the raw SQLite storage (for advanced/internal operations).
+     * Gets the storage backend (for advanced/internal operations).
+     * The concrete implementation is selected by {@code storage.json}.
      * @throws IllegalStateException if called before initialization
      */
-    public SQLiteStorage getStorage() {
+    public StorageBackend getStorage() {
         ensureInitialized();
         return storage;
     }

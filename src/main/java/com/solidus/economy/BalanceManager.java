@@ -33,9 +33,9 @@ public class BalanceManager {
 
     private static final Logger LOGGER = LoggerFactory.getLogger(BalanceManager.class);
 
-    private final SQLiteStorage storage;
+    private final StorageBackend storage;
 
-    public BalanceManager(SQLiteStorage storage) {
+    public BalanceManager(StorageBackend storage) {
         this.storage = storage;
     }
 
@@ -406,7 +406,7 @@ public class BalanceManager {
      * rows are materialized. Intended for analytics/governance consumers that
      * only need distribution statistics, not individual rows.
      *
-     * @return CompletableFuture with the current {@link SQLiteStorage.EconomyStats}
+     * @return CompletableFuture with the current {@link EconomyStats}
      * @since 2.1.0
      */
     public CompletableFuture<SQLiteStorage.EconomyStats> getEconomyStats() {

@@ -58,8 +58,14 @@ import java.util.concurrent.TimeUnit;
  * - Auto-checkpoint balances performance vs. crash recovery window.
  * - All critical mutations are persisted to SQLite immediately after the
  *   in-memory state is updated, minimizing the data-at-risk window.
+ *
+ * Phase 1 (DB scaling plan, 2.1.5): this class now implements
+ * {@link StorageBackend} — a pure abstraction extraction with ZERO behaviour
+ * change. The nested result types (TransferOutcome, BalanceEntry, EconomyStats,
+ * AtomicLedgerRow) stay here on purpose: companions reference them through
+ * SolidusAPI, and VERSIONING.md forbids breaking companions in a patch family.
  */
-public class SQLiteStorage {
+public class SQLiteStorage implements StorageBackend {
 
     private static final Logger LOGGER = LoggerFactory.getLogger(SQLiteStorage.class);
     public static final String DATABASE_NAME = "economy.db";
