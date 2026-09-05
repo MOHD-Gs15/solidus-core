@@ -323,10 +323,14 @@ com.solidus
 │   ├── TradeCommand.java         // /trade <player>|accept|deny|cancel (2.1.4+)
 │   └── TransactionsCommand.java  // /transactions [page] [export [days] | exportall [days]]
 ├── economy/                      // Core economy engine
-│   ├── EconomyEngine.java        // Central coordinator
-│   ├── SQLiteStorage.java        // Async persistent backend (941 lines)
+│   ├── EconomyEngine.java        // Central coordinator (selects the storage backend)
+│   ├── StorageBackend.java       // Storage contract IF (2.1.5+, DB scaling Phase 1)
+│   ├── StorageConfig.java        // storage.json parser (sqlite|mysql + pool + env password)
+│   ├── SQLiteStorage.java        // Default single-file backend (941 lines)
+│   ├── MySqlStorage.java         // Shared MySQL/MariaDB backend (2.2.0+, multi-server)
+│   ├── Money.java                // Exact 2-decimal boundary wrapper (BigDecimal, 2.2.0+)
 │   ├── BalanceManager.java       // High-level balance API
-│   ├── TransactionLog.java       // Audit trail + notifications + CSV export
+│   ├── TransactionLog.java       // Audit trail + notifications + CSV export (dialect-aware 2.2.0+)
 │   └── EscrowAccount.java        // Bid-escrow system account (2.1.4+)
 ├── gui/                          // Shared GUI primitives
 │   └── DisplaySlot.java          // Display-only Slot (no place/pickup/set)
@@ -378,15 +382,22 @@ The economy engine is the heart of Solidus. It manages virtual currency persiste
 ```java
 // Simplified lifecycle (matches EconomyEngine.java)
 public class EconomyEngine {
-    private SQLiteStorage storage;
+    private StorageBackend storage;   // 2.1.5+: interface, selected by storage.json
     private BalanceManager balanceManager;
     private volatile boolean initialized = false;
 
     public void initialize() {
         ConfigManager.initialize(...);          // resolves config/solidus
-        storage = new SQLiteStorage(configDir);
-        storage.initialize();                   // Opens DB, creates tables, pre-loads cache,
-                                                // creates the TransactionLog on the same executor
+        StorageConfig cfg = StorageConfig.load(); // "sqlite" (default) | "mysql" (2.2.0+)
+        if (cfg.type() == StorageConfig.Type.MYSQL) {
+            MySqlStorage mysql = new MySqlStorage(cfg.mysql());
+            mysql.initialize();                 // pool + schema + fail-closed on unreachable DB
+            storage = mysql;                    // multi-server mode: unified balances
+        } else {
+            SQLiteStorage sqlite = new SQLiteStorage(configDir);
+            sqlite.initialize();                // Opens DB, creates tables, pre-loads cache,
+            storage = sqlite;                   // creates the TransactionLog on the same executor
+        }
         // Pre-create the bid-escrow system account at balance 0 so the first
         // transfer INTO escrow cannot mint phantom "starting balance" money.
         storage.setBalance(EscrowAccount.UUID_ZERO, EscrowAccount.NAME, 0.0);
@@ -395,17 +406,35 @@ public class EconomyEngine {
     }
 
     public TransactionLog getTransactionLog() {
-        return storage.getTransactionLog();     // owned by SQLiteStorage
+        return storage.getTransactionLog();     // owned by the active backend
     }
 
     public void shutdown() {
         initialized = false;
-        storage.shutdown();                     // Close SQLite connection
+        storage.shutdown();                     // close connection / drain pool
     }
 }
 ```
 
-**Key Design Decision**: `EconomyEngine` does not perform any business logic itself. It is purely a lifecycle manager and dependency injector. All actual operations flow through `BalanceManager` and `SQLiteStorage`.
+**Key Design Decision**: `EconomyEngine` does not perform any business logic itself. It is purely a lifecycle manager and dependency injector. All actual operations flow through `BalanceManager` and the `StorageBackend` interface.
+
+#### Storage backends (DB scaling plan — Phase 1/2)
+
+Since 2.1.5 all storage consumers depend on the `StorageBackend` interface, not a concrete class. Two backends ship:
+
+| Backend | Since | Selection | Money storage | Concurrency model |
+|---------|-------|-----------|---------------|-------------------|
+| `SQLiteStorage` | 2.0.0 | default (`"type": "sqlite"`) | `REAL` + `CurrencyUtil.round` | single-thread executor is the lock |
+| `MySqlStorage` | 2.2.0 | `"type": "mysql"` (or `"mariadb"`) in `config/solidus/storage.json` | `DECIMAL(18,2)` columns + `Money` (BigDecimal) boundary | **the database is the lock**: `SELECT ... FOR UPDATE` in deterministic lower-UUID-first order + deadlock/lock-wait retries (2× backoff); the local executor only preserves ordering |
+
+`MySqlStorage` properties (2.2.0):
+
+- HikariCP pool (`storage.json` pool size/timeouts; password via `SOLIDUS_DB_PASSWORD` env override; the connection string is never logged).
+- **Database-first reads**: every balance read hits the shared DB, so values written by another server are immediately visible; the in-memory balance cache is a degraded-read FALLBACK only (never zero, never authoritative). Redis L1/L2 arrives in 2.2.1.
+- **Exact money**: all JDBC money binds/reads go through `Money` (`DECIMAL(18,2)`) — no float drift on cross-server sums (baltop, Gini, money supply).
+- **Failure model**: unreachable database at startup = fail closed with a clear error; runtime read failure degrades to cache values; write/transfer failure rolls back completely (`PERSIST_ERROR`) — nothing ever moves half-way.
+- Schema is auto-created (`CREATE TABLE IF NOT EXISTS`), mirrored in `docs/sql/mysql/001_init.sql` (which also provisions the auction tables for the 2.2.1 `AuctionStore` port). Minimum versions: MariaDB 10.6+ / MySQL 8.0+.
+- Acceptance: the `StorageBackendContractTest` harness (11 interface contract cases) runs against BOTH backends — the MySQL binding self-activates in CI when `SOLIDUS_TEST_MYSQL_HOST` is set; `MySqlTransferRaceTest` races two backends over one shared DB and asserts money-supply conservation to the cent.
 
 ---
 

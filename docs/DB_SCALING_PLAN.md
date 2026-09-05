@@ -1,6 +1,9 @@
 # Solidus — Database Scaling Plan: MySQL / MariaDB / Redis
 
-> **Status: PLAN (not yet implemented)** | Target: 2.2.x (multi-server era family) | Author: agent implementation notes
+> **Status: Phases 1+2 IMPLEMENTED** — Phase 1 (abstraction) shipped as 2.1.5,
+> Phase 2 (MySQL/MariaDB multi-server backend) shipped as 2.2.0. Phases 3/4
+> (Redis cache/bus + network integrity tooling) target 2.2.1 — see §11 for the
+> shipped-vs-remaining scope table. | Author: agent implementation notes
 >
 > This document is the engineering plan for the third community request:
 > *"SQLite only — no MySQL/MariaDB/Redis: impossible to run on a server
@@ -353,8 +356,52 @@ Additional network flows:
 | 4 — Network integrity | Invariant checker, notification routing, baltop polish | ~1 week |
 | Migration tooling + docs | Cutover command, SQL scripts, runbook | ~3–4 days |
 
-Phase 1 can ship early as 2.1.5 (pure abstraction refactor, current
-family); Phase 2 lands as 2.2.0 (MySQL-ready, SQLite default) and Phases
-3/4 as 2.2.1 (Redis + network features) — the whole multi-server era stays
-inside the owner-reserved 2.2.x family. A MySQL-only network is already
-fully functional without Redis.
+Phases 1 and 2 SHIPPED: Phase 1 as 2.1.5 (pure abstraction refactor, current
+family) and Phase 2 as 2.2.0 (MySqlStorage — the owner-reserved 2.2.x family).
+Phases 3/4 (Redis + network features) target 2.2.1 — a MySQL-only network is
+already fully functional without Redis.
+
+## 11. Shipped vs Remaining (post-2.2.0 scope ledger)
+
+**Shipped in 2.1.5 (Phase 1 — pure refactor, zero behaviour change):**
+
+- `StorageBackend` interface mirroring the SQLiteStorage public surface.
+- `StorageConfig` + `config/solidus/storage.json` (`type`: sqlite|mysql,
+  pool settings, `SOLIDUS_DB_PASSWORD` env override).
+- `StorageBackendContractTest` harness: 11 contract cases run through the
+  interface ONLY — the acceptance harness for every future backend.
+- Nested result types intentionally stay on `SQLiteStorage` (companion
+  source compatibility inside a patch family — owner rule).
+
+**Shipped in 2.2.0 (Phase 2 — the multi-server release):**
+
+- `MySqlStorage implements StorageBackend`: HikariCP pool, auto-created
+  schema (`player_balances` + `operations` + log/notifications, MySQL
+  dialect), database-first reads, fail-closed startup on unreachable DB.
+- Exact money: `DECIMAL(18,2)` columns + `Money` (BigDecimal) boundary.
+- `transferAtomic(WithLedger)`: `SELECT ... FOR UPDATE` both rows in
+  deterministic lower-UUID-first order, ledger rows inside the transaction,
+  compare-and-set updates, deadlock/lock-wait retry (2× backoff).
+- `TransactionLog` made dialect-aware (SQLite | MySQL DDL; pooled vs
+  persistent connection flavors) — zero change to its public API.
+- `docs/sql/mysql/001_init.sql`: operator reference schema incl. the
+  provisioned auction tables.
+- Race harness: `MySqlTransferRaceTest` (two backends, one shared DB, 200
+  concurrent transfers → money-supply conservation to the cent) + MySQL
+  contract binding — both CI-activated via `SOLIDUS_TEST_MYSQL_HOST`.
+
+**Remaining for 2.2.1 (NOT in 2.2.0 — do not assume otherwise):**
+
+1. **Auction store on MySQL (`AuctionStore` port)** — in 2.2.0 the auction
+   house remains per-server SQLite (its money legs already flow through the
+   shared economy DB). Tables are provisioned in `001_init.sql`.
+2. **Redis layer** (§6): L1/L2 cache + pub/sub invalidation + network-aware
+   notification delivery.
+3. **`/solidus-admin storage migrate` cutover command** (§8.2) — until it
+   ships, SQLite→MySQL data migration is manual SQL (export `player_balances`
+   + `transaction_log` and import; the schema file matches 1:1).
+4. **`operations` idempotency wiring** — the table is created in 2.2.0, the
+   primitives are not routed through it yet (command-driven primitives have
+   no network retries to dedupe until Redis/2.2.1).
+5. `SKIP LOCKED` expiry sweeps + outbox (§5.5-adopted additions from the
+   reviewed hybrid plan).

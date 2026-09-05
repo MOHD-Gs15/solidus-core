@@ -47,17 +47,17 @@ public class EconomyEngine {
         // (DB scaling plan Phase 1/2): "sqlite" (default) or "mysql" (2.2.0+).
         StorageConfig storageConfig = StorageConfig.load();
         if (storageConfig.type() == StorageConfig.Type.MYSQL) {
-            // Phase 2 (2.2.0) activates the shared MySQL/MariaDB backend.
-            // Until then the network-capable branch degrades safely to SQLite
-            // so a misconfigured network server never boots without an economy.
-            SolidusMod.LOGGER.warn(
-                "storage.json: type=mysql requires Solidus 2.2.0+ - falling back to SQLite.");
+            MySqlStorage mysql = new MySqlStorage(storageConfig.mysql());
+            mysql.initialize(); // fails closed with a clear error if the DB is unreachable
+            storage = mysql;
+            SolidusMod.LOGGER.info("Storage backend: MySQL/MariaDB (multi-server mode, unified balances)");
+        } else {
+            String dbPath = ConfigManager.getConfigDir().toAbsolutePath().toString();
+            SQLiteStorage sqlite = new SQLiteStorage(dbPath);
+            sqlite.initialize();
+            storage = sqlite;
+            SolidusMod.LOGGER.info("Storage backend: SQLite (single-server mode)");
         }
-        String dbPath = ConfigManager.getConfigDir().toAbsolutePath().toString();
-        SQLiteStorage sqlite = new SQLiteStorage(dbPath);
-        sqlite.initialize();
-        storage = sqlite;
-        SolidusMod.LOGGER.info("Storage backend: SQLite (single-server mode)");
 
         // Pre-create the bid-escrow system account with balance 0. Without
         // this, the first atomic transfer INTO escrow would create the row as

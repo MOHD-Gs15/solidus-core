@@ -89,6 +89,63 @@ public class TransactionLog {
         ON pending_notifications (player_uuid)
     """;
 
+    /**
+     * SQL dialect for the log DDL (DB scaling plan Phase 2, 2.2.0).
+     *
+     * <p>{@link #SQLITE} keeps the historical single-file schema (AUTOINCREMENT
+     * ids, REAL money columns). {@link #MYSQL} mirrors it for MySQL/MariaDB
+     * (AUTO_INCREMENT ids, DECIMAL(18,2) money columns, inline KEY clauses —
+     * MySQL 8 does not support CREATE INDEX IF NOT EXISTS).</p>
+     */
+    public enum Dialect {
+        SQLITE(
+            CREATE_TABLE_SQL,
+            CREATE_INDEX_SQL,
+            CREATE_NOTIFICATIONS_TABLE_SQL,
+            CREATE_NOTIFICATIONS_INDEX_SQL
+        ),
+        MYSQL(
+            """
+            CREATE TABLE IF NOT EXISTS transaction_log (
+                id BIGINT PRIMARY KEY AUTO_INCREMENT,
+                timestamp BIGINT NOT NULL,
+                type VARCHAR(32) NOT NULL,
+                player_uuid CHAR(36) NOT NULL,
+                player_name VARCHAR(64) NOT NULL,
+                target_uuid CHAR(36),
+                target_name VARCHAR(64),
+                amount DECIMAL(18,2) NOT NULL,
+                item_material VARCHAR(128),
+                item_quantity INTEGER,
+                description TEXT,
+                KEY idx_transaction_player (player_uuid, timestamp DESC)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+            """,
+            null,
+            """
+            CREATE TABLE IF NOT EXISTS pending_notifications (
+                id BIGINT PRIMARY KEY AUTO_INCREMENT,
+                timestamp BIGINT NOT NULL,
+                player_uuid CHAR(36) NOT NULL,
+                message TEXT NOT NULL,
+                KEY idx_notifications_player (player_uuid)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+            """,
+            null
+        );
+
+        private final String[] statements;
+
+        Dialect(String... statements) {
+            this.statements = statements;
+        }
+
+        /** DDL statements to execute at initialize(); null entries are skipped. */
+        public String[] statements() {
+            return statements;
+        }
+    }
+
     /** Transaction type enum for type-safe logging */
     public enum Type {
         SHOP_BUY("SHOP_BUY"),
@@ -147,23 +204,80 @@ public class TransactionLog {
         String description
     ) {}
 
-    private final Connection persistentConnection;
+    /**
+     * Opens a JDBC connection for one log operation. Thread-safe by contract.
+     * The pooled (MySQL/MariaDB) flavor borrows a connection per operation;
+     * the persistent (SQLite) flavor returns the same shared connection.
+     */
+    public interface ConnectionSource {
+        Connection open() throws SQLException;
+    }
+
+    interface SqlWork<T> {
+        T run(Connection conn) throws SQLException;
+    }
+
+    private final ConnectionSource connectionSource;
+    private final boolean closeConnections;
     private final ExecutorService asyncExecutor;
 
+    /**
+     * SQLite flavor: one persistent connection shared with the storage
+     * backend, serialized by the storage executor, never closed here.
+     */
     public TransactionLog(Connection persistentConnection, ExecutorService asyncExecutor) {
-        this.persistentConnection = persistentConnection;
+        this.connectionSource = () -> persistentConnection;
+        this.closeConnections = false;
         this.asyncExecutor = asyncExecutor;
     }
 
     /**
-     * Initializes the transaction log tables and loads pending notifications into memory.
+     * Pooled flavor (MySQL/MariaDB, 2.2.0+): borrows a connection per
+     * operation from the storage pool and returns it after use.
+     */
+    public TransactionLog(ConnectionSource connectionSource, ExecutorService asyncExecutor) {
+        this.connectionSource = connectionSource;
+        this.closeConnections = true;
+        this.asyncExecutor = asyncExecutor;
+    }
+
+    /**
+     * Runs one log operation on a connection. In the persistent flavor the
+     * connection is shared and MUST NOT be closed; in the pooled flavor the
+     * connection is closed (returned to the pool) when the work completes.
+     */
+    private <T> T withConnection(SqlWork<T> work) throws SQLException {
+        Connection conn = connectionSource.open();
+        if (!closeConnections) {
+            return work.run(conn);
+        }
+        try (Connection pooled = conn) {
+            return work.run(pooled);
+        }
+    }
+
+    /**
+     * Initializes the transaction log tables using the SQLite dialect.
      */
     public void initialize() {
-        try (Statement stmt = persistentConnection.createStatement()) {
-            stmt.execute(CREATE_TABLE_SQL);
-            stmt.execute(CREATE_INDEX_SQL);
-            stmt.execute(CREATE_NOTIFICATIONS_TABLE_SQL);
-            stmt.execute(CREATE_NOTIFICATIONS_INDEX_SQL);
+        initialize(Dialect.SQLITE);
+    }
+
+    /**
+     * Initializes the transaction log tables with the given dialect.
+     */
+    public void initialize(Dialect dialect) {
+        try {
+            withConnection(conn -> {
+                try (Statement stmt = conn.createStatement()) {
+                    for (String ddl : dialect.statements()) {
+                        if (ddl != null) {
+                            stmt.execute(ddl);
+                        }
+                    }
+                }
+                return null;
+            });
         } catch (SQLException e) {
             LOGGER.error("Failed to initialize transaction log tables!", e);
         }
@@ -198,10 +312,17 @@ public class TransactionLog {
                     UUID targetUuid, String targetName,
                     double amount, String itemMaterial, int itemQuantity,
                     String description) {
-        CompletableFuture.runAsync(() ->
-            insertRowSync(persistentConnection, type, playerUuid, playerName,
-                targetUuid, targetName, amount, itemMaterial, itemQuantity, description),
-            asyncExecutor);
+        CompletableFuture.runAsync(() -> {
+            try {
+                withConnection(conn -> {
+                    insertRowSync(conn, type, playerUuid, playerName,
+                        targetUuid, targetName, amount, itemMaterial, itemQuantity, description);
+                    return null;
+                });
+            } catch (SQLException e) {
+                LOGGER.error("Failed to log transaction: {} for player: {}", type, playerName, e);
+            }
+        }, asyncExecutor);
     }
 
     /**
@@ -257,14 +378,20 @@ public class TransactionLog {
         return CompletableFuture.supplyAsync(() -> {
             List<TransactionEntry> entries = new ArrayList<>();
             String sql = "SELECT * FROM transaction_log WHERE player_uuid = ? ORDER BY timestamp DESC LIMIT ?";
-            try (PreparedStatement ps = persistentConnection.prepareStatement(sql)) {
-                ps.setString(1, playerUuid.toString());
-                ps.setInt(2, limit);
-                try (ResultSet rs = ps.executeQuery()) {
-                    while (rs.next()) {
-                        entries.add(mapResultSetToEntry(rs));
+            try {
+                entries = withConnection(conn -> {
+                    List<TransactionEntry> list = new ArrayList<>();
+                    try (PreparedStatement ps = conn.prepareStatement(sql)) {
+                        ps.setString(1, playerUuid.toString());
+                        ps.setInt(2, limit);
+                        try (ResultSet rs = ps.executeQuery()) {
+                            while (rs.next()) {
+                                list.add(mapResultSetToEntry(rs));
+                            }
+                        }
                     }
-                }
+                    return list;
+                });
             } catch (SQLException e) {
                 LOGGER.error("Failed to get transactions for player: {}", playerUuid, e);
             } catch (RuntimeException e) {
@@ -296,15 +423,21 @@ public class TransactionLog {
         return CompletableFuture.supplyAsync(() -> {
             List<TransactionEntry> entries = new ArrayList<>();
             String sql = "SELECT * FROM transaction_log WHERE player_uuid = ? ORDER BY timestamp DESC LIMIT ? OFFSET ?";
-            try (PreparedStatement ps = persistentConnection.prepareStatement(sql)) {
-                ps.setString(1, playerUuid.toString());
-                ps.setInt(2, limit);
-                ps.setInt(3, Math.max(0, offset));
-                try (ResultSet rs = ps.executeQuery()) {
-                    while (rs.next()) {
-                        entries.add(mapResultSetToEntry(rs));
+            try {
+                entries = withConnection(conn -> {
+                    List<TransactionEntry> list = new ArrayList<>();
+                    try (PreparedStatement ps = conn.prepareStatement(sql)) {
+                        ps.setString(1, playerUuid.toString());
+                        ps.setInt(2, limit);
+                        ps.setInt(3, Math.max(0, offset));
+                        try (ResultSet rs = ps.executeQuery()) {
+                            while (rs.next()) {
+                                list.add(mapResultSetToEntry(rs));
+                            }
+                        }
                     }
-                }
+                    return list;
+                });
             } catch (SQLException e) {
                 LOGGER.error("Failed to get transaction page for player: {}", playerUuid, e);
             }
@@ -322,13 +455,18 @@ public class TransactionLog {
     public CompletableFuture<Integer> countTransactions(UUID playerUuid) {
         return CompletableFuture.supplyAsync(() -> {
             String sql = "SELECT COUNT(*) FROM transaction_log WHERE player_uuid = ?";
-            try (PreparedStatement ps = persistentConnection.prepareStatement(sql)) {
-                ps.setString(1, playerUuid.toString());
-                try (ResultSet rs = ps.executeQuery()) {
-                    if (rs.next()) {
-                        return rs.getInt(1);
+            try {
+                return withConnection(conn -> {
+                    try (PreparedStatement ps = conn.prepareStatement(sql)) {
+                        ps.setString(1, playerUuid.toString());
+                        try (ResultSet rs = ps.executeQuery()) {
+                            if (rs.next()) {
+                                return rs.getInt(1);
+                            }
+                        }
                     }
-                }
+                    return 0;
+                });
             } catch (SQLException e) {
                 LOGGER.error("Failed to count transactions for player: {}", playerUuid, e);
             }
@@ -366,15 +504,21 @@ public class TransactionLog {
             String sql = "SELECT * FROM transaction_log "
                 + "WHERE player_uuid = ? AND timestamp >= ? "
                 + "ORDER BY timestamp DESC LIMIT ?";
-            try (PreparedStatement ps = persistentConnection.prepareStatement(sql)) {
-                ps.setString(1, playerUuid.toString());
-                ps.setLong(2, sinceEpochMs);
-                ps.setInt(3, Math.max(0, maxRows));
-                try (ResultSet rs = ps.executeQuery()) {
-                    while (rs.next()) {
-                        entries.add(mapResultSetToEntry(rs));
+            try {
+                entries = withConnection(conn -> {
+                    List<TransactionEntry> list = new ArrayList<>();
+                    try (PreparedStatement ps = conn.prepareStatement(sql)) {
+                        ps.setString(1, playerUuid.toString());
+                        ps.setLong(2, sinceEpochMs);
+                        ps.setInt(3, Math.max(0, maxRows));
+                        try (ResultSet rs = ps.executeQuery()) {
+                            while (rs.next()) {
+                                list.add(mapResultSetToEntry(rs));
+                            }
+                        }
                     }
-                }
+                    return list;
+                });
             } catch (SQLException e) {
                 LOGGER.error("Failed to get transactions since {} for player: {}", sinceEpochMs, playerUuid, e);
             }
@@ -402,14 +546,20 @@ public class TransactionLog {
             String sql = "SELECT * FROM transaction_log "
                 + "WHERE timestamp >= ? "
                 + "ORDER BY timestamp DESC LIMIT ?";
-            try (PreparedStatement ps = persistentConnection.prepareStatement(sql)) {
-                ps.setLong(1, sinceEpochMs);
-                ps.setInt(2, Math.max(0, maxRows));
-                try (ResultSet rs = ps.executeQuery()) {
-                    while (rs.next()) {
-                        entries.add(mapResultSetToEntry(rs));
+            try {
+                entries = withConnection(conn -> {
+                    List<TransactionEntry> list = new ArrayList<>();
+                    try (PreparedStatement ps = conn.prepareStatement(sql)) {
+                        ps.setLong(1, sinceEpochMs);
+                        ps.setInt(2, Math.max(0, maxRows));
+                        try (ResultSet rs = ps.executeQuery()) {
+                            while (rs.next()) {
+                                list.add(mapResultSetToEntry(rs));
+                            }
+                        }
                     }
-                }
+                    return list;
+                });
             } catch (SQLException e) {
                 LOGGER.error("Failed to get all transactions since {}", sinceEpochMs, e);
             }
@@ -530,11 +680,16 @@ public class TransactionLog {
         // delivered on next login. (Single source of truth: the database.)
         CompletableFuture.runAsync(() -> {
             String sql = "INSERT INTO pending_notifications (timestamp, player_uuid, message) VALUES (?, ?, ?)";
-            try (PreparedStatement ps = persistentConnection.prepareStatement(sql)) {
-                ps.setLong(1, System.currentTimeMillis());
-                ps.setString(2, playerUuid.toString());
-                ps.setString(3, message);
-                ps.executeUpdate();
+            try {
+                withConnection(conn -> {
+                    try (PreparedStatement ps = conn.prepareStatement(sql)) {
+                        ps.setLong(1, System.currentTimeMillis());
+                        ps.setString(2, playerUuid.toString());
+                        ps.setString(3, message);
+                        ps.executeUpdate();
+                    }
+                    return null;
+                });
             } catch (SQLException e) {
                 LOGGER.error("Failed to queue notification for player: {}", playerUuid, e);
             }
@@ -558,13 +713,19 @@ public class TransactionLog {
         CompletableFuture.supplyAsync(() -> {
             List<PendingNotificationRow> rows = new ArrayList<>();
             String sql = "SELECT id, message FROM pending_notifications WHERE player_uuid = ? ORDER BY timestamp ASC";
-            try (PreparedStatement ps = persistentConnection.prepareStatement(sql)) {
-                ps.setString(1, playerUuid.toString());
-                try (ResultSet rs = ps.executeQuery()) {
-                    while (rs.next()) {
-                        rows.add(new PendingNotificationRow(rs.getLong("id"), rs.getString("message")));
+            try {
+                rows = withConnection(conn -> {
+                    List<PendingNotificationRow> list = new ArrayList<>();
+                    try (PreparedStatement ps = conn.prepareStatement(sql)) {
+                        ps.setString(1, playerUuid.toString());
+                        try (ResultSet rs = ps.executeQuery()) {
+                            while (rs.next()) {
+                                list.add(new PendingNotificationRow(rs.getLong("id"), rs.getString("message")));
+                            }
+                        }
                     }
-                }
+                    return list;
+                });
             } catch (SQLException e) {
                 LOGGER.error("Failed to load pending notifications for: {}",
                     player.getName().getString(), e);
@@ -611,12 +772,17 @@ public class TransactionLog {
                 sql.append(i == 0 ? "?" : ", ?");
             }
             sql.append(")");
-            try (PreparedStatement ps = persistentConnection.prepareStatement(sql.toString())) {
-                ps.setString(1, playerUuid.toString());
-                for (int i = 0; i < ids.length; i++) {
-                    ps.setLong(i + 2, ids[i]);
-                }
-                ps.executeUpdate();
+            try {
+                withConnection(conn -> {
+                    try (PreparedStatement ps = conn.prepareStatement(sql.toString())) {
+                        ps.setString(1, playerUuid.toString());
+                        for (int i = 0; i < ids.length; i++) {
+                            ps.setLong(i + 2, ids[i]);
+                        }
+                        ps.executeUpdate();
+                    }
+                    return null;
+                });
             } catch (SQLException e) {
                 LOGGER.error("Failed to delete delivered notifications for: {}", playerUuid, e);
             }
