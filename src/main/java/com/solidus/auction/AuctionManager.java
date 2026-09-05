@@ -188,8 +188,143 @@ public class AuctionManager {
     /** Archived because the row's item data could not be deserialized (undeliverable). */
     static final String SETTLED_CORRUPT = "CORRUPT";
 
+    // ───────────────────────────────────────────────────────────
+    //  STORAGE DIALECTS (DB scaling plan §6/§11 item 1 — 2.2.1)
+    //
+    //  The auction store is dialect-aware exactly like TransactionLog
+    //  (2.2.0): SQLITE keeps the historical per-server auctions.db file;
+    //  MYSQL lives on the SHARED economy database so a network sees one
+    //  auction market. Cross-server safety comes from the existing
+    //  exactly-once conditional claims ("AND status = 0" guards) — every
+    //  mutation is idempotent, so two servers racing a listing cannot
+    //  double-settle it. MySQL DDL mirrors docs/sql/mysql/001_init.sql:
+    //  DECIMAL(18,2) money columns, MEDIUMTEXT item blobs (complex item
+    //  JSON can exceed the 64KB TEXT limit), inline KEY clauses (MySQL 8
+    //  has no CREATE INDEX IF NOT EXISTS).
+    // ───────────────────────────────────────────────────────────
+    static final String MYSQL_CREATE_LISTINGS_SQL = """
+        CREATE TABLE IF NOT EXISTS auction_listings (
+            listing_id CHAR(36) PRIMARY KEY NOT NULL,
+            seller_uuid CHAR(36) NOT NULL,
+            seller_name VARCHAR(64) NOT NULL,
+            material_name VARCHAR(128) NOT NULL,
+            quantity INTEGER NOT NULL,
+            item_nbt MEDIUMTEXT,
+            price DECIMAL(18,2) NOT NULL,
+            listed_timestamp BIGINT NOT NULL,
+            expire_timestamp BIGINT NOT NULL,
+            status INTEGER NOT NULL DEFAULT 0,
+            KEY idx_active_listings (status, expire_timestamp)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+    """;
+    static final String MYSQL_CREATE_SOLD_HISTORY_SQL = """
+        CREATE TABLE IF NOT EXISTS auction_sold_history (
+            listing_id CHAR(36) PRIMARY KEY NOT NULL,
+            seller_uuid CHAR(36) NOT NULL,
+            seller_name VARCHAR(64) NOT NULL,
+            material_name VARCHAR(128) NOT NULL,
+            quantity INTEGER NOT NULL,
+            price DECIMAL(18,2) NOT NULL,
+            buyer_uuid CHAR(36),
+            buyer_name VARCHAR(64),
+            listed_timestamp BIGINT NOT NULL,
+            settled_timestamp BIGINT NOT NULL,
+            settled_reason VARCHAR(32) NOT NULL,
+            KEY idx_sold_history_time (settled_timestamp DESC)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+    """;
+    static final String MYSQL_CREATE_BID_STATE_SQL = """
+        CREATE TABLE IF NOT EXISTS auction_bid_state (
+            listing_id CHAR(36) PRIMARY KEY NOT NULL,
+            start_price DECIMAL(18,2) NOT NULL,
+            current_bid DECIMAL(18,2),
+            current_bidder_uuid CHAR(36),
+            current_bidder_name VARCHAR(64),
+            bid_count INTEGER NOT NULL DEFAULT 0,
+            extensions_used INTEGER NOT NULL DEFAULT 0
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+    """;
+    static final String MYSQL_CREATE_BID_HISTORY_SQL = """
+        CREATE TABLE IF NOT EXISTS auction_bids (
+            bid_id BIGINT PRIMARY KEY AUTO_INCREMENT,
+            listing_id CHAR(36) NOT NULL,
+            bidder_uuid CHAR(36) NOT NULL,
+            bidder_name VARCHAR(64) NOT NULL,
+            amount DECIMAL(18,2) NOT NULL,
+            bid_timestamp BIGINT NOT NULL,
+            KEY idx_bids_listing (listing_id, bid_timestamp DESC)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+    """;
+    static final String MYSQL_CREATE_WON_ITEMS_SQL = """
+        CREATE TABLE IF NOT EXISTS auction_won_items (
+            win_id BIGINT PRIMARY KEY AUTO_INCREMENT,
+            listing_id CHAR(36) NOT NULL UNIQUE,
+            winner_uuid CHAR(36) NOT NULL,
+            winner_name VARCHAR(64) NOT NULL,
+            material_name VARCHAR(128) NOT NULL,
+            item_nbt MEDIUMTEXT,
+            quantity INTEGER NOT NULL,
+            win_price DECIMAL(18,2) NOT NULL,
+            won_timestamp BIGINT NOT NULL,
+            KEY idx_won_items_winner (winner_uuid)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+    """;
+
+    /**
+     * DDL dialect for the auction store (DB scaling plan §11 item 1).
+     * {@code null} statement entries are skipped (MySQL needs no separate
+     * CREATE INDEX statements — the KEY clauses are inline).
+     */
+    public enum AuctionDialect {
+        SQLITE(
+            CREATE_TABLE_SQL,
+            CREATE_INDEX_SQL,
+            CREATE_SOLD_HISTORY_SQL,
+            CREATE_SOLD_HISTORY_INDEX_SQL,
+            CREATE_BID_STATE_SQL,
+            CREATE_BID_HISTORY_SQL,
+            CREATE_BID_HISTORY_INDEX_SQL,
+            CREATE_WON_ITEMS_SQL,
+            CREATE_WON_ITEMS_INDEX_SQL
+        ),
+        MYSQL(
+            MYSQL_CREATE_LISTINGS_SQL,
+            null,
+            MYSQL_CREATE_SOLD_HISTORY_SQL,
+            null,
+            MYSQL_CREATE_BID_STATE_SQL,
+            MYSQL_CREATE_BID_HISTORY_SQL,
+            null,
+            MYSQL_CREATE_WON_ITEMS_SQL,
+            null
+        );
+
+        private final String[] statements;
+
+        AuctionDialect(String... statements) {
+            this.statements = statements;
+        }
+
+        /** DDL statements to execute at initialize(); null entries are skipped. */
+        public String[] statements() {
+            return statements;
+        }
+
+        /** "INSERT OR IGNORE" (SQLite) vs "INSERT IGNORE" (MySQL). */
+        public String insertIgnorePrefix() {
+            return this == MYSQL ? "INSERT IGNORE" : "INSERT OR IGNORE";
+        }
+    }
+
     private final EconomyEngine economyEngine;
     private final ExecutorService asyncExecutor;
+
+    /** Connection strategy: the shared persistent SQLite connection, or one borrowed per operation from the MySQL pool. */
+    private final TransactionLog.ConnectionSource connectionSource;
+    /** True when connections come from a pool and must be returned (closed) after each operation. */
+    private final boolean pooledConnections;
+    private final AuctionDialect dialect;
+    /** SQLite flavor only: the auctions.db JDBC URL. */
     private final String databaseUrl;
     private volatile boolean initialized = false;
 
@@ -215,16 +350,66 @@ public class AuctionManager {
     private final java.util.concurrent.ConcurrentHashMap<UUID, Integer> lastWonDeliveryCount =
         new java.util.concurrent.ConcurrentHashMap<>();
 
+    /**
+     * SQLite flavor (per-server auctions.db file) — the historical default,
+     * used by every existing test and by single-server installs.
+     */
     public AuctionManager(EconomyEngine economyEngine) {
+        this(economyEngine, AuctionDialect.SQLITE, null);
+    }
+
+    /**
+     * MySQL/MariaDB flavor (2.2.1): auction rows live on the shared economy
+     * database and every operation borrows a pooled connection.
+     *
+     * @param pooledSource connection source backed by the MySQL pool
+     *                     (usually {@code MySqlStorage}'s Hikari pool)
+     */
+    public AuctionManager(EconomyEngine economyEngine,
+                          TransactionLog.ConnectionSource pooledSource) {
+        this(economyEngine, AuctionDialect.MYSQL, pooledSource);
+    }
+
+    private AuctionManager(EconomyEngine economyEngine, AuctionDialect dialect,
+                           TransactionLog.ConnectionSource pooledSource) {
         this.economyEngine = economyEngine;
-        this.databaseUrl = "jdbc:sqlite:" + getDatabasePath();
+        this.dialect = dialect;
+        this.pooledConnections = dialect == AuctionDialect.MYSQL;
+        this.connectionSource = pooledConnections
+            ? java.util.Objects.requireNonNull(pooledSource,
+                "MYSQL auction dialect requires a pooled connection source")
+            : () -> persistentConnection;
+        this.databaseUrl = pooledConnections ? null : "jdbc:sqlite:" + getDatabasePath();
         // Single-threaded executor guarantees sequential consistency for all
-        // auction DB operations - NO race conditions possible, NO locking needed
+        // auction operations issued BY THIS SERVER. On a network the shared
+        // database is the real lock: every claim below is a conditional
+        // (exactly-once) UPDATE, so two servers cannot double-settle a row.
         this.asyncExecutor = Executors.newSingleThreadExecutor(r -> {
             Thread t = new Thread(r, "Solidus-Auction-Worker");
             t.setDaemon(true);
             return t;
         });
+    }
+
+    /** One auction-store SQL operation run against a borrowed/shared connection. */
+    private interface SqlWork<T> {
+        T run(Connection conn) throws SQLException;
+    }
+
+    /**
+     * Runs one auction operation on a connection. The SQLite flavor shares the
+     * persistent connection (MUST NOT be closed); the MySQL flavor borrows a
+     * pooled connection and returns it when the work completes — the same
+     * wrapper TransactionLog has used since 2.2.0.
+     */
+    private <T> T withAuction(SqlWork<T> work) throws SQLException {
+        Connection conn = connectionSource.open();
+        if (!pooledConnections) {
+            return work.run(conn);
+        }
+        try (Connection borrowed = conn) {
+            return work.run(borrowed);
+        }
     }
 
     /**
@@ -241,27 +426,29 @@ public class AuctionManager {
     }
 
     /**
-     * Initializes the auction database.
+     * Initializes the auction store with the configured dialect.
      */
     public void initialize() {
         try {
-            // Open persistent connection (safe because single-threaded executor serializes all access)
-            persistentConnection = DriverManager.getConnection(databaseUrl);
-            try (Statement stmt = persistentConnection.createStatement()) {
-                stmt.execute("PRAGMA journal_mode=WAL");
-                stmt.execute("PRAGMA synchronous=NORMAL");
-                stmt.execute(CREATE_TABLE_SQL);
-                stmt.execute(CREATE_INDEX_SQL);
-                stmt.execute(CREATE_SOLD_HISTORY_SQL);
-                stmt.execute(CREATE_SOLD_HISTORY_INDEX_SQL);
-                stmt.execute(CREATE_BID_STATE_SQL);
-                stmt.execute(CREATE_BID_HISTORY_SQL);
-                stmt.execute(CREATE_BID_HISTORY_INDEX_SQL);
-                stmt.execute(CREATE_WON_ITEMS_SQL);
-                stmt.execute(CREATE_WON_ITEMS_INDEX_SQL);
+            if (dialect == AuctionDialect.SQLITE) {
+                // Open persistent connection (safe because single-threaded executor serializes all access)
+                persistentConnection = DriverManager.getConnection(databaseUrl);
+                try (Statement stmt = persistentConnection.createStatement()) {
+                    stmt.execute("PRAGMA journal_mode=WAL");
+                    stmt.execute("PRAGMA synchronous=NORMAL");
+                }
+            }
+            // Create the schema (both dialects; null entries skipped for MYSQL).
+            try (Connection conn = connectionSource.open();
+                 Statement stmt = conn.createStatement()) {
+                for (String ddl : dialect.statements()) {
+                    if (ddl != null) {
+                        stmt.execute(ddl);
+                    }
+                }
             }
             initialized = true;
-            SolidusMod.LOGGER.info("Auction database initialized successfully (bidding system enabled).");
+            SolidusMod.LOGGER.info("Auction store initialized successfully (dialect {}, bidding system enabled).", dialect);
             // Startup recovery: status=1 rows are crash residues (purchase marked
             // SOLD but settlement never finished) or archive failures kept as
             // evidence. Reconcile them against TransactionLog now.
@@ -514,39 +701,40 @@ public class AuctionManager {
         // Step 1: On the auction executor, verify and mark as SOLD atomically
         CompletableFuture.supplyAsync(() -> {
             try {
-                // Check if the listing is still active
-                String selectSql = "SELECT * FROM auction_listings WHERE listing_id = ? AND status = 0";
-                AuctionEntry entry = null;
-                try (PreparedStatement ps = persistentConnection.prepareStatement(selectSql)) {
-                    ps.setString(1, listingId.toString());
-                    try (ResultSet rs = ps.executeQuery()) {
-                        if (rs.next()) {
-                            entry = mapResultSetToEntry(rs);
+                return withAuction(conn -> {
+                    // Check if the listing is still active
+                    String selectSql = "SELECT * FROM auction_listings WHERE listing_id = ? AND status = 0";
+                    AuctionEntry entry = null;
+                    try (PreparedStatement ps = conn.prepareStatement(selectSql)) {
+                        ps.setString(1, listingId.toString());
+                        try (ResultSet rs = ps.executeQuery()) {
+                            if (rs.next()) {
+                                entry = mapResultSetToEntry(rs);
+                            }
                         }
                     }
-                }
 
-                if (entry == null) {
-                    return "SOLD_OUT";
-                }
+                    if (entry == null) {
+                        return "SOLD_OUT";
+                    }
 
-                if (entry.isExpired()) {
-                    return "EXPIRED";
-                }
+                    if (entry.isExpired()) {
+                        return "EXPIRED";
+                    }
 
-                // Check if buyer is the seller
-                if (entry.sellerUuid().equals(buyer.getUUID())) {
-                    return "OWN_ITEM";
-                }
+                    // Check if buyer is the seller
+                    if (entry.sellerUuid().equals(buyer.getUUID())) {
+                        return "OWN_ITEM";
+                    }
 
                 // Transaction hook veto (Solidus 2.1.0+): runs on the auction
                 // executor BEFORE the listing is marked SOLD. A denial here
                 // leaves the listing untouched and fully buyable by others.
                 // (entry is reassigned above, so capture it into a final local
                 // for lambda use.)
-                final AuctionEntry vetoEntry = entry;
+                final AuctionEntry vetoEntry0 = entry;
                 SolidusTransactionHook.Decision hookDecision = EconomyHooks.allow(hook ->
-                    hook.allowAuctionPurchase(buyer.getUUID(), buyer.getName().getString(), vetoEntry.price()));
+                    hook.allowAuctionPurchase(buyer.getUUID(), buyer.getName().getString(), vetoEntry0.price()));
                 if (!hookDecision.allowed()) {
                     return "HOOK_VETOED:" + (hookDecision.reason() != null
                         ? hookDecision.reason() : "Transaction denied.");
@@ -555,12 +743,13 @@ public class AuctionManager {
                 // Mark as SOLD IMMEDIATELY (single-threaded executor guarantees
                 // no other thread can interfere - this IS the atomic operation)
                 String updateSql = "UPDATE auction_listings SET status = 1 WHERE listing_id = ?";
-                try (PreparedStatement ps = persistentConnection.prepareStatement(updateSql)) {
+                try (PreparedStatement ps = conn.prepareStatement(updateSql)) {
                     ps.setString(1, listingId.toString());
                     ps.executeUpdate();
                 }
 
                 return entry;
+            });
 
             } catch (SQLException e) {
                 SolidusMod.LOGGER.error("Auction purchase DB error for listing: {}", listingId, e);
@@ -768,13 +957,18 @@ public class AuctionManager {
                 case MATERIAL -> "material_name ASC, price ASC";
             };
             String sql = "SELECT * FROM auction_listings WHERE status = 0 AND expire_timestamp > ? ORDER BY " + orderBy;
-            try (PreparedStatement ps = persistentConnection.prepareStatement(sql)) {
-                ps.setLong(1, System.currentTimeMillis());
-                try (ResultSet rs = ps.executeQuery()) {
-                    while (rs.next()) {
-                        entries.add(mapResultSetToEntry(rs));
+            try {
+                withAuction(conn -> {
+                    try (PreparedStatement ps = conn.prepareStatement(sql)) {
+                        ps.setLong(1, System.currentTimeMillis());
+                        try (ResultSet rs = ps.executeQuery()) {
+                            while (rs.next()) {
+                                entries.add(mapResultSetToEntry(rs));
+                            }
+                        }
                     }
-                }
+                    return null;
+                });
             } catch (SQLException e) {
                 SolidusMod.LOGGER.error("Failed to get active auction listings", e);
             }
@@ -805,7 +999,7 @@ public class AuctionManager {
         }
         return CompletableFuture.supplyAsync(() -> {
             try {
-                return searchListingsVia(persistentConnection, sanitized, MAX_SEARCH_RESULTS);
+                return withAuction(conn -> searchListingsVia(conn, sanitized, MAX_SEARCH_RESULTS));
             } catch (SQLException e) {
                 SolidusMod.LOGGER.error("Failed to search auction listings", e);
                 return new ArrayList<>();
@@ -884,14 +1078,19 @@ public class AuctionManager {
         return CompletableFuture.supplyAsync(() -> {
             List<AuctionEntry> entries = new ArrayList<>();
             String sql = "SELECT * FROM auction_listings WHERE seller_uuid = ? AND status = 0 AND expire_timestamp > ? ORDER BY listed_timestamp DESC";
-            try (PreparedStatement ps = persistentConnection.prepareStatement(sql)) {
-                ps.setString(1, sellerUuid.toString());
-                ps.setLong(2, System.currentTimeMillis());
-                try (ResultSet rs = ps.executeQuery()) {
-                    while (rs.next()) {
-                        entries.add(mapResultSetToEntry(rs));
+            try {
+                withAuction(conn -> {
+                    try (PreparedStatement ps = conn.prepareStatement(sql)) {
+                        ps.setString(1, sellerUuid.toString());
+                        ps.setLong(2, System.currentTimeMillis());
+                        try (ResultSet rs = ps.executeQuery()) {
+                            while (rs.next()) {
+                                entries.add(mapResultSetToEntry(rs));
+                            }
+                        }
                     }
-                }
+                    return null;
+                });
             } catch (SQLException e) {
                 SolidusMod.LOGGER.error("Failed to get seller listings", e);
             }
@@ -933,19 +1132,7 @@ public class AuctionManager {
         }
 
         CompletableFuture.supplyAsync(() -> {
-            List<AuctionEntry> expired = new ArrayList<>();
-            String sql = "SELECT * FROM auction_listings WHERE status = 0 AND expire_timestamp <= ?";
-            try (PreparedStatement ps = persistentConnection.prepareStatement(sql)) {
-                ps.setLong(1, System.currentTimeMillis());
-                try (ResultSet rs = ps.executeQuery()) {
-                    while (rs.next()) {
-                        expired.add(mapResultSetToEntry(rs));
-                    }
-                }
-            } catch (SQLException e) {
-                SolidusMod.LOGGER.error("Failed to query expired listings", e);
-                return new ArrayList<AuctionEntry>();
-            }
+            List<AuctionEntry> expired = selectExpiredListings();
 
             List<AuctionEntry> toReturnDirectly = new ArrayList<>();
             List<PendingWinDelivery> toDeliverDirectly = new ArrayList<>();
@@ -1039,6 +1226,72 @@ public class AuctionManager {
     }
 
     /**
+     * Feature gate for the {@code FOR UPDATE SKIP LOCKED} sweep (MariaDB 10.6+ /
+     * MySQL 8+). Flipped off permanently after one unsupported-feature error.
+     */
+    private volatile boolean skipLockedSweepSupported = true;
+
+    /** True when the error means the SKIP LOCKED syntax/feature is unavailable. */
+    private static boolean isUnsupportedFeature(SQLException e) {
+        for (SQLException cur = e; cur != null; cur = cur.getNextException()) {
+            int code = cur.getErrorCode();
+            if (code == 1064 /* SQL syntax error */ || code == 1235 /* feature not supported */
+                    || code == 1305 /* function/procedure unknown */) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * SELECTs the expired ACTIVE rows for settlement.
+     *
+     * <p>MySQL/MariaDB flavor (2.2.1): the sweep runs inside a SHORT
+     * transaction with {@code FOR UPDATE SKIP LOCKED} so two servers sweeping
+     * at the same tick never return the same rows twice — each server takes a
+     * disjoint batch. The locks release at the commit right after the SELECT;
+     * the per-row claims below stay exactly-once via their own conditional
+     * guards, so this is a concurrency smoother, not a correctness change.
+     * Servers older than MariaDB 10.6 / MySQL 8.0 fall back to the plain
+     * SELECT after one unsupported-feature error.</p>
+     */
+    private List<AuctionEntry> selectExpiredListings() {
+        List<AuctionEntry> expired = new ArrayList<>();
+        String baseSql = "SELECT * FROM auction_listings WHERE status = 0 AND expire_timestamp <= ?";
+        String sweepSql = baseSql + " FOR UPDATE SKIP LOCKED";
+        boolean useSkipLocked = dialect == AuctionDialect.MYSQL && skipLockedSweepSupported;
+        try {
+            withAuction(conn -> {
+                if (useSkipLocked) {
+                    conn.setAutoCommit(false); // hold the row locks for this snapshot
+                }
+                try (PreparedStatement ps = conn.prepareStatement(useSkipLocked ? sweepSql : baseSql)) {
+                    ps.setLong(1, System.currentTimeMillis());
+                    try (ResultSet rs = ps.executeQuery()) {
+                        while (rs.next()) {
+                            expired.add(mapResultSetToEntry(rs));
+                        }
+                    }
+                }
+                if (useSkipLocked) {
+                    conn.commit(); // release locks — per-row claims are exactly-once anyway
+                }
+                return null;
+            });
+        } catch (SQLException e) {
+            if (useSkipLocked && isUnsupportedFeature(e)) {
+                skipLockedSweepSupported = false;
+                SolidusMod.LOGGER.warn(
+                    "SKIP LOCKED sweep unsupported on this database server - falling back to the plain sweep SELECT.");
+                return selectExpiredListings(); // retry with the plain SELECT
+            }
+            SolidusMod.LOGGER.error("Failed to query expired listings", e);
+            return new ArrayList<AuctionEntry>();
+        }
+        return expired;
+    }
+
+    /**
      * Audit 2.1.3: re-inserts an expired listing row (status = 2, collectible
      * via /ah collect) after a direct hand-out could not be delivered because
      * the seller disconnected between the online-seller snapshot and the
@@ -1048,23 +1301,28 @@ public class AuctionManager {
      */
     private void reinsertAsCollectible(AuctionEntry entry) {
         CompletableFuture.runAsync(() -> {
-            String sql = """
-                INSERT OR IGNORE INTO auction_listings
+            String sql = dialect.insertIgnorePrefix() + """
+                 INTO auction_listings
                 (listing_id, seller_uuid, seller_name, material_name, quantity,
                  item_nbt, price, listed_timestamp, expire_timestamp, status)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 2)
             """;
-            try (PreparedStatement ps = persistentConnection.prepareStatement(sql)) {
-                ps.setString(1, entry.listingId().toString());
-                ps.setString(2, entry.sellerUuid().toString());
-                ps.setString(3, entry.sellerName());
-                ps.setString(4, entry.materialName());
-                ps.setInt(5, entry.quantity());
-                ps.setString(6, entry.itemNbt());
-                ps.setDouble(7, entry.price());
-                ps.setLong(8, entry.listedTimestamp());
-                ps.setLong(9, entry.expireTimestamp());
-                ps.executeUpdate();
+            try {
+                withAuction(conn -> {
+                    try (PreparedStatement ps = conn.prepareStatement(sql)) {
+                        ps.setString(1, entry.listingId().toString());
+                        ps.setString(2, entry.sellerUuid().toString());
+                        ps.setString(3, entry.sellerName());
+                        ps.setString(4, entry.materialName());
+                        ps.setInt(5, entry.quantity());
+                        ps.setString(6, entry.itemNbt());
+                        ps.setDouble(7, entry.price());
+                        ps.setLong(8, entry.listedTimestamp());
+                        ps.setLong(9, entry.expireTimestamp());
+                        ps.executeUpdate();
+                    }
+                    return null;
+                });
                 SolidusMod.LOGGER.warn(
                     "Expired listing {} re-inserted as collectible - seller {} disconnected before hand-out.",
                     entry.listingId(), entry.sellerName());
@@ -1090,26 +1348,30 @@ public class AuctionManager {
                  item_nbt, price, listed_timestamp, expire_timestamp, status)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """;
-            try (PreparedStatement ps = persistentConnection.prepareStatement(sql)) {
-                ps.setString(1, entry.listingId().toString());
-                ps.setString(2, entry.sellerUuid().toString());
-                ps.setString(3, entry.sellerName());
-                ps.setString(4, entry.materialName());
-                ps.setInt(5, entry.quantity());
-                ps.setString(6, entry.itemNbt());
-                ps.setDouble(7, entry.price());
-                ps.setLong(8, entry.listedTimestamp());
-                ps.setLong(9, entry.expireTimestamp());
-                ps.setInt(10, entry.status().ordinal()); // 0=ACTIVE, 1=SOLD, 2=EXPIRED
-                ps.executeUpdate();
+            try {
+                return withAuction(conn -> {
+                    try (PreparedStatement ps = conn.prepareStatement(sql)) {
+                        ps.setString(1, entry.listingId().toString());
+                        ps.setString(2, entry.sellerUuid().toString());
+                        ps.setString(3, entry.sellerName());
+                        ps.setString(4, entry.materialName());
+                        ps.setInt(5, entry.quantity());
+                        ps.setString(6, entry.itemNbt());
+                        ps.setDouble(7, entry.price());
+                        ps.setLong(8, entry.listedTimestamp());
+                        ps.setLong(9, entry.expireTimestamp());
+                        ps.setInt(10, entry.status().ordinal()); // 0=ACTIVE, 1=SOLD, 2=EXPIRED
+                        ps.executeUpdate();
+                    }
 
-                // Bidding-enabled listing: seed the bid state row in the SAME
-                // serialized executor step. A listing without a bid-state row
-                // is a buy-now-only listing; with one, the auction can be won.
-                if (startBid > 0) {
-                    insertBidState(entry.listingId(), startBid);
-                }
-                return true;
+                    // Bidding-enabled listing: seed the bid state row in the SAME
+                    // serialized executor step. A listing without a bid-state row
+                    // is a buy-now-only listing; with one, the auction can be won.
+                    if (startBid > 0) {
+                        insertBidState(conn, entry.listingId(), startBid);
+                    }
+                    return true;
+                });
             } catch (SQLException e) {
                 SolidusMod.LOGGER.error("Failed to save auction listing", e);
                 return false;
@@ -1118,11 +1380,12 @@ public class AuctionManager {
     }
 
     /** Inserts the initial bid-state row for a bidding-enabled listing. */
-    private void insertBidState(UUID listingId, double startPrice) throws SQLException {
-        String sql = "INSERT OR REPLACE INTO auction_bid_state "
+    private void insertBidState(Connection conn, UUID listingId, double startPrice) throws SQLException {
+        // REPLACE INTO is valid on BOTH SQLite and MySQL — one dialect-neutral string.
+        String sql = "REPLACE INTO auction_bid_state "
             + "(listing_id, start_price, current_bid, current_bidder_uuid, current_bidder_name, bid_count, extensions_used) "
             + "VALUES (?, ?, NULL, NULL, NULL, 0, 0)";
-        try (PreparedStatement ps = persistentConnection.prepareStatement(sql)) {
+        try (PreparedStatement ps = conn.prepareStatement(sql)) {
             ps.setString(1, listingId.toString());
             ps.setDouble(2, startPrice);
             ps.executeUpdate();
@@ -1136,9 +1399,14 @@ public class AuctionManager {
             // the unconditional UPDATE could resurrect any state a future
             // caller or a concurrent recovery sweep left behind.
             String sql = "UPDATE auction_listings SET status = 0 WHERE listing_id = ? AND status = 1";
-            try (PreparedStatement ps = persistentConnection.prepareStatement(sql)) {
-                ps.setString(1, listingId.toString());
-                ps.executeUpdate();
+            try {
+                withAuction(conn -> {
+                    try (PreparedStatement ps = conn.prepareStatement(sql)) {
+                        ps.setString(1, listingId.toString());
+                        ps.executeUpdate();
+                    }
+                    return null;
+                });
             } catch (SQLException e) {
                 SolidusMod.LOGGER.error("Failed to mark listing as unsold: {}", listingId, e);
             }
@@ -1153,8 +1421,14 @@ public class AuctionManager {
      * Returns true only when THIS call performed the claim.
      */
     private boolean claimExpiredRowForReturn(UUID listingId) {
-        return archiveAndDeleteListing(persistentConnection, listingId,
-            SETTLED_EXPIRED_RETURN, null, null, System.currentTimeMillis(), SolidusMod.LOGGER);
+        try {
+            return withAuction(conn -> archiveAndDeleteListing(conn, listingId,
+                SETTLED_EXPIRED_RETURN, null, null, System.currentTimeMillis(), SolidusMod.LOGGER, dialect));
+        } catch (SQLException e) {
+            SolidusMod.LOGGER.error("Failed to claim expired listing {}: {}",
+                listingId, e.getMessage());
+            return false;
+        }
     }
 
     /**
@@ -1166,8 +1440,18 @@ public class AuctionManager {
      */
     private boolean markExpiredRowCollectible(UUID listingId) {
         String sql = "UPDATE auction_listings SET status = 2 WHERE listing_id = ? AND status = 0";
-        try (PreparedStatement ps = persistentConnection.prepareStatement(sql)) {
-            return ps.executeUpdate() > 0;
+        try {
+            return withAuction(conn -> {
+                try (PreparedStatement ps = conn.prepareStatement(sql)) {
+                    // BUGFIX (2.2.1): the parameter was NEVER bound in 2.1.x —
+                    // SQLite treated it as NULL, "listing_id = NULL" matched no
+                    // row, and offline sellers' expired items never became
+                    // collectible via this path (they only came back when the
+                    // seller happened to be online during a sweep).
+                    ps.setString(1, listingId.toString());
+                    return ps.executeUpdate() > 0;
+                }
+            });
         } catch (SQLException e) {
             SolidusMod.LOGGER.error("Failed to mark listing {} collectible: {}", listingId, e.getMessage());
             return false;
@@ -1274,13 +1558,18 @@ public class AuctionManager {
         CompletableFuture.supplyAsync(() -> {
             String sql = "SELECT * FROM auction_listings WHERE seller_uuid = ? AND status = 2";
             List<AuctionEntry> expired = new ArrayList<>();
-            try (PreparedStatement ps = persistentConnection.prepareStatement(sql)) {
-                ps.setString(1, player.getUUID().toString());
-                try (ResultSet rs = ps.executeQuery()) {
-                    while (rs.next()) {
-                        expired.add(mapResultSetToEntry(rs));
+            try {
+                withAuction(conn -> {
+                    try (PreparedStatement ps = conn.prepareStatement(sql)) {
+                        ps.setString(1, player.getUUID().toString());
+                        try (ResultSet rs = ps.executeQuery()) {
+                            while (rs.next()) {
+                                expired.add(mapResultSetToEntry(rs));
+                            }
+                        }
                     }
-                }
+                    return null;
+                });
             } catch (SQLException e) {
                 SolidusMod.LOGGER.error("Failed to query expired listings for collection", e);
             }
@@ -1294,8 +1583,15 @@ public class AuctionManager {
             if (!expired.isEmpty()) {
                 // Atomic archive+delete: rows land in auction_sold_history in the
                 // same transaction that removes them - no hand-out without evidence.
-                int claimed = archiveAndDeleteCollectibles(persistentConnection,
-                    player.getUUID(), System.currentTimeMillis(), SolidusMod.LOGGER);
+                Integer claimed;
+                try {
+                    claimed = withAuction(conn -> archiveAndDeleteCollectibles(conn,
+                        player.getUUID(), System.currentTimeMillis(), SolidusMod.LOGGER, dialect));
+                } catch (SQLException e) {
+                    SolidusMod.LOGGER.error("Failed to claim collected listings for seller {}: {}",
+                        player.getUUID(), e.getMessage());
+                    return new ArrayList<AuctionEntry>();
+                }
                 if (claimed != expired.size()) {
                     // Archive+delete failed or claimed fewer rows than selected -
                     // do NOT hand out items, or they could be re-claimed later.
@@ -1357,18 +1653,23 @@ public class AuctionManager {
         CompletableFuture.supplyAsync(() -> {
             List<WonItemRow> won = new ArrayList<>();
             String sql = "SELECT * FROM auction_won_items WHERE winner_uuid = ?";
-            try (PreparedStatement ps = persistentConnection.prepareStatement(sql)) {
-                ps.setString(1, playerUuid.toString());
-                try (ResultSet rs = ps.executeQuery()) {
-                    while (rs.next()) {
-                        won.add(new WonItemRow(
-                            rs.getLong("win_id"),
-                            rs.getString("material_name"),
-                            rs.getString("item_nbt"),
-                            rs.getInt("quantity"),
-                            rs.getDouble("win_price")));
+            try {
+                withAuction(conn -> {
+                    try (PreparedStatement ps = conn.prepareStatement(sql)) {
+                        ps.setString(1, playerUuid.toString());
+                        try (ResultSet rs = ps.executeQuery()) {
+                            while (rs.next()) {
+                                won.add(new WonItemRow(
+                                    rs.getLong("win_id"),
+                                    rs.getString("material_name"),
+                                    rs.getString("item_nbt"),
+                                    rs.getInt("quantity"),
+                                    rs.getDouble("win_price")));
+                            }
+                        }
                     }
-                }
+                    return null;
+                });
             } catch (SQLException e) {
                 SolidusMod.LOGGER.error("Failed to query won items for {}", playerUuid, e);
             }
@@ -1377,12 +1678,17 @@ public class AuctionManager {
             }
             // Claim by DELETE (serialized executor) BEFORE handing anything out.
             List<WonItemRow> claimed = new ArrayList<>();
-            try (PreparedStatement del = persistentConnection.prepareStatement(
-                    "DELETE FROM auction_won_items WHERE win_id = ?")) {
-                for (WonItemRow row : won) {
-                    del.setLong(1, row.winId());
-                    if (del.executeUpdate() > 0) claimed.add(row);
-                }
+            try {
+                withAuction(conn -> {
+                    try (PreparedStatement del = conn.prepareStatement(
+                            "DELETE FROM auction_won_items WHERE win_id = ?")) {
+                        for (WonItemRow row : won) {
+                            del.setLong(1, row.winId());
+                            if (del.executeUpdate() > 0) claimed.add(row);
+                        }
+                    }
+                    return null;
+                });
             } catch (SQLException e) {
                 SolidusMod.LOGGER.error("Failed to claim won items for {}", playerUuid, e);
                 return new ArrayList<WonItemRow>();
@@ -1434,26 +1740,27 @@ public class AuctionManager {
     public void cancelListing(ServerPlayer player, UUID listingId) {
         CompletableFuture.supplyAsync(() -> {
             try {
-                // Check if the listing is active and belongs to this seller
-                String selectSql = "SELECT * FROM auction_listings WHERE listing_id = ? AND status = 0";
-                AuctionEntry entry = null;
-                try (PreparedStatement ps = persistentConnection.prepareStatement(selectSql)) {
-                    ps.setString(1, listingId.toString());
-                    try (ResultSet rs = ps.executeQuery()) {
-                        if (rs.next()) {
-                            entry = mapResultSetToEntry(rs);
+                return withAuction(conn -> {
+                    // Check if the listing is active and belongs to this seller
+                    String selectSql = "SELECT * FROM auction_listings WHERE listing_id = ? AND status = 0";
+                    AuctionEntry entry = null;
+                    try (PreparedStatement ps = conn.prepareStatement(selectSql)) {
+                        ps.setString(1, listingId.toString());
+                        try (ResultSet rs = ps.executeQuery()) {
+                            if (rs.next()) {
+                                entry = mapResultSetToEntry(rs);
+                            }
                         }
                     }
-                }
 
-                if (entry == null) {
-                    return "NOT_FOUND";
-                }
+                    if (entry == null) {
+                        return "NOT_FOUND";
+                    }
 
-                // Verify ownership
-                if (!entry.sellerUuid().equals(player.getUUID())) {
-                    return "NOT_OWNER";
-                }
+                    // Verify ownership
+                    if (!entry.sellerUuid().equals(player.getUUID())) {
+                        return "NOT_OWNER";
+                    }
 
                 // SECURITY FIX (guaranteed dupe): cancellation used to flip the row
                 // to status=2 EXPIRED and leave it in the database while the item was
@@ -1463,14 +1770,15 @@ public class AuctionManager {
                 // timing required. The row is now atomically ARCHIVED + DELETED
                 // (claimed) inside this same serialized executor step; the hand-out
                 // follows on the server thread.
-                if (!archiveAndDeleteListing(persistentConnection, listingId,
-                        SETTLED_CANCELLED, null, null, System.currentTimeMillis(), SolidusMod.LOGGER)) {
+                if (!archiveAndDeleteListing(conn, listingId,
+                        SETTLED_CANCELLED, null, null, System.currentTimeMillis(), SolidusMod.LOGGER, dialect)) {
                     // A buy, expiry sweep or another cancel consumed the listing
                     // between our SELECT and DELETE - nothing was changed.
                     return "NOT_FOUND";
                 }
 
                 return entry;
+            });
 
             } catch (SQLException e) {
                 SolidusMod.LOGGER.error("Auction cancel DB error for listing: {}", listingId, e);
@@ -1526,13 +1834,18 @@ public class AuctionManager {
         return CompletableFuture.supplyAsync(() -> {
             List<AuctionEntry> entries = new ArrayList<>();
             String sql = "SELECT * FROM auction_listings WHERE seller_uuid = ? AND status = 2 ORDER BY expire_timestamp DESC";
-            try (PreparedStatement ps = persistentConnection.prepareStatement(sql)) {
-                ps.setString(1, sellerUuid.toString());
-                try (ResultSet rs = ps.executeQuery()) {
-                    while (rs.next()) {
-                        entries.add(mapResultSetToEntry(rs));
+            try {
+                withAuction(conn -> {
+                    try (PreparedStatement ps = conn.prepareStatement(sql)) {
+                        ps.setString(1, sellerUuid.toString());
+                        try (ResultSet rs = ps.executeQuery()) {
+                            while (rs.next()) {
+                                entries.add(mapResultSetToEntry(rs));
+                            }
+                        }
                     }
-                }
+                    return null;
+                });
             } catch (SQLException e) {
                 SolidusMod.LOGGER.error("Failed to get expired listings for seller", e);
             }
@@ -1718,73 +2031,90 @@ public class AuctionManager {
                 bid_count = bid_count + 1
             WHERE listing_id = ? AND (current_bid IS NULL OR current_bid < ?)
         """;
-        try (PreparedStatement ps = persistentConnection.prepareStatement(sql)) {
-            ps.setDouble(1, amount);
-            ps.setString(2, bidderUuid.toString());
-            ps.setString(3, bidderName);
-            ps.setString(4, listingId.toString());
-            ps.setDouble(5, amount);
-            return ps.executeUpdate() > 0;
-        }
+        return withAuction(conn -> {
+            try (PreparedStatement ps = conn.prepareStatement(sql)) {
+                ps.setDouble(1, amount);
+                ps.setString(2, bidderUuid.toString());
+                ps.setString(3, bidderName);
+                ps.setString(4, listingId.toString());
+                ps.setDouble(5, amount);
+                return ps.executeUpdate() > 0;
+            }
+        });
     }
 
     private void insertBidHistory(UUID listingId, UUID bidderUuid, String bidderName, double amount)
             throws SQLException {
         String sql = "INSERT INTO auction_bids (listing_id, bidder_uuid, bidder_name, amount, bid_timestamp) "
             + "VALUES (?, ?, ?, ?, ?)";
-        try (PreparedStatement ps = persistentConnection.prepareStatement(sql)) {
-            ps.setString(1, listingId.toString());
-            ps.setString(2, bidderUuid.toString());
-            ps.setString(3, bidderName);
-            ps.setDouble(4, amount);
-            ps.setLong(5, System.currentTimeMillis());
-            ps.executeUpdate();
-        }
+        withAuction(conn -> {
+            try (PreparedStatement ps = conn.prepareStatement(sql)) {
+                ps.setString(1, listingId.toString());
+                ps.setString(2, bidderUuid.toString());
+                ps.setString(3, bidderName);
+                ps.setDouble(4, amount);
+                ps.setLong(5, System.currentTimeMillis());
+                ps.executeUpdate();
+            }
+            return null;
+        });
     }
 
     private void extendListingExpiry(UUID listingId, long newExpiry) throws SQLException {
-        String sql = "UPDATE auction_listings SET expire_timestamp = ? "
+        // BUGFIX (2.2.1): extensions_used was never incremented in 2.1.x, so the
+        // MAX_ANTI_SNIPE_EXTENSIONS cap (12) never took effect and every bid in
+        // the last window extended the deadline indefinitely. The counter now
+        // advances with every successful extension.
+        String sql = "UPDATE auction_listings SET expire_timestamp = ?, "
+            + "extensions_used = extensions_used + 1 "
             + "WHERE listing_id = ? AND status = 0";
-        try (PreparedStatement ps = persistentConnection.prepareStatement(sql)) {
-            ps.setLong(1, newExpiry);
-            ps.setString(2, listingId.toString());
-            ps.executeUpdate();
-        }
+        withAuction(conn -> {
+            try (PreparedStatement ps = conn.prepareStatement(sql)) {
+                ps.setLong(1, newExpiry);
+                ps.setString(2, listingId.toString());
+                ps.executeUpdate();
+            }
+            return null;
+        });
     }
 
     /** Loads an ACTIVE (status=0, unexpired) listing row, or null. */
     private AuctionEntry loadActiveListing(UUID listingId) throws SQLException {
         String sql = "SELECT * FROM auction_listings WHERE listing_id = ? AND status = 0";
-        try (PreparedStatement ps = persistentConnection.prepareStatement(sql)) {
-            ps.setString(1, listingId.toString());
-            try (ResultSet rs = ps.executeQuery()) {
-                return rs.next() ? mapResultSetToEntry(rs) : null;
+        return withAuction(conn -> {
+            try (PreparedStatement ps = conn.prepareStatement(sql)) {
+                ps.setString(1, listingId.toString());
+                try (ResultSet rs = ps.executeQuery()) {
+                    return rs.next() ? mapResultSetToEntry(rs) : null;
+                }
             }
-        }
+        });
     }
 
     /** Loads the bid state for a listing, or null when the listing is buy-now-only. */
     private BidState loadBidState(UUID listingId) throws SQLException {
         String sql = "SELECT * FROM auction_bid_state WHERE listing_id = ?";
-        try (PreparedStatement ps = persistentConnection.prepareStatement(sql)) {
-            ps.setString(1, listingId.toString());
-            try (ResultSet rs = ps.executeQuery()) {
-                if (!rs.next()) return null;
-                double startPrice = rs.getDouble("start_price");
-                double currentBid = rs.getDouble("current_bid");
-                boolean hasBid = !rs.wasNull();
-                String bidderUuidStr = rs.getString("current_bidder_uuid");
-                String bidderName = rs.getString("current_bidder_name");
-                return new BidState(
-                    listingId,
-                    startPrice,
-                    hasBid ? currentBid : null,
-                    bidderUuidStr != null ? UUID.fromString(bidderUuidStr) : null,
-                    bidderName,
-                    rs.getInt("bid_count"),
-                    rs.getInt("extensions_used"));
+        return withAuction(conn -> {
+            try (PreparedStatement ps = conn.prepareStatement(sql)) {
+                ps.setString(1, listingId.toString());
+                try (ResultSet rs = ps.executeQuery()) {
+                    if (!rs.next()) return null;
+                    double startPrice = rs.getDouble("start_price");
+                    double currentBid = rs.getDouble("current_bid");
+                    boolean hasBid = !rs.wasNull();
+                    String bidderUuidStr = rs.getString("current_bidder_uuid");
+                    String bidderName = rs.getString("current_bidder_name");
+                    return new BidState(
+                        listingId,
+                        startPrice,
+                        hasBid ? currentBid : null,
+                        bidderUuidStr != null ? UUID.fromString(bidderUuidStr) : null,
+                        bidderName,
+                        rs.getInt("bid_count"),
+                        rs.getInt("extensions_used"));
+                }
             }
-        }
+        });
     }
 
     /**
@@ -1802,27 +2132,32 @@ public class AuctionManager {
             java.util.Map<UUID, BidState> out = new java.util.HashMap<>();
             String placeholders = String.join(", ", java.util.Collections.nCopies(listingIds.size(), "?"));
             String sql = "SELECT * FROM auction_bid_state WHERE listing_id IN (" + placeholders + ")";
-            try (PreparedStatement ps = persistentConnection.prepareStatement(sql)) {
-                int i = 1;
-                for (UUID id : listingIds) {
-                    ps.setString(i++, id.toString());
-                }
-                try (ResultSet rs = ps.executeQuery()) {
-                    while (rs.next()) {
-                        UUID listingId = UUID.fromString(rs.getString("listing_id"));
-                        double currentBid = rs.getDouble("current_bid");
-                        boolean hasBid = !rs.wasNull();
-                        String bidderUuidStr = rs.getString("current_bidder_uuid");
-                        out.put(listingId, new BidState(
-                            listingId,
-                            rs.getDouble("start_price"),
-                            hasBid ? currentBid : null,
-                            bidderUuidStr != null ? UUID.fromString(bidderUuidStr) : null,
-                            rs.getString("current_bidder_name"),
-                            rs.getInt("bid_count"),
-                            rs.getInt("extensions_used")));
+            try {
+                withAuction(conn -> {
+                    try (PreparedStatement ps = conn.prepareStatement(sql)) {
+                        int i = 1;
+                        for (UUID id : listingIds) {
+                            ps.setString(i++, id.toString());
+                        }
+                        try (ResultSet rs = ps.executeQuery()) {
+                            while (rs.next()) {
+                                UUID listingId = UUID.fromString(rs.getString("listing_id"));
+                                double currentBid = rs.getDouble("current_bid");
+                                boolean hasBid = !rs.wasNull();
+                                String bidderUuidStr = rs.getString("current_bidder_uuid");
+                                out.put(listingId, new BidState(
+                                    listingId,
+                                    rs.getDouble("start_price"),
+                                    hasBid ? currentBid : null,
+                                    bidderUuidStr != null ? UUID.fromString(bidderUuidStr) : null,
+                                    rs.getString("current_bidder_name"),
+                                    rs.getInt("bid_count"),
+                                    rs.getInt("extensions_used")));
+                            }
+                        }
                     }
-                }
+                    return null;
+                });
             } catch (SQLException e) {
                 SolidusMod.LOGGER.error("Failed to load bid states", e);
             }
@@ -1872,22 +2207,29 @@ public class AuctionManager {
                 LEFT JOIN auction_listings l ON l.listing_id = bs.listing_id AND l.status = 0
                 WHERE l.listing_id IS NULL
             """;
-            try (PreparedStatement ps = persistentConnection.prepareStatement(sql);
-                 ResultSet rs = ps.executeQuery()) {
-                while (rs.next()) {
-                    UUID listingId = UUID.fromString(rs.getString("listing_id"));
-                    double currentBid = rs.getDouble("current_bid");
-                    boolean hasBid = !rs.wasNull();
-                    if (hasBid) {
-                        orphans.add(new BidState(listingId, rs.getDouble("start_price"),
-                            currentBid, UUID.fromString(rs.getString("current_bidder_uuid")),
-                            rs.getString("current_bidder_name"),
-                            rs.getInt("bid_count"), rs.getInt("extensions_used")));
-                    } else {
-                        // No bids to refund - just clean the dead state row.
-                        deleteBidState(listingId);
+            try {
+                withAuction(conn -> {
+                    try (PreparedStatement ps = conn.prepareStatement(sql);
+                         ResultSet rs = ps.executeQuery()) {
+                        while (rs.next()) {
+                            UUID listingId = UUID.fromString(rs.getString("listing_id"));
+                            double currentBid = rs.getDouble("current_bid");
+                            boolean hasBid = !rs.wasNull();
+                            if (hasBid) {
+                                orphans.add(new BidState(listingId, rs.getDouble("start_price"),
+                                    currentBid, UUID.fromString(rs.getString("current_bidder_uuid")),
+                                    rs.getString("current_bidder_name"),
+                                    rs.getInt("bid_count"), rs.getInt("extensions_used")));
+                            } else {
+                                // No bids to refund - just clean the dead state row.
+                                deleteBidState(listingId);
+                            }
+                        }
                     }
-                }
+                    return null;
+                });
+            } catch (SQLException inner) {
+                throw inner;
             }
             for (BidState orphan : orphans) {
                 refundFromEscrow(orphan.currentBidderUuid(), orphan.currentBidderName(),
@@ -1912,11 +2254,14 @@ public class AuctionManager {
     }
 
     private void deleteBidState(UUID listingId) throws SQLException {
-        try (PreparedStatement ps = persistentConnection.prepareStatement(
-                "DELETE FROM auction_bid_state WHERE listing_id = ?")) {
-            ps.setString(1, listingId.toString());
-            ps.executeUpdate();
-        }
+        withAuction(conn -> {
+            try (PreparedStatement ps = conn.prepareStatement(
+                    "DELETE FROM auction_bid_state WHERE listing_id = ?")) {
+                ps.setString(1, listingId.toString());
+                ps.executeUpdate();
+            }
+            return null;
+        });
     }
 
     /**
@@ -1925,31 +2270,37 @@ public class AuctionManager {
      * charge and the bid-state claim, or vice versa).
      */
     private void checkEscrowConsistency() {
+        final double expected;
         try {
-            double escrowBalance = 0;
-            try (PreparedStatement ps = persistentConnection.prepareStatement(
-                    "SELECT balance FROM player_balances WHERE uuid = ?")) {
-                ps.setString(1, com.solidus.economy.EscrowAccount.UUID_ZERO.toString());
-                try (ResultSet rs = ps.executeQuery()) {
-                    if (rs.next()) escrowBalance = rs.getDouble("balance");
+            expected = withAuction(conn -> {
+                try (PreparedStatement ps = conn.prepareStatement(
+                            "SELECT COALESCE(SUM(current_bid), 0) AS total FROM auction_bid_state "
+                                + "WHERE current_bid IS NOT NULL");
+                     ResultSet rs = ps.executeQuery()) {
+                    return rs.next() ? rs.getDouble("total") : 0.0;
                 }
-            }
-            double expected = 0;
-            try (PreparedStatement ps = persistentConnection.prepareStatement(
-                    "SELECT COALESCE(SUM(current_bid), 0) AS total FROM auction_bid_state WHERE current_bid IS NOT NULL");
-                 ResultSet rs = ps.executeQuery()) {
-                if (rs.next()) expected = rs.getDouble("total");
-            }
-            double diff = Math.abs(escrowBalance - expected);
-            if (diff > 0.01) {
-                SolidusMod.LOGGER.warn(
-                    "ESCROW CONSISTENCY: escrow holds {} but open top bids sum to {} (diff {}). "
-                        + "A crash likely interrupted a bid - audit BID_PLACED/BID_REFUNDED ledger rows and refund manually if needed.",
-                    CurrencyUtil.format(escrowBalance), CurrencyUtil.format(expected), CurrencyUtil.format(diff));
-            }
+            });
         } catch (SQLException e) {
-            SolidusMod.LOGGER.error("Escrow consistency check failed", e);
+            SolidusMod.LOGGER.error("Escrow consistency check failed (auction side)", e);
+            return;
         }
+        // BUGFIX (2.2.1): the escrow BALANCE used to be read through the auction
+        // connection — in SQLite mode a DIFFERENT database file with no
+        // player_balances table, so this check silently failed into the catch
+        // block on every startup. The balance now comes from the economy
+        // storage API (async — no init-thread blocking).
+        economyEngine.getStorage().getBalance(
+                com.solidus.economy.EscrowAccount.UUID_ZERO,
+                com.solidus.economy.EscrowAccount.NAME)
+            .thenAccept(escrowBalance -> {
+                double diff = Math.abs(escrowBalance - expected);
+                if (diff > 0.01) {
+                    SolidusMod.LOGGER.warn(
+                        "ESCROW CONSISTENCY: escrow holds {} but open top bids sum to {} (diff {}). "
+                            + "A crash likely interrupted a bid - audit BID_PLACED/BID_REFUNDED ledger rows and refund manually if needed.",
+                        CurrencyUtil.format(escrowBalance), CurrencyUtil.format(expected), CurrencyUtil.format(diff));
+                }
+            });
     }
 
     /**
@@ -2045,8 +2396,14 @@ public class AuctionManager {
         double amount = state.currentBid();
 
         // 1) Exactly-once claim of the listing row (buyer = winner).
-        boolean claimed = archiveAndDeleteListing(persistentConnection, entry.listingId(),
-            SETTLED_WON, winnerUuid, winnerName, System.currentTimeMillis(), SolidusMod.LOGGER);
+        boolean claimed;
+        try {
+            claimed = withAuction(conn -> archiveAndDeleteListing(conn, entry.listingId(),
+                SETTLED_WON, winnerUuid, winnerName, System.currentTimeMillis(), SolidusMod.LOGGER, dialect));
+        } catch (SQLException e) {
+            SolidusMod.LOGGER.error("Failed to claim won listing {}: {}", entry.listingId(), e.getMessage());
+            return null;
+        }
         if (!claimed) {
             SolidusMod.LOGGER.warn("Won listing {} was claimed by another flow - skipping settlement.",
                 entry.listingId());
@@ -2120,21 +2477,26 @@ public class AuctionManager {
     /** Stores a won item for offline collection via /ah collect (idempotent). */
     private void storeWonItemRow(AuctionEntry entry, UUID winnerUuid, String winnerName, double amount) {
         CompletableFuture.runAsync(() -> {
-            String sql = """
-                INSERT OR IGNORE INTO auction_won_items
+            String sql = dialect.insertIgnorePrefix() + """
+                 INTO auction_won_items
                 (listing_id, winner_uuid, winner_name, material_name, item_nbt, quantity, win_price, won_timestamp)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """;
-            try (PreparedStatement ps = persistentConnection.prepareStatement(sql)) {
-                ps.setString(1, entry.listingId().toString());
-                ps.setString(2, winnerUuid.toString());
-                ps.setString(3, winnerName);
-                ps.setString(4, entry.materialName());
-                ps.setString(5, entry.itemNbt());
-                ps.setInt(6, entry.quantity());
-                ps.setDouble(7, amount);
-                ps.setLong(8, System.currentTimeMillis());
-                ps.executeUpdate();
+            try {
+                withAuction(conn -> {
+                    try (PreparedStatement ps = conn.prepareStatement(sql)) {
+                        ps.setString(1, entry.listingId().toString());
+                        ps.setString(2, winnerUuid.toString());
+                        ps.setString(3, winnerName);
+                        ps.setString(4, entry.materialName());
+                        ps.setString(5, entry.itemNbt());
+                        ps.setInt(6, entry.quantity());
+                        ps.setDouble(7, amount);
+                        ps.setLong(8, System.currentTimeMillis());
+                        ps.executeUpdate();
+                    }
+                    return null;
+                });
             } catch (SQLException e) {
                 SolidusMod.LOGGER.error("CRITICAL: could not store won item for {} (listing {}) - check auction_sold_history",
                     winnerName, entry.listingId(), e);
@@ -2168,21 +2530,26 @@ public class AuctionManager {
     }
 
     private void storeWonItemRowFromDelivery(PendingWinDelivery win) {
-        String sql = """
-            INSERT OR IGNORE INTO auction_won_items
+        String sql = dialect.insertIgnorePrefix() + """
+             INTO auction_won_items
             (listing_id, winner_uuid, winner_name, material_name, item_nbt, quantity, win_price, won_timestamp)
             VALUES (?, ?, ?, ?, NULL, ?, ?, ?)
         """;
         CompletableFuture.runAsync(() -> {
-            try (PreparedStatement ps = persistentConnection.prepareStatement(sql)) {
-                ps.setString(1, win.listingId().toString());
-                ps.setString(2, win.winnerUuid().toString());
-                ps.setString(3, win.winnerName());
-                ps.setString(4, win.materialName());
-                ps.setInt(5, win.quantity());
-                ps.setDouble(6, win.winPrice());
-                ps.setLong(7, System.currentTimeMillis());
-                ps.executeUpdate();
+            try {
+                withAuction(conn -> {
+                    try (PreparedStatement ps = conn.prepareStatement(sql)) {
+                        ps.setString(1, win.listingId().toString());
+                        ps.setString(2, win.winnerUuid().toString());
+                        ps.setString(3, win.winnerName());
+                        ps.setString(4, win.materialName());
+                        ps.setInt(5, win.quantity());
+                        ps.setDouble(6, win.winPrice());
+                        ps.setLong(7, System.currentTimeMillis());
+                        ps.executeUpdate();
+                    }
+                    return null;
+                });
             } catch (SQLException e) {
                 SolidusMod.LOGGER.error("Failed to persist undelivered won item for listing {}",
                     win.listingId(), e);
@@ -2209,18 +2576,28 @@ public class AuctionManager {
         final String buyerName = buyer.getName().getString();
         final long settledAt = System.currentTimeMillis();
         CompletableFuture.runAsync(() -> {
-            boolean archived = insertSoldHistory(persistentConnection, entry,
-                buyerUuid, buyerName, SETTLED_SOLD, settledAt, SolidusMod.LOGGER);
+            boolean archived;
+            try {
+                archived = withAuction(conn -> insertSoldHistory(conn, entry,
+                    buyerUuid, buyerName, SETTLED_SOLD, settledAt, SolidusMod.LOGGER, dialect));
+            } catch (SQLException e) {
+                archived = false;
+            }
             if (!archived) {
                 SolidusMod.LOGGER.error(
                     "Settled listing {} could NOT be archived - keeping SOLD row for startup recovery",
                     entry.listingId());
                 return;
             }
-            try (PreparedStatement ps = persistentConnection.prepareStatement(
-                    "DELETE FROM auction_listings WHERE listing_id = ? AND status = 1")) {
-                ps.setString(1, entry.listingId().toString());
-                ps.executeUpdate();
+            try {
+                withAuction(conn -> {
+                    try (PreparedStatement ps = conn.prepareStatement(
+                            "DELETE FROM auction_listings WHERE listing_id = ? AND status = 1")) {
+                        ps.setString(1, entry.listingId().toString());
+                        ps.executeUpdate();
+                    }
+                    return null;
+                });
             } catch (SQLException e) {
                 SolidusMod.LOGGER.error("Failed to delete archived sold listing: {}", entry.listingId(), e);
             }
@@ -2238,18 +2615,28 @@ public class AuctionManager {
      */
     private void archiveCorruptListing(AuctionEntry entry) {
         CompletableFuture.runAsync(() -> {
-            boolean archived = insertSoldHistory(persistentConnection, entry,
-                null, null, SETTLED_CORRUPT, System.currentTimeMillis(), SolidusMod.LOGGER);
+            boolean archived;
+            try {
+                archived = withAuction(conn -> insertSoldHistory(conn, entry,
+                    null, null, SETTLED_CORRUPT, System.currentTimeMillis(), SolidusMod.LOGGER, dialect));
+            } catch (SQLException e) {
+                archived = false;
+            }
             if (!archived) {
                 SolidusMod.LOGGER.error(
                     "Corrupt listing {} could NOT be archived - keeping SOLD row for startup recovery",
                     entry.listingId());
                 return;
             }
-            try (PreparedStatement ps = persistentConnection.prepareStatement(
-                    "DELETE FROM auction_listings WHERE listing_id = ? AND status = 1")) {
-                ps.setString(1, entry.listingId().toString());
-                ps.executeUpdate();
+            try {
+                withAuction(conn -> {
+                    try (PreparedStatement ps = conn.prepareStatement(
+                            "DELETE FROM auction_listings WHERE listing_id = ? AND status = 1")) {
+                        ps.setString(1, entry.listingId().toString());
+                        ps.executeUpdate();
+                    }
+                    return null;
+                });
             } catch (SQLException e) {
                 SolidusMod.LOGGER.error("Failed to delete archived corrupt listing: {}", entry.listingId(), e);
             }
@@ -2272,7 +2659,24 @@ public class AuctionManager {
      * connections; the auction executor has no competing work yet.</p>
      */
     private void recoverOrphanedSoldRowsFromEconomy() {
-        // The auction database and the economy database are separate SQLite
+        if (dialect == AuctionDialect.MYSQL) {
+            // MySQL mode: auction tables AND transaction_log share the SAME
+            // database — two pooled connections serve the two arguments.
+            try (Connection auctionConn = connectionSource.open();
+                 Connection economyConn = connectionSource.open()) {
+                int[] result = recoverOrphanedSoldRows(auctionConn, economyConn,
+                    TransactionLog.Type.AUCTION_SOLD.code(), SolidusMod.LOGGER, dialect);
+                if (result[0] > 0 || result[1] > 0) {
+                    SolidusMod.LOGGER.info("Auction startup recovery: {} orphaned SOLD row(s) archived, {} re-listed",
+                        result[0], result[1]);
+                }
+            } catch (SQLException e) {
+                SolidusMod.LOGGER.error(
+                    "Auction startup recovery failed - orphaned SOLD rows left for the next restart", e);
+            }
+            return;
+        }
+        // SQLite: the auction database and the economy database are separate
         // files, so matching against TransactionLog needs a second connection.
         String economyUrl = "jdbc:sqlite:" + com.solidus.util.ConfigManager.getConfigDir().toAbsolutePath()
             + "/" + com.solidus.economy.SQLiteStorage.DATABASE_NAME;
@@ -2305,7 +2709,16 @@ public class AuctionManager {
     static boolean insertSoldHistory(Connection conn, AuctionEntry entry,
                                      UUID buyerUuid, String buyerName,
                                      String reason, long settledTimestamp, org.slf4j.Logger log) {
-        String sql = "INSERT OR IGNORE INTO auction_sold_history " + HISTORY_INSERT_COLUMNS
+        return insertSoldHistory(conn, entry, buyerUuid, buyerName, reason,
+            settledTimestamp, log, AuctionDialect.SQLITE);
+    }
+
+    /** Dialect-aware variant (2.2.1): {@code dialect} selects INSERT OR IGNORE / INSERT IGNORE. */
+    static boolean insertSoldHistory(Connection conn, AuctionEntry entry,
+                                     UUID buyerUuid, String buyerName,
+                                     String reason, long settledTimestamp, org.slf4j.Logger log,
+                                     AuctionDialect dialect) {
+        String sql = dialect.insertIgnorePrefix() + " INTO auction_sold_history " + HISTORY_INSERT_COLUMNS
             + " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
         try (PreparedStatement ps = conn.prepareStatement(sql)) {
             ps.setString(1, entry.listingId().toString());
@@ -2347,13 +2760,26 @@ public class AuctionManager {
     static boolean archiveAndDeleteListing(Connection conn, UUID listingId, String reason,
                                            UUID buyerUuid, String buyerName,
                                            long settledTimestamp, org.slf4j.Logger log) {
+        return archiveAndDeleteListing(conn, listingId, reason, buyerUuid, buyerName,
+            settledTimestamp, log, AuctionDialect.SQLITE);
+    }
+
+    /**
+     * Dialect-aware variant (2.2.1): SQLite keeps the historical explicit
+     * {@code BEGIN IMMEDIATE}/{@code COMMIT} statements; MySQL uses the JDBC
+     * transaction API ({@code setAutoCommit(false)} / commit / rollback).
+     */
+    static boolean archiveAndDeleteListing(Connection conn, UUID listingId, String reason,
+                                           UUID buyerUuid, String buyerName,
+                                           long settledTimestamp, org.slf4j.Logger log,
+                                           AuctionDialect dialect) {
         String insertSql = "INSERT INTO auction_sold_history " + HISTORY_INSERT_COLUMNS
             + " SELECT listing_id, seller_uuid, seller_name, material_name, quantity, price,"
             + " ?, ?, listed_timestamp, ?, ?"
             + " FROM auction_listings WHERE listing_id = ? AND status = 0";
         String deleteSql = "DELETE FROM auction_listings WHERE listing_id = ? AND status = 0";
         try {
-            conn.createStatement().execute("BEGIN IMMEDIATE");
+            beginTx(conn, dialect);
             boolean claimed;
             try (PreparedStatement ins = conn.prepareStatement(insertSql)) {
                 ins.setString(1, buyerUuid != null ? buyerUuid.toString() : null);
@@ -2369,12 +2795,43 @@ public class AuctionManager {
                     del.executeUpdate();
                 }
             }
-            conn.createStatement().execute("COMMIT");
+            commitTx(conn, dialect);
             return claimed;
         } catch (SQLException e) {
-            tryRollback(conn);
+            rollbackTx(conn, dialect);
             log.error("Failed to archive-and-delete listing {}: {}", listingId, e.getMessage());
             return false;
+        }
+    }
+
+    /** Opens a write transaction on the given dialect (SQLite keeps BEGIN IMMEDIATE). */
+    private static void beginTx(Connection conn, AuctionDialect dialect) throws SQLException {
+        if (dialect == AuctionDialect.MYSQL) {
+            conn.setAutoCommit(false);
+        } else {
+            conn.createStatement().execute("BEGIN IMMEDIATE");
+        }
+    }
+
+    private static void commitTx(Connection conn, AuctionDialect dialect) throws SQLException {
+        if (dialect == AuctionDialect.MYSQL) {
+            conn.commit();
+            conn.setAutoCommit(true);
+        } else {
+            conn.createStatement().execute("COMMIT");
+        }
+    }
+
+    private static void rollbackTx(Connection conn, AuctionDialect dialect) {
+        try {
+            if (dialect == AuctionDialect.MYSQL) {
+                conn.rollback();
+                conn.setAutoCommit(true);
+            } else {
+                tryRollback(conn);
+            }
+        } catch (SQLException ignored) {
+            // connection already broken — pool/PaS will discard it
         }
     }
 
@@ -2389,13 +2846,20 @@ public class AuctionManager {
      */
     static int archiveAndDeleteCollectibles(Connection conn, UUID sellerUuid,
                                             long settledTimestamp, org.slf4j.Logger log) {
+        return archiveAndDeleteCollectibles(conn, sellerUuid, settledTimestamp, log, AuctionDialect.SQLITE);
+    }
+
+    /** Dialect-aware variant (2.2.1) — same transaction semantics as {@link #archiveAndDeleteListing}. */
+    static int archiveAndDeleteCollectibles(Connection conn, UUID sellerUuid,
+                                            long settledTimestamp, org.slf4j.Logger log,
+                                            AuctionDialect dialect) {
         String insertSql = "INSERT INTO auction_sold_history " + HISTORY_INSERT_COLUMNS
             + " SELECT listing_id, seller_uuid, seller_name, material_name, quantity, price,"
             + " NULL, NULL, listed_timestamp, ?, ?"
             + " FROM auction_listings WHERE seller_uuid = ? AND status = 2";
         String deleteSql = "DELETE FROM auction_listings WHERE seller_uuid = ? AND status = 2";
         try {
-            conn.createStatement().execute("BEGIN IMMEDIATE");
+            beginTx(conn, dialect);
             int claimed;
             try (PreparedStatement ins = conn.prepareStatement(insertSql)) {
                 ins.setLong(1, settledTimestamp);
@@ -2407,10 +2871,10 @@ public class AuctionManager {
                 del.setString(1, sellerUuid.toString());
                 claimed = del.executeUpdate();
             }
-            conn.createStatement().execute("COMMIT");
+            commitTx(conn, dialect);
             return claimed;
         } catch (SQLException e) {
-            tryRollback(conn);
+            rollbackTx(conn, dialect);
             log.error("Failed to archive-and-delete collectibles for seller {}: {}",
                 sellerUuid, e.getMessage());
             return -1;
@@ -2430,10 +2894,19 @@ public class AuctionManager {
      */
     static int[] recoverOrphanedSoldRows(Connection auctionConn, Connection economyConn,
                                          String soldTypeCode, org.slf4j.Logger log) {
+        return recoverOrphanedSoldRows(auctionConn, economyConn, soldTypeCode, log, AuctionDialect.SQLITE);
+    }
+
+    /** Dialect-aware variant (2.2.1) — table probe + rowid/id handling per dialect. */
+    static int[] recoverOrphanedSoldRows(Connection auctionConn, Connection economyConn,
+                                         String soldTypeCode, org.slf4j.Logger log,
+                                         AuctionDialect dialect) {
         // The economy side may not exist yet (fresh install) - nothing to match
+        String probeSql = dialect == AuctionDialect.MYSQL
+            ? "SELECT 1 FROM information_schema.tables WHERE table_schema = DATABASE() AND table_name = 'transaction_log'"
+            : "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'transaction_log'";
         try (Statement st = economyConn.createStatement();
-             ResultSet rs = st.executeQuery(
-                 "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'transaction_log'")) {
+             ResultSet rs = st.executeQuery(probeSql)) {
             if (!rs.next()) {
                 log.warn("Startup sweep skipped: economy database has no transaction_log table yet");
                 return new int[]{0, 0};
@@ -2468,6 +2941,8 @@ public class AuctionManager {
         Set<Long> consumedLogRows = new HashSet<>();
         int archived = 0;
         int relisted = 0;
+        // SQLite exposes the implicit rowid; MySQL needs the explicit id column.
+        String rowCol = dialect == AuctionDialect.MYSQL ? "id" : "rowid";
         for (AuctionEntry entry : orphans) {
             Long matchedRowid = null;
             UUID buyerUuid = null;
@@ -2476,7 +2951,7 @@ public class AuctionManager {
 
             StringBuilder notIn = new StringBuilder();
             if (!consumedLogRows.isEmpty()) {
-                notIn.append(" AND rowid NOT IN (");
+                notIn.append(" AND " + rowCol + " NOT IN (");
                 boolean first = true;
                 for (Long ignored : consumedLogRows) {
                     if (!first) notIn.append(",");
@@ -2485,7 +2960,7 @@ public class AuctionManager {
                 }
                 notIn.append(")");
             }
-            String matchSql = "SELECT rowid, target_uuid, target_name, timestamp FROM transaction_log"
+            String matchSql = "SELECT " + rowCol + ", target_uuid, target_name, timestamp FROM transaction_log"
                 + " WHERE type = ? AND player_uuid = ? AND amount = ? AND item_material = ?"
                 + " AND item_quantity = ? AND timestamp >= ?" + notIn
                 + " ORDER BY timestamp ASC LIMIT 1";
@@ -2502,7 +2977,7 @@ public class AuctionManager {
                 }
                 try (ResultSet rs = ps.executeQuery()) {
                     if (rs.next()) {
-                        matchedRowid = rs.getLong("rowid");
+                        matchedRowid = rs.getLong(rowCol);
                         String targetUuid = rs.getString("target_uuid");
                         buyerUuid = targetUuid != null ? UUID.fromString(targetUuid) : null;
                         buyerName = rs.getString("target_name");

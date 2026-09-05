@@ -1,6 +1,6 @@
 # Solidus Economy — Server-Side Minecraft Fabric Mod
 
-[![Solidus Family](https://img.shields.io/badge/Solidus_Family-2.2.0-8B5CF6.svg)](VERSIONING.md)
+[![Solidus Family](https://img.shields.io/badge/Solidus_Family-2.2.1-8B5CF6.svg)](VERSIONING.md)
 [![Platform](https://img.shields.io/badge/Platform-Fabric-blue.svg)](https://fabricmc.net/)
 [![Minecraft](https://img.shields.io/badge/Minecraft-26.1.x-green.svg)](https://www.minecraft.net/)
 [![Java](https://img.shields.io/badge/Java-25-orange.svg)](https://adoptium.net/)
@@ -234,6 +234,7 @@ All modules auto-detect Solidus Core via reflection and activate automatically. 
 | `/transactions [page]` | Transaction history (10 per page) |
 | `/transactions export [days]` | Export your own history to CSV (default 7 days) |
 | `/transactions exportall [days]` | Export the full ledger to CSV (OP 2+) |
+| `/solidus-admin storage migrate [flags]` | Copy the SQLite data set into the configured MySQL target, verify, write a report (OP 4; flags: `--force`, `--batch N`) |
 
 ---
 

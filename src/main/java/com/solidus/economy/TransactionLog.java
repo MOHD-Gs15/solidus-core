@@ -222,6 +222,14 @@ public class TransactionLog {
     private final ExecutorService asyncExecutor;
 
     /**
+     * Optional network broadcaster (2.2.1, Redis layer): fired AFTER a pending
+     * notification row is durably stored, so the server hosting the player
+     * can deliver instantly instead of waiting for a relogin. The database row
+     * stays the durable copy — subscribers delete it only on real delivery.
+     */
+    private volatile java.util.function.BiConsumer<UUID, String> notificationBroadcaster;
+
+    /**
      * SQLite flavor: one persistent connection shared with the storage
      * backend, serialized by the storage executor, never closed here.
      */
@@ -690,8 +698,55 @@ public class TransactionLog {
                     }
                     return null;
                 });
+                // Row is durable — announce it to the network (no-op without Redis).
+                java.util.function.BiConsumer<UUID, String> broadcaster = notificationBroadcaster;
+                if (broadcaster != null) {
+                    broadcaster.accept(playerUuid, message);
+                }
             } catch (SQLException e) {
                 LOGGER.error("Failed to queue notification for player: {}", playerUuid, e);
+            }
+        }, asyncExecutor);
+    }
+
+    /**
+     * Registers the optional network broadcaster (2.2.1). Called by SolidusMod
+     * with {@code redisLayer::publishPlayerEvent} when Redis is enabled.
+     */
+    public void setNotificationBroadcaster(java.util.function.BiConsumer<UUID, String> broadcaster) {
+        this.notificationBroadcaster = broadcaster;
+    }
+
+    /**
+     * Deletes the durable copy of ONE already-delivered network notification
+     * (exact player + message match). Used by the Redis events path after an
+     * instant delivery — so the JOIN-delivery sweep cannot repeat it.
+     */
+    public void deletePendingNotificationsByMessage(UUID playerUuid, String message) {
+        if (playerUuid == null || message == null) return;
+        CompletableFuture.runAsync(() -> {
+            String selectSql = "SELECT id FROM pending_notifications WHERE player_uuid = ? AND message = ?";
+            try {
+                Long[] ids = withConnection(conn -> {
+                    List<Long> list = new ArrayList<>();
+                    try (PreparedStatement ps = conn.prepareStatement(selectSql)) {
+                        ps.setString(1, playerUuid.toString());
+                        ps.setString(2, message);
+                        try (ResultSet rs = ps.executeQuery()) {
+                            while (rs.next()) {
+                                list.add(rs.getLong("id"));
+                            }
+                        }
+                    }
+                    return list.toArray(Long[]::new);
+                });
+                if (ids.length > 0) {
+                    long[] primitives = new long[ids.length];
+                    for (int i = 0; i < ids.length; i++) primitives[i] = ids[i];
+                    deletePendingNotificationsByIds(playerUuid, primitives);
+                }
+            } catch (SQLException e) {
+                LOGGER.error("Failed to delete delivered network notification for {}: {}", playerUuid, e.getMessage());
             }
         }, asyncExecutor);
     }

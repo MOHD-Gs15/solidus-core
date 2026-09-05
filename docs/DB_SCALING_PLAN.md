@@ -358,8 +358,8 @@ Additional network flows:
 
 Phases 1 and 2 SHIPPED: Phase 1 as 2.1.5 (pure abstraction refactor, current
 family) and Phase 2 as 2.2.0 (MySqlStorage — the owner-reserved 2.2.x family).
-Phases 3/4 (Redis + network features) target 2.2.1 — a MySQL-only network is
-already fully functional without Redis.
+Phase 3 (Redis + the §11 remainder) SHIPPED as 2.2.1 — a MySQL-only network
+was already fully functional without Redis; the Redis layer stays optional.
 
 ## 11. Shipped vs Remaining (post-2.2.0 scope ledger)
 
@@ -390,18 +390,52 @@ already fully functional without Redis.
   concurrent transfers → money-supply conservation to the cent) + MySQL
   contract binding — both CI-activated via `SOLIDUS_TEST_MYSQL_HOST`.
 
-**Remaining for 2.2.1 (NOT in 2.2.0 — do not assume otherwise):**
+**Shipped in 2.2.1 (the §11 remainder — shared auctions, optional Redis, cutover):**
 
-1. **Auction store on MySQL (`AuctionStore` port)** — in 2.2.0 the auction
-   house remains per-server SQLite (its money legs already flow through the
-   shared economy DB). Tables are provisioned in `001_init.sql`.
-2. **Redis layer** (§6): L1/L2 cache + pub/sub invalidation + network-aware
-   notification delivery.
-3. **`/solidus-admin storage migrate` cutover command** (§8.2) — until it
-   ships, SQLite→MySQL data migration is manual SQL (export `player_balances`
-   + `transaction_log` and import; the schema file matches 1:1).
-4. **`operations` idempotency wiring** — the table is created in 2.2.0, the
-   primitives are not routed through it yet (command-driven primitives have
-   no network retries to dedupe until Redis/2.2.1).
-5. `SKIP LOCKED` expiry sweeps + outbox (§5.5-adopted additions from the
-   reviewed hybrid plan).
+1. **Auction store on the shared database (AuctionStore port)** — DONE.
+   `AuctionManager` is dialect-aware exactly like `TransactionLog`
+   (`AuctionDialect` SQLITE | MYSQL + a `withAuction` connection wrapper over
+   ~30 call sites). MYSQL mode lives on the SAME database as the economy
+   (one network-wide market); SQLite mode keeps the per-server `auctions.db`.
+   Cross-server safety is preserved by the existing exactly-once conditional
+   claims, plus `FOR UPDATE SKIP LOCKED` on the expiry sweep's SELECT
+   (short transaction; falls back permanently to a plain sweep on servers
+   older than MariaDB 10.6 / MySQL 8). Transaction helpers use the JDBC API
+   (`setAutoCommit(false)`) on MySQL and keep `BEGIN IMMEDIATE` on SQLite.
+2. **Redis layer** — DONE, OPTIONAL (`redis.enabled=false` default).
+   `RedisLayer` (Lettuce 6.5.5): L2 balance cache (TTL-bounded, default 30 s)
+   + pub/sub invalidation bus (`solidus:bal:inv`) + network-aware
+   notification delivery (`solidus:events` — the server hosting the player
+   delivers instantly and deletes the durable row). Circuit breaker: an
+   outage degrades to database-only reads; MySQL stays the ONLY source of
+   truth (writes never publish balances as truth — they DEL the key).
+   NOTE: `pending_notifications` doubles as the durable event store; the
+   full DB outbox pattern remains deferred as measured need (as per the
+   review §4).
+3. **`/solidus-admin storage migrate`** — DONE (OP 4,
+   `solidus.command.admin`). `StorageMigrator` copies balances + ledger +
+   notifications + all five auction tables with keyset pagination, idempotent
+   writes (money/state tables ON DUPLICATE KEY UPDATE — latest wins;
+   append-only tables INSERT IGNORE with explicit ids), verifies per-table
+   counts + `SUM(balance)` to the cent, refuses players-online without
+   `--force`, and writes a report file under `config/solidus/`. Cutover
+   remains the documented config flip + restart.
+4. **`operations` idempotency wiring** — DONE as an API primitive:
+   `StorageBackend.transferAtomicWithLedger(opId, opType, …)` (default
+   delegates = no behavior change) with a real MySqlStorage routing through
+   the `operations` table using the corrected ON CONFLICT pattern (claim via
+   upsert, affected-rows disambiguation, recorded-outcome replay).
+   No production caller passes opIds yet — the primitive exists for
+   cross-server bridges; tested by `MySqlOperationsIdempotencyTest`.
+5. **SKIP LOCKED expiry sweeps** — DONE (see item 1). The DB outbox stays
+   deferred (see item 2 note).
+
+**Bug fixes discovered during the port (all shipped in 2.2.1):**
+
+- `markExpiredRowCollectible` never bound its `?` parameter (SQLite treated
+  it as NULL → the offline-seller collectible flip was dead code).
+- `checkEscrowConsistency` read `player_balances` through the AUCTION
+  connection (a different SQLite file) — the check silently failed on every
+  startup; the escrow balance now comes from the storage API (async).
+- `extensions_used` was never incremented — the anti-snipe cap (12) never
+  took effect; every extension now advances the counter.

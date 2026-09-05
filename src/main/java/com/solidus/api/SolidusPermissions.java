@@ -89,6 +89,9 @@ public final class SolidusPermissions {
     /** Export the full transaction ledger as CSV - /transactions exportall (OP 2+) */
     public static final String TRANSACTIONS_EXPORT_ALL = "solidus.command.transactions.exportall";
 
+    /** Storage administration - /solidus-admin storage migrate (OP 4, server owner) */
+    public static final String ADMIN = "solidus.command.admin";
+
     // ===========================================================
     //  ANALYTICS - Data Analytics Commands
     // ===========================================================
@@ -231,6 +234,7 @@ public final class SolidusPermissions {
             // Admin-only sub-commands need a higher OP level
             if (permission.equals(SHOP_RELOAD)) return 2;
             if (permission.equals(TRANSACTIONS_EXPORT_ALL)) return 2;
+            if (permission.equals(ADMIN)) return 4;
             return 0;
         }
 

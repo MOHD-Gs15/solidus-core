@@ -9,8 +9,11 @@ import com.solidus.commands.SellCommand;
 import com.solidus.commands.ShopCommand;
 import com.solidus.commands.AuctionCommand;
 import com.solidus.commands.TransactionsCommand;
+import com.solidus.commands.SolidusAdminCommand;
 import com.solidus.economy.BalanceManager;
 import com.solidus.economy.EconomyEngine;
+import com.solidus.economy.MySqlStorage;
+import com.solidus.economy.RedisLayer;
 import com.solidus.economy.TransactionLog;
 import com.solidus.chat.ChatPrompts;
 import com.solidus.shop.ShopManager;
@@ -55,6 +58,10 @@ public class SolidusMod implements DedicatedServerModInitializer {
     private static RateLimiter rateLimiter;
     private static ChatPrompts chatPrompts;
     private static TradeManager tradeManager;
+    /** Optional Redis coordination layer (2.2.1) — null unless enabled in storage.json. */
+    private static volatile RedisLayer redisLayer;
+    /** Injected via SERVER_STARTED — MinecraftServer.getServer() is unavailable in Fabric. */
+    private static volatile MinecraftServer activeServer;
 
     /** Tick counter for periodic tasks (auction expiration check every 5 minutes) */
     private static long tickCounter = 0;
@@ -89,7 +96,17 @@ public class SolidusMod implements DedicatedServerModInitializer {
         shopManager = new ShopManager(economyEngine);
         shopManager.loadConfiguration();
 
-        auctionManager = new AuctionManager(economyEngine);
+        // ── Optional Redis layer (2.2.1) — MUST be attached BEFORE the auction
+        // manager below so its first reads can use the L2 cache.
+        startRedisLayer(economyEngine);
+
+        // Auction house: on MySQL the store lives on the SHARED database (one
+        // network-wide market); on SQLite it keeps the per-server file.
+        if (economyEngine.isMysqlMode()) {
+            auctionManager = new AuctionManager(economyEngine, economyEngine.auctionConnectionSource());
+        } else {
+            auctionManager = new AuctionManager(economyEngine);
+        }
         auctionManager.initialize();
 
         // Chat prompt service (bid amounts, trade money input) - must exist
@@ -113,6 +130,7 @@ public class SolidusMod implements DedicatedServerModInitializer {
             AuctionCommand.register(dispatcher, auctionManager);
             TradeCommand.register(dispatcher, tradeManager);
             TransactionsCommand.register(dispatcher, economyEngine);
+            SolidusAdminCommand.register(dispatcher, economyEngine);
         });
 
         // Register server shutdown hook for clean database closure
@@ -121,6 +139,7 @@ public class SolidusMod implements DedicatedServerModInitializer {
             tradeManager.shutdown();
             auctionManager.shutdown();
             economyEngine.shutdown();
+            closeRedisLayer();
             rateLimiter.clear();
             LOGGER.info("Solidus shutdown complete. All data saved.");
         });
@@ -130,9 +149,12 @@ public class SolidusMod implements DedicatedServerModInitializer {
         ServerLifecycleEvents.SERVER_STARTED.register(server -> {
             auctionManager.setServer(server);
             tradeManager.setServer(server);
+            activeServer = server;
 
             LOGGER.info("Solidus: MinecraftServer instance injected into AuctionManager + TradeManager.");
         });
+
+        ServerLifecycleEvents.SERVER_STOPPING.register(server -> activeServer = null);
 
         // Register periodic tick handler for auction expiration checks
         ServerTickEvents.END_SERVER_TICK.register(server -> {
@@ -166,6 +188,74 @@ public class SolidusMod implements DedicatedServerModInitializer {
 
     public static EconomyEngine getEconomyEngine() {
         return economyEngine;
+    }
+
+    public static RedisLayer getRedisLayer() {
+        return redisLayer;
+    }
+
+    /**
+     * Starts the optional Redis layer (2.2.1) when storage.json enables it and
+     * wires: L2 invalidation callbacks into the MySQL storage, instant network
+     * notification delivery on the events channel, and the notification
+     * broadcaster. A startup failure here degrades to MySQL-only mode (never
+     * blocks the server).
+     */
+    private static void startRedisLayer(EconomyEngine engine) {
+        try {
+            RedisLayer layer = RedisLayer.start(engine.redisSettings());
+            if (layer == null) {
+                LOGGER.info("Solidus Redis layer disabled (storage.json redis.enabled=false) — database-only mode.");
+                return;
+            }
+            redisLayer = layer;
+
+            if (engine.getStorage() instanceof MySqlStorage mysql) {
+                mysql.setRedisLayer(layer);
+                // Other servers' mutations invalidate our local L1/L2 copies.
+                layer.onBalanceInvalidation(mysql::dropLocalBalanceCache);
+            } else {
+                LOGGER.info("Solidus Redis layer active with SQLite storage: only the events bus is used.");
+            }
+
+            // Network-aware notification delivery: when a queued notification
+            // for an OFFLINE player arrives and that player is hosted HERE,
+            // deliver instantly and delete the durable row (no relogin wait).
+            TransactionLog log = engine.getTransactionLog();
+            if (log != null) {
+                log.setNotificationBroadcaster(layer::publishPlayerEvent);
+            }
+            layer.onPlayerEvent((playerUuid, message) -> {
+                MinecraftServer currentServer = activeServer;
+                if (currentServer == null) return;
+                var online = currentServer.getPlayerList().getPlayer(playerUuid);
+                if (online == null) return; // not hosted here — durable row stays
+                TransactionLog txLog = engine.getTransactionLog();
+                if (txLog == null) return;
+                currentServer.execute(() -> {
+                    var stillOnline = currentServer.getPlayerList().getPlayer(playerUuid);
+                    if (stillOnline == null) return;
+                    stillOnline.sendSystemMessage(com.solidus.util.TextUtil.styled(
+                        "[Solidus] " + message, net.minecraft.ChatFormatting.AQUA));
+                    txLog.deletePendingNotificationsByMessage(playerUuid, message);
+                });
+            });
+        } catch (RuntimeException e) {
+            LOGGER.error("Solidus Redis layer failed to start — continuing in database-only mode.", e);
+            redisLayer = null;
+        }
+    }
+
+    private static void closeRedisLayer() {
+        RedisLayer layer = redisLayer;
+        redisLayer = null;
+        if (layer != null) {
+            try {
+                layer.close();
+            } catch (Exception e) {
+                LOGGER.warn("Redis layer close error (ignored): {}", e.getMessage());
+            }
+        }
     }
 
     public static ShopManager getShopManager() {

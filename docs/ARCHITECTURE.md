@@ -303,7 +303,7 @@ com.solidus
 │   ├── PermissionChecker.java    // Unified checking (LuckPerms + OP fallback)
 │   └── PermissionConfig.java     // OP-level config loader
 ├── auction/                      // Auction House subsystem
-│   ├── AuctionManager.java       // Core controller (2570 lines incl. bidding)
+│   ├── AuctionManager.java       // Core controller (dialect-aware store: SQLITE | MYSQL, 2.2.1+)
 │   ├── AuctionEntry.java         // Immutable listing record
 │   ├── ListingStatus.java        // ACTIVE/SOLD/EXPIRED enum
 │   ├── BidRules.java             // Pure bid validation + anti-snipe arithmetic
@@ -321,16 +321,19 @@ com.solidus
 │   ├── SellCommand.java          // /sell gui, /sell all [item] (+shulkers)
 │   ├── AuctionCommand.java       // /ah sell/bid/collect/cancel/sort/search
 │   ├── TradeCommand.java         // /trade <player>|accept|deny|cancel (2.1.4+)
-│   └── TransactionsCommand.java  // /transactions [page] [export [days] | exportall [days]]
+│   ├── TransactionsCommand.java  // /transactions [page] [export [days] | exportall [days]]
+│   └── SolidusAdminCommand.java  // /solidus-admin storage migrate (2.2.1+, OP 4)
 ├── economy/                      // Core economy engine
 │   ├── EconomyEngine.java        // Central coordinator (selects the storage backend)
 │   ├── StorageBackend.java       // Storage contract IF (2.1.5+, DB scaling Phase 1)
-│   ├── StorageConfig.java        // storage.json parser (sqlite|mysql + pool + env password)
+│   ├── StorageConfig.java        // storage.json parser (sqlite|mysql + pool + env password + redis block 2.2.1+)
 │   ├── SQLiteStorage.java        // Default single-file backend (941 lines)
 │   ├── MySqlStorage.java         // Shared MySQL/MariaDB backend (2.2.0+, multi-server)
 │   ├── Money.java                // Exact 2-decimal boundary wrapper (BigDecimal, 2.2.0+)
 │   ├── BalanceManager.java       // High-level balance API
 │   ├── TransactionLog.java       // Audit trail + notifications + CSV export (dialect-aware 2.2.0+)
+│   ├── RedisLayer.java           // OPTIONAL Redis L2 cache + pub/sub (Lettuce, 2.2.1+)
+│   ├── StorageMigrator.java      // SQLite → MySQL cutover copy + verify (2.2.1+)
 │   └── EscrowAccount.java        // Bid-escrow system account (2.1.4+)
 ├── gui/                          // Shared GUI primitives
 │   └── DisplaySlot.java          // Display-only Slot (no place/pickup/set)
@@ -418,7 +421,7 @@ public class EconomyEngine {
 
 **Key Design Decision**: `EconomyEngine` does not perform any business logic itself. It is purely a lifecycle manager and dependency injector. All actual operations flow through `BalanceManager` and the `StorageBackend` interface.
 
-#### Storage backends (DB scaling plan — Phase 1/2)
+#### Storage backends (DB scaling plan — Phase 1/2/3)
 
 Since 2.1.5 all storage consumers depend on the `StorageBackend` interface, not a concrete class. Two backends ship:
 
@@ -430,11 +433,29 @@ Since 2.1.5 all storage consumers depend on the `StorageBackend` interface, not 
 `MySqlStorage` properties (2.2.0):
 
 - HikariCP pool (`storage.json` pool size/timeouts; password via `SOLIDUS_DB_PASSWORD` env override; the connection string is never logged).
-- **Database-first reads**: every balance read hits the shared DB, so values written by another server are immediately visible; the in-memory balance cache is a degraded-read FALLBACK only (never zero, never authoritative). Redis L1/L2 arrives in 2.2.1.
+- **Database-first reads**: every balance read hits the shared DB (or the optional Redis L2 — see below), so values written by another server are immediately visible; the in-memory balance cache is a degraded-read FALLBACK only (never zero, never authoritative).
 - **Exact money**: all JDBC money binds/reads go through `Money` (`DECIMAL(18,2)`) — no float drift on cross-server sums (baltop, Gini, money supply).
 - **Failure model**: unreachable database at startup = fail closed with a clear error; runtime read failure degrades to cache values; write/transfer failure rolls back completely (`PERSIST_ERROR`) — nothing ever moves half-way.
-- Schema is auto-created (`CREATE TABLE IF NOT EXISTS`), mirrored in `docs/sql/mysql/001_init.sql` (which also provisions the auction tables for the 2.2.1 `AuctionStore` port). Minimum versions: MariaDB 10.6+ / MySQL 8.0+.
-- Acceptance: the `StorageBackendContractTest` harness (11 interface contract cases) runs against BOTH backends — the MySQL binding self-activates in CI when `SOLIDUS_TEST_MYSQL_HOST` is set; `MySqlTransferRaceTest` races two backends over one shared DB and asserts money-supply conservation to the cent.
+- Schema is auto-created (`CREATE TABLE IF NOT EXISTS`), mirrored in `docs/sql/mysql/001_init.sql` (the auction tables are LIVE on this database since 2.2.1). Minimum versions: MariaDB 10.6+ / MySQL 8.0+.
+- **Idempotent transfers (2.2.1)**: `transferAtomicWithLedger(opId, opType, …)` routes the op id through the shared `operations` table (claim via upsert → execute → record the outcome; a replay returns the recorded result instead of moving money twice). The plain methods keep their exact 2.2.0 semantics.
+- Acceptance: the `StorageBackendContractTest` harness (11 interface contract cases) runs against BOTH backends — the MySQL binding self-activates in CI when `SOLIDUS_TEST_MYSQL_HOST` is set; `MySqlTransferRaceTest` races two backends over one shared DB and asserts money-supply conservation to the cent; `MySqlOperationsIdempotencyTest` proves the op-id replay guarantee; `MySqlAuctionDialectTest` + `StorageMigratorTest` cover the 2.2.1 dialect seams.
+
+#### Optional Redis layer (2.2.1, DB scaling plan Phase 3)
+
+`RedisLayer` (Lettuce) activates ONLY with `"redis": { "enabled": true }` in `storage.json`. Role boundaries:
+
+- **L2 balance cache** (read path): keys `solidus:bal:<uuid>` with a short TTL (default 30 s). A cache hit skips one database round trip; a miss falls through to MySQL and populates. Staleness is bounded by the TTL + instant invalidation — **money mutations never trust cached values** (they re-validate atomically inside their own SQL transaction).
+- **Invalidation bus** (`solidus:bal:inv`): after every committed mutation the writer DELetes its L2 keys and broadcasts — every server drops its local copy. Redis pub/sub is fire-and-forget: the TTL is the correctness backstop for lost messages.
+- **Events bus** (`solidus:events`): queued offline-tolerant notifications are broadcast after their durable row is written; the server that actually hosts the player delivers instantly and deletes the row (the JOIN-delivery sweep cannot repeat it). This removes the "queue and hope they join here" limitation on networks.
+- **Failure model**: circuit breaker (3 consecutive failures → 30 s cooldown) — a Redis outage degrades the server to plain database reads. MySQL stays the ONLY source of truth; Redis is never written a balance as truth.
+
+#### Auction store on the shared database (2.2.1)
+
+`AuctionManager` is dialect-aware exactly like `TransactionLog` (`AuctionDialect` SQLITE | MYSQL + a `withAuction` connection wrapper). SQLite keeps the per-server `auctions.db`; MYSQL mode lives on the SAME database as the economy — one network-wide market. Cross-server safety comes from the existing exactly-once conditional claims (`AND status = 0` guards), plus `FOR UPDATE SKIP LOCKED` on the expiry sweep's SELECT (short transaction, permanent fallback on older servers). Startup sweeps (`recoverOrphanedSoldRows`, `refundOrphanedBidStates`) work on both dialects (information_schema + `id` replace sqlite_master + `rowid` on MySQL).
+
+#### Storage migration (2.2.1)
+
+`/solidus-admin storage migrate [--force] [--batch N]` (OP 4): copies balances, ledger, notifications and all five auction tables from the local SQLite file into the configured MySQL target with keyset pagination and idempotent writes (money/state tables ON DUPLICATE KEY UPDATE — latest wins; append-only tables INSERT IGNORE with explicit ids), verifies per-table counts + `SUM(balance)` to the cent, refuses players-online without `--force`, and writes a report file. Cutover = flip `storage.json` to `"type": "mysql"` + restart; SQLite files stay as the read-only rollback copy.
 
 ---
 

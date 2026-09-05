@@ -9,5 +9,12 @@
     "password": "CHANGE_ME",
     "pool": { "maxSize": 10, "connectionTimeoutMs": 5000 },
     "useSsl": false
+  },
+  "redis": {
+    "enabled": false,
+    "_redis_comment": "OPTIONAL coordination layer (2.2.1): L2 balance cache + pub/sub invalidation + instant network-wide notifications. Never the source of truth - the shared database stays authoritative, and a Redis outage degrades to plain database reads. The redis password may be overridden with the SOLIDUS_REDIS_PASSWORD environment variable (passwordEnv names that variable).",
+    "uri": "redis://127.0.0.1:6379/0",
+    "passwordEnv": "SOLIDUS_REDIS_PASSWORD",
+    "balanceTtlSeconds": 30
   }
 }

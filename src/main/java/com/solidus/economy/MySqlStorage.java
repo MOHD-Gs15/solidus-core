@@ -4,6 +4,9 @@ import com.solidus.util.CurrencyUtil;
 import com.zaxxer.hikari.HikariConfig;
 import com.zaxxer.hikari.HikariDataSource;
 
+import com.google.gson.Gson;
+import com.google.gson.JsonObject;
+
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -106,6 +109,9 @@ public class MySqlStorage implements StorageBackend {
     private final ExecutorService asyncExecutor;
     private final ConcurrentHashMap<UUID, Double> balanceFallbackCache = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<UUID, String> playerNameCache = new ConcurrentHashMap<>();
+
+    /** Optional Redis L2/invalidation layer (2.2.1) — null unless enabled in storage.json. */
+    private volatile RedisLayer redis;
 
     private volatile HikariDataSource dataSource;
     private volatile boolean initialized = false;
@@ -216,6 +222,17 @@ public class MySqlStorage implements StorageBackend {
     public CompletableFuture<Double> getBalance(UUID uuid, String playerName) {
         ensureInitialized();
         scheduleNameRefresh(uuid, playerName);
+        // L2 read path (2.2.1, optional): a cached balance skips the database
+        // round trip. Staleness is bounded by the TTL plus instant invalidation
+        // on writes; money MUTATIONS never trust this value — they re-validate
+        // atomically inside their own SQL transaction.
+        RedisLayer layer = redis;
+        if (layer != null) {
+            Double cached = layer.getCachedBalance(uuid);
+            if (cached != null) {
+                return CompletableFuture.completedFuture(cached);
+            }
+        }
         return CompletableFuture.supplyAsync(() -> {
             try (Connection conn = dataSource.getConnection()) {
                 Double balance = selectBalance(conn, uuid);
@@ -228,6 +245,9 @@ public class MySqlStorage implements StorageBackend {
                     }
                 }
                 balanceFallbackCache.put(uuid, balance);
+                if (layer != null) {
+                    layer.cacheBalance(uuid, balance);
+                }
                 return balance;
             } catch (SQLException e) {
                 LOGGER.error("Balance read failed for {} — serving degraded cache value", uuid, e);
@@ -371,6 +391,7 @@ public class MySqlStorage implements StorageBackend {
                 if (playerName != null && !playerName.isEmpty()) {
                     playerNameCache.put(uuid, playerName);
                 }
+                invalidateBalancesRedis(uuid);
                 return true;
             } catch (SQLException e) {
                 LOGGER.error("Failed to persist balance for UUID: {}", uuid, e);
@@ -423,6 +444,7 @@ public class MySqlStorage implements StorageBackend {
                 }
                 conn.commit();
                 balanceFallbackCache.put(uuid, newMoney.toDouble());
+                invalidateBalancesRedis(uuid);
                 return newMoney.toDouble();
             } catch (SQLException e) {
                 rollbackQuietly(conn);
@@ -541,9 +563,11 @@ public class MySqlStorage implements StorageBackend {
 
                     conn.commit();
 
-                    // Committed: refresh local fallback caches.
+                    // Committed: refresh local fallback caches + broadcast the
+                    // invalidation so every server drops its Redis/L1 copy.
                     balanceFallbackCache.put(senderUuid, senderNew.toDouble());
                     balanceFallbackCache.put(receiverUuid, receiverNew.toDouble());
+                    invalidateBalancesRedis(senderUuid, receiverUuid);
                     if (senderName != null && !senderName.isEmpty()) {
                         playerNameCache.put(senderUuid, senderName);
                     }
@@ -575,6 +599,133 @@ public class MySqlStorage implements StorageBackend {
             }
         }
         return new SQLiteStorage.TransferOutcome(SQLiteStorage.TransferStatus.PERSIST_ERROR, 0, 0);
+    }
+
+    // -- Idempotent transfers (operations table, DB scaling plan §5.1) ------
+
+    /**
+     * Idempotent transfer (2.2.1): the {@code operations} table routes the
+     * primitive. A caller that retries the same {@code opId} — after a
+     * timeout, a reconnect, or a cross-server re-dispatch — gets the recorded
+     * result back instead of moving money twice.
+     *
+     * <p>Pattern (the corrected form from the hybrid-plan review §3):</p>
+     * <ol>
+     *   <li>Claim: {@code INSERT ... ON DUPLICATE KEY UPDATE op_type = VALUES(op_type)}
+     *       — a replay must NOT throw (a bare INSERT would abort on the
+     *       unique key exactly when idempotency matters most).</li>
+     *   <li>The affected-rows value disambiguates: 1 = we own the id;
+     *       2 = someone else claimed it first.</li>
+     *   <li>Owners execute the transfer and record the outcome on the row;
+     *       non-owners either replay a recorded outcome or refuse while the
+     *       operation is still in flight.</li>
+     * </ol>
+     */
+    @Override
+    public CompletableFuture<SQLiteStorage.TransferOutcome> transferAtomicWithLedger(
+            UUID opId, String opType,
+            UUID senderUuid, String senderName,
+            UUID receiverUuid, String receiverName,
+            double amount,
+            List<SQLiteStorage.AtomicLedgerRow> ledgerRows) {
+        ensureInitialized();
+        if (opId == null) {
+            // Null opId = "not retried-safe" — plain transfer semantics.
+            return transferAtomicWithLedger(senderUuid, senderName,
+                receiverUuid, receiverName, amount, ledgerRows);
+        }
+        final double roundedAmount = CurrencyUtil.round(amount);
+        final List<SQLiteStorage.AtomicLedgerRow> rows =
+            ledgerRows != null ? ledgerRows : List.of();
+
+        return CompletableFuture.supplyAsync(() -> {
+            // Step 1: claim (or detect the existing claim on) the op id.
+            int affected;
+            try (Connection conn = dataSource.getConnection();
+                 PreparedStatement ps = conn.prepareStatement(
+                     "INSERT INTO operations (op_id, account_uuid, op_type, request_hash, result_state, created_at) "
+                         + "VALUES (?, ?, ?, NULL, NULL, ?) "
+                         + "ON DUPLICATE KEY UPDATE op_type = VALUES(op_type)")) {
+                ps.setString(1, opId.toString());
+                ps.setString(2, senderUuid.toString());
+                ps.setString(3, opType == null || opType.isBlank() ? "TRANSFER" : opType);
+                ps.setLong(4, System.currentTimeMillis());
+                affected = ps.executeUpdate();
+            } catch (SQLException e) {
+                LOGGER.error("Idempotent transfer: claim failed for op {} — nothing moved", opId, e);
+                return new SQLiteStorage.TransferOutcome(SQLiteStorage.TransferStatus.PERSIST_ERROR, 0, 0);
+            }
+
+            if (affected >= 2) {
+                // Another execution already holds this op id.
+                String recorded = readOperationResult(opId);
+                if (recorded != null) {
+                    SQLiteStorage.TransferOutcome replayed = decodeOutcome(recorded);
+                    if (replayed != null) {
+                        LOGGER.info("Idempotent transfer {}: replaying recorded result {} — no money moved twice.",
+                            opId, replayed.status());
+                        return replayed;
+                    }
+                }
+                LOGGER.warn("Idempotent transfer {}: operation still in flight elsewhere — refusing (nothing moved).", opId);
+                return new SQLiteStorage.TransferOutcome(SQLiteStorage.TransferStatus.PERSIST_ERROR, 0, 0);
+            }
+
+            // Step 2: we own the id — execute and record.
+            SQLiteStorage.TransferOutcome outcome = executeAtomicTransfer(
+                senderUuid, senderName, receiverUuid, receiverName, roundedAmount, rows);
+            String encoded = encodeOutcome(outcome);
+            try (Connection conn = dataSource.getConnection();
+                 PreparedStatement ps = conn.prepareStatement(
+                     "UPDATE operations SET result_state = ? WHERE op_id = ?")) {
+                ps.setString(1, encoded);
+                ps.setString(2, opId.toString());
+                ps.executeUpdate();
+            } catch (SQLException e) {
+                // The transfer committed; only the record write failed. Log loudly —
+                // a replay of this opId would re-execute (conservation is still
+                // protected by the atomic transfer itself).
+                LOGGER.error("Idempotent transfer {}: committed but result_state NOT recorded — "
+                    + "a replay of this op id would execute again!", opId, e);
+            }
+            return outcome;
+        }, asyncExecutor);
+    }
+
+    private String readOperationResult(UUID opId) {
+        try (Connection conn = dataSource.getConnection();
+             PreparedStatement ps = conn.prepareStatement(
+                 "SELECT result_state FROM operations WHERE op_id = ?")) {
+            ps.setString(1, opId.toString());
+            try (ResultSet rs = ps.executeQuery()) {
+                return rs.next() ? rs.getString("result_state") : null;
+            }
+        } catch (SQLException e) {
+            LOGGER.error("Idempotent transfer: cannot read result_state for op {}", opId, e);
+            return null;
+        }
+    }
+
+    private static final Gson OUTCOME_GSON = new Gson();
+
+    private static String encodeOutcome(SQLiteStorage.TransferOutcome outcome) {
+        JsonObject obj = new JsonObject();
+        obj.addProperty("status", outcome.status().name());
+        obj.addProperty("sender", outcome.senderNewBalance());
+        obj.addProperty("receiver", outcome.receiverNewBalance());
+        return OUTCOME_GSON.toJson(obj);
+    }
+
+    private static SQLiteStorage.TransferOutcome decodeOutcome(String json) {
+        try {
+            JsonObject obj = OUTCOME_GSON.fromJson(json, JsonObject.class);
+            return new SQLiteStorage.TransferOutcome(
+                SQLiteStorage.TransferStatus.valueOf(obj.get("status").getAsString()),
+                obj.get("sender").getAsDouble(),
+                obj.get("receiver").getAsDouble());
+        } catch (Exception e) {
+            return null;
+        }
     }
 
     // -- Transaction helpers ------------------------------------------------
@@ -729,6 +880,39 @@ public class MySqlStorage implements StorageBackend {
     @Override
     public TransactionLog getTransactionLog() {
         return transactionLog;
+    }
+
+    /**
+     * Borrows one pooled connection (2.2.1). Shared with the auction store's
+     * ConnectionSource; callers MUST close the connection (returning it to
+     * the pool).
+     */
+    public Connection borrowConnection() throws SQLException {
+        ensureInitialized();
+        return dataSource.getConnection();
+    }
+
+    /**
+     * Attaches the optional Redis layer (2.2.1). Called by SolidusMod after
+     * both the storage and the Redis client are up; null detaches.
+     */
+    public void setRedisLayer(RedisLayer layer) {
+        this.redis = layer;
+    }
+
+    /** Drops the local (L1) fallback copies of the given balances. */
+    public void dropLocalBalanceCache(List<UUID> uuids) {
+        if (uuids == null) return;
+        for (UUID uuid : uuids) {
+            balanceFallbackCache.remove(uuid);
+        }
+    }
+
+    /** Best-effort Redis L2 invalidation + network broadcast after a committed mutation. */
+    private void invalidateBalancesRedis(UUID... uuids) {
+        RedisLayer layer = redis;
+        if (layer == null) return;
+        layer.publishBalanceInvalidation(List.of(uuids));
     }
 
     @Override

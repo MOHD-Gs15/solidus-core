@@ -213,3 +213,32 @@ These are additional suggestions for the next developer or the user to implement
 | Non-ASCII characters cleaned | All source files are now pure ASCII |
 
 The new UI offers a professional visual experience with a dark border and colored glass, and items are centered in the chest instead of the default top-down arrangement — exactly as the user requested.
+
+---
+
+# Appendix — Storage Scaling 2.1.5 / 2.2.0 / 2.2.1
+
+> DB-scaling delivery notes (full phase ledger lives in `docs/DB_SCALING_PLAN.md` §11,
+> and the engineering review of the external hybrid plan in `notes/PLAN_REVIEW_HYBRID.md`).
+> Date: 2026-09-06
+
+| Release | Content |
+|---------|---------|
+| **2.1.5** | `StorageBackend` interface + `StorageConfig`/`storage.json` + the 11-case contract test harness (pure refactor, zero behaviour change). |
+| **2.2.0** | `MySqlStorage` (HikariCP, DECIMAL(18,2) + `Money` boundary, FOR UPDATE deterministic locking, in-transaction ledger rows, deadlock retries), dialect-aware `TransactionLog`, `docs/sql/mysql/001_init.sql`, MySQL race harness. |
+| **2.2.1** | Auction store on the shared database (`AuctionDialect` SQLITE\|MYSQL, exactly-once claims preserved, SKIP LOCKED sweep), optional `RedisLayer` (L2 cache + `solidus:bal:inv` invalidation + `solidus:events` instant network notifications, circuit breaker), `/solidus-admin storage migrate` cutover command + `StorageMigrator` (idempotent copy + cent-exact verify + report file), `operations` idempotency wiring (`transferAtomicWithLedger(opId, …)` with the corrected ON CONFLICT pattern). |
+
+**Bugs fixed in 2.2.1 (discovered during the dialect port):**
+
+1. `markExpiredRowCollectible` never bound its `?` parameter — the offline-seller
+   collectible flip was dead code (the parameter silently compared against NULL).
+2. `checkEscrowConsistency` read `player_balances` through the AUCTION connection
+   (a different SQLite file) — the escrow check silently failed on every startup;
+   it now reads through the storage API (async, non-blocking).
+3. `extensions_used` was never incremented — the anti-snipe cap (12 extensions)
+   never took effect; the counter now advances with every successful extension.
+
+**Test totals after 2.2.1:** 364 test executions — 337 passed, 0 failed,
+27 self-skipping CI-gated tests (MySQL/MariaDB + Redis service containers;
+the same files bind and run green in CI when `SOLIDUS_TEST_MYSQL_HOST` /
+`SOLIDUS_TEST_REDIS_URI` are set).

@@ -20,8 +20,8 @@
 --   -- (The mod itself deletes only from pending_notifications during delivery.)
 --
 -- Minimum versions: MariaDB 10.6+ or MySQL 8.0+ (window functions required;
--- SKIP LOCKED reserved for 2.2.1 sweeps; InnoDB row locks carry all
--- correctness in 2.2.0).
+-- SKIP LOCKED expiry sweeps land in 2.2.1; InnoDB row locks carry all
+-- correctness).
 -- ============================================================================
 
 -- ---------------------------------------------------------------------------
@@ -86,9 +86,12 @@ CREATE TABLE IF NOT EXISTS pending_notifications (
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
 -- ============================================================================
--- AUCTION HOUSE (provisioned for the AuctionStore port — 2.2.1)
--- In 2.2.0 the auction store remains per-server SQLite; these tables mirror
--- auction/AuctionManager.java exactly so the port lands without a migration.
+-- AUCTION HOUSE (live on the shared database since 2.2.1 — one network-wide
+-- market). Mirrors auction/AuctionManager.java (AuctionDialect.MYSQL) exactly.
+-- Money columns are DECIMAL(18,2); item JSON blobs are MEDIUMTEXT (complex
+-- serialized stacks can exceed the 64KB TEXT limit).
+-- Cross-server safety: every claim is a conditional (exactly-once) UPDATE;
+-- the expiry sweep uses FOR UPDATE SKIP LOCKED (MariaDB 10.6+/MySQL 8+).
 -- ============================================================================
 
 CREATE TABLE IF NOT EXISTS auction_listings (
@@ -97,11 +100,12 @@ CREATE TABLE IF NOT EXISTS auction_listings (
     seller_name VARCHAR(64) NOT NULL,
     material_name VARCHAR(128) NOT NULL,
     quantity INTEGER NOT NULL,
-    item_nbt TEXT,
+    item_nbt MEDIUMTEXT,
     price DECIMAL(18,2) NOT NULL,
     listed_timestamp BIGINT NOT NULL,
     expire_timestamp BIGINT NOT NULL,
-    status INTEGER NOT NULL DEFAULT 0
+    status INTEGER NOT NULL DEFAULT 0,
+    KEY idx_active_listings (status, expire_timestamp)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
 CREATE TABLE IF NOT EXISTS auction_sold_history (
@@ -115,7 +119,8 @@ CREATE TABLE IF NOT EXISTS auction_sold_history (
     buyer_name VARCHAR(64),
     listed_timestamp BIGINT NOT NULL,
     settled_timestamp BIGINT NOT NULL,
-    settled_reason VARCHAR(32) NOT NULL
+    settled_reason VARCHAR(32) NOT NULL,
+    KEY idx_sold_history_time (settled_timestamp DESC)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
 CREATE TABLE IF NOT EXISTS auction_bid_state (
@@ -144,8 +149,9 @@ CREATE TABLE IF NOT EXISTS auction_won_items (
     winner_uuid CHAR(36) NOT NULL,
     winner_name VARCHAR(64) NOT NULL,
     material_name VARCHAR(128) NOT NULL,
-    item_nbt TEXT,
+    item_nbt MEDIUMTEXT,
     quantity INTEGER NOT NULL,
     win_price DECIMAL(18,2) NOT NULL,
-    won_timestamp BIGINT NOT NULL
+    won_timestamp BIGINT NOT NULL,
+    KEY idx_won_items_winner (winner_uuid)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;

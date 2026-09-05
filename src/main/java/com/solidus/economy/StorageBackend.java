@@ -110,6 +110,29 @@ public interface StorageBackend {
             double amount,
             List<SQLiteStorage.AtomicLedgerRow> ledgerRows);
 
+    /**
+     * Idempotent transfer (2.2.1): the caller supplies a stable operation id
+     * (stable across retries/re-dispatches of the SAME logical transfer) and
+     * the backend guarantees at-most-once money movement for that id — a
+     * replay returns the recorded outcome instead of executing again.
+     *
+     * <p>Default: delegates to {@link #transferAtomicWithLedger} (no
+     * idempotency). {@link MySqlStorage} routes the id through the shared
+     * {@code operations} table so the guarantee holds network-wide.</p>
+     *
+     * @param opId   unique operation id; {@code null} falls back to plain semantics
+     * @param opType free-form classification for analytics (e.g. "PAY", "BID_ESCROW")
+     */
+    default CompletableFuture<SQLiteStorage.TransferOutcome> transferAtomicWithLedger(
+            UUID opId, String opType,
+            UUID senderUuid, String senderName,
+            UUID receiverUuid, String receiverName,
+            double amount,
+            List<SQLiteStorage.AtomicLedgerRow> ledgerRows) {
+        return transferAtomicWithLedger(senderUuid, senderName,
+            receiverUuid, receiverName, amount, ledgerRows);
+    }
+
     // -- Shared services ------------------------------------
 
     /** The transaction log / offline-notification service bound to this backend. */

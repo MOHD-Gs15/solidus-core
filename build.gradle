@@ -126,6 +126,13 @@ dependencies {
     include "com.zaxxer:HikariCP:7.0.2"
     include "org.mariadb.jdbc:mariadb-java-client:3.5.3"
 
+    // ── Optional Redis layer (DB scaling plan Phase 3, 2.2.1) ──
+    // Lettuce: async Redis client (L2 balance cache + pub/sub invalidation
+    // and network event bus). Entirely OPTIONAL — disabled by default in
+    // storage.json; a MySQL-only network needs none of it.
+    implementation "io.lettuce:lettuce-core:6.5.5.RELEASE"
+    include "io.lettuce:lettuce-core:6.5.5.RELEASE"
+
     // ── Testing ──────────────────────────────────────────
     testImplementation "org.junit.jupiter:junit-jupiter:5.10.2"
     testImplementation "org.mockito:mockito-core:5.11.0"

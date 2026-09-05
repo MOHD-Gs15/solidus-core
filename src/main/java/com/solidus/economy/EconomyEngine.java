@@ -22,6 +22,8 @@ public class EconomyEngine {
 
     private StorageBackend storage;
     private BalanceManager balanceManager;
+    /** The config the backend was selected from (exposes the mysql/redis blocks). */
+    private StorageConfig storageConfig;
     private volatile boolean initialized = false;
 
     public EconomyEngine() {
@@ -46,6 +48,7 @@ public class EconomyEngine {
         // Select the storage backend from config/solidus/storage.json
         // (DB scaling plan Phase 1/2): "sqlite" (default) or "mysql" (2.2.0+).
         StorageConfig storageConfig = StorageConfig.load();
+        this.storageConfig = storageConfig;
         if (storageConfig.type() == StorageConfig.Type.MYSQL) {
             MySqlStorage mysql = new MySqlStorage(storageConfig.mysql());
             mysql.initialize(); // fails closed with a clear error if the DB is unreachable
@@ -88,6 +91,34 @@ public class EconomyEngine {
         storage.shutdown();
         initialized = false;
         SolidusMod.LOGGER.info("Solidus Economy Engine shut down complete.");
+    }
+
+    /**
+     * True when the selected backend is the shared MySQL/MariaDB database
+     * (multi-server mode).
+     */
+    public boolean isMysqlMode() {
+        return initialized && storage instanceof MySqlStorage;
+    }
+
+    /**
+     * Connection source for the auction store on the shared MySQL database
+     * (2.2.1). Null in SQLite mode — the auction manager then owns its own
+     * persistent per-server connection.
+     */
+    public TransactionLog.ConnectionSource auctionConnectionSource() {
+        if (storage instanceof MySqlStorage mysql) {
+            return mysql::borrowConnection;
+        }
+        return null;
+    }
+
+    /**
+     * The redis block of {@code storage.json} (2.2.1). Never null — disabled
+     * by default.
+     */
+    public StorageConfig.RedisSettings redisSettings() {
+        return storageConfig != null ? storageConfig.redis() : StorageConfig.RedisSettings.disabled();
     }
 
     /**
