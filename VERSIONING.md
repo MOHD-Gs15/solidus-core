@@ -10,17 +10,19 @@ server owner, at a glance, which releases are built and tested to work together.
 | **Minor** `2.1.x → 2.2.0` | Breaking change: API, hook signature, config schema, or database layout. | No — the other mods must move to the `2.2` family in lockstep. |
 | **Major** `2.x → 3.0.0` | Architectural reset of the ecosystem contract. | No — full coordinated release. |
 
-Current family: **2.1.0** — Core, Analytics, Governance, and Enforcer are aligned on it.
+Current family: **2.2.0** — Core is on it; companions declare the minimum family
+they were integration-tested against in their own `fabric.mod.json`.
 
 Each mod's `fabric.mod.json` `suggests` entry declares the **minimum family version** it
-was integration-tested against (e.g. `"solidus": ">=2.1.0"`).
+was integration-tested against (e.g. Core ships `"solidus-governance": ">=2.1.0",
+"solidus-analytics": ">=2.1.0"`).
 
 ## Where the number lives
 
 Each mod's version has exactly one source of truth — a single line in `gradle.properties`:
 
 ```properties
-mod_version = 2.1.0
+mod_version = 2.2.0
 ```
 
 `fabric.mod.json` picks it up through the `${version}` expansion at build time — never

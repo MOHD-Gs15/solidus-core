@@ -20,8 +20,9 @@ the single-transaction `SQLiteStorage.transferAtomic` fix.
 - Storage is `REAL` in SQLite (`player_balances.balance`); the in-memory
   cache stores `Double` values; the API (`SolidusAPI`, hooks) exposes
   `double`.
-- Tax math rounds at the point of calculation (`TaxEngine.roundTax`),
-  so a tax of 12.345 becomes 12.35 before collection.
+- Companion-module tax math (Solidus Governance's TaxEngine, a separate
+  repository) rounds at the point of calculation, so a tax of 12.345 becomes
+  12.35 before collection. No tax logic lives inside solidus-core itself.
 
 ## Why this is acceptable for now
 

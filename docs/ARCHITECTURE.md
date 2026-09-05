@@ -1,6 +1,6 @@
 # Solidus-Core Architecture Documentation
 
-> **Version**: 2.0.0 | **Minecraft**: 26.1.x | **Fabric**: 0.19.2+ | **Java**: 25  
+> **Version**: 2.2.0 | **Minecraft**: 26.1.x | **Fabric**: 0.19.4+ | **Java**: 25  
 > **License**: MIT | **Environment**: 100% Server-Side Only
 
 ---
@@ -30,7 +30,7 @@
    - 9.2 [Sell Flow: Open → Place → Close → Process](#92-sell-flow-open--place--close--process)
 10. [Cross-Cutting: Networking & Packet Handling](#10-cross-cutting-networking--packet-handling)
     - 10.1 [ServerPlayerEntityMixin — Packet Interception](#101-serverplayerentitymixin--packet-interception)
-    - 10.2 [ScreenHandlerMixin — Safety Net](#102-screenhandlermixin--safety-net)
+    - 10.2 [ScreenHandler-Level Protections (No Second Mixin)](#102-screenhandler-level-protections-no-second-mixin)
     - 10.3 [PacketHandler — Click Routing Gateway](#103-packethandler--click-routing-gateway)
     - 10.4 [RateLimiter — Click & Transfer Cooldowns](#104-ratelimiter--click--transfer-cooldowns)
 11. [Cross-Cutting: Permission System](#11-cross-cutting-permission-system)
@@ -70,10 +70,11 @@ The mod operates through **packet manipulation**: it intercepts container click 
 |---------|-------------|
 | **Virtual Currency** | S$ (Solidus) with configurable starting balance, max balance, and transaction limits |
 | **Persistent Storage** | SQLite with WAL mode, in-memory cache, and async single-thread executor |
-| **GUI Shop** | JSON-configured virtual shop with 11 sections, 120+ items, buy/sell prices |
-| **Auction House** | Peer-to-peer marketplace with 72h listings, 2% listing fee, sort/filter/cancel/collect |
+| **GUI Shop** | JSON-configured virtual shop with 11 sections, 185 items, buy/sell prices |
+| **Auction House** | Peer-to-peer marketplace: buy-now listings plus optional **bidding** (money escrow, anti-snipe, self-healing refunds), 72h listings, configurable fee, sort/search/cancel/collect |
+| **Direct Trade** | `/trade` mutual-preview window (items + money) that executes only when both players are ready — see `docs/FEATURES_TRADE_BIDDING.md` |
 | **Sell GUI** | Full cursor-based item placement GUI with shulker box content inspection |
-| **Transaction Logging** | 10 transaction types with persistent audit trail and offline notification delivery |
+| **Transaction Logging** | 15 transaction types with persistent audit trail and offline notification delivery |
 | **Permission System** | Fine-grained permission nodes with LuckPerms integration and OP-level fallback |
 | **Public API** | Stable `SolidusAPI` singleton accessible via reflection (zero compile dependency) |
 | **Rate Limiting** | 150ms click cooldown per player to prevent exploit automation |
@@ -130,11 +131,12 @@ subtractBalance(player, amount)         // Checks AND deducts atomically
 
 Virtual GUIs (shop, auction) are inherently vulnerable because the client believes it's interacting with a real container. Solidus implements five layers of protection:
 
-1. **RateLimiter** — 150ms cooldown prevents rapid automated clicks
-2. **Mixin Interception** — `ServerPlayerEntityMixin` catches clicks before vanilla processing
-3. **ScreenHandler Rewriting** — Custom handlers rewrite clicks into Solidus actions
-4. **DummyContainer** — Display-only containers block all item insertion/removal
-5. **broadcastChanges()** — Forces client-server resync after every handled click
+1. **RateLimiter** — 150ms cooldown prevents rapid automated clicks (Solidus GUIs only)
+2. **Mixin Interception** — `ServerPlayerEntityMixin` catches clicks before vanilla processing (with a packet containerId desync guard)
+3. **ScreenHandler `clicked()` Overrides** — Custom handlers rewrite clicks into Solidus actions, verify ownership, and whitelist click types
+4. **DisplaySlot** — Slot-level hardening: `mayPlace`/`mayPickup` return false and `set()` is a no-op
+5. **DummyContainer** — Display-only containers block all item insertion/removal
+6. **broadcastFullState()** — Full client resync after every processed click (plus a throttled resync for rate-limited ones) — erases ghost-item predictions in the same tick
 
 ### 2.6 Reflection-Based Inter-Mod API
 
@@ -167,7 +169,7 @@ External mods should not need to compile against Solidus. The `SolidusAPI` class
 │  │  │  EconomyEngine  │  │  ShopManager   │  │ AuctionMgr   │  │   │
 │  │  │  ┌────────────┐ │  │                │  │              │  │   │
 │  │  │  │SQLiteStore │ │  │  shop.json     │  │ SQLite DB    │  │   │
-│  │  │  │+Cache      │ │  │  (120+ items)  │  │ (listings)   │  │   │
+│  │  │  │+Cache      │ │  │  (185 items)   │  │ (listings)   │  │   │
 │  │  │  └────────────┘ │  │                │  │              │  │   │
 │  │  │  ┌────────────┐ │  └───────┬────────┘  └──────┬───────┘  │   │
 │  │  │  │BalanceMgr  │ │          │                   │          │   │
@@ -186,8 +188,8 @@ External mods should not need to compile against Solidus. The `SolidusAPI` class
 │  ┌──────────────────────────────────────────────────────────────┐   │
 │  │                    Mixin Layer                                │   │
 │  │  ┌─────────────────────────┐  ┌───────────────────────────┐ │   │
-│  │  │ ServerPlayerEntityMixin │  │   ScreenHandlerMixin      │ │   │
-│  │  │ (Packet Interception)   │  │   (Safety Net)            │ │   │
+│  │  │ ServerPlayerEntityMixin │  │   DisplaySlot             │ │   │
+│  │  │ (Packet Interception)   │  │   (Frozen display slots)  │ │   │
 │  │  └─────────────────────────┘  └───────────────────────────┘ │   │
 │  └──────────────────────────────────────────────────────────────┘   │
 │                                                                     │
@@ -224,38 +226,52 @@ The entire mod lifecycle is managed by `SolidusMod.java`, which implements `Dedi
 │     └─ 150ms cooldown map initialized                  │
 │                                                        │
 │  3. new EconomyEngine() → initialize()                 │
-│     ├─ SQLiteStorage: opens DB, creates tables,       │
-│     │   enables WAL, pre-loads all balances to cache  │
-│     ├─ BalanceManager: wraps SQLiteStorage             │
-│     └─ TransactionLog: creates log table, loads       │
-│        pending offline notifications                   │
+│     ├─ ConfigManager: resolves config/solidus dir      │
+│     ├─ SQLiteStorage: opens economy.db, creates tables,│
+│     │   enables WAL, pre-loads all balances to cache,  │
+│     │   creates the TransactionLog (same executor)     │
+│     ├─ Pre-creates the escrow account at balance 0     │
+│     └─ BalanceManager: wraps SQLiteStorage             │
 │                                                        │
-│  4. new ShopManager(economyEngine) → loadConfiguration│
-│     └─ Loads shop.json from JAR resources             │
+│  4. SolidusAPI.initialize(engine)                      │
+│     └─ At MOD INIT time (NOT SERVER_STARTED) so        │
+│        companions registering hooks at SERVER_STARTING │
+│        find a non-null API (idempotent)                │
 │                                                        │
-│  5. new AuctionManager(economyEngine) → initialize()   │
-│     └─ Opens auction DB, loads active listings,       │
-│        starts single-thread executor                   │
+│  5. new ShopManager(economyEngine) → loadConfiguration │
+│     └─ Copies shop.json from JAR on first run, parses  │
+│        it, applies startingBalance/currency/listingFee │
 │                                                        │
-│  6. new PacketHandler(shop, auction, rateLimiter)      │
-│     └─ Registers container click interceptor          │
+│  6. new AuctionManager(economyEngine) → initialize()   │
+│     └─ Opens auctions.db (+ bid tables), runs startup  │
+│        sweeps (orphaned SOLD rows, orphaned bid states,│
+│        escrow consistency check)                       │
 │                                                        │
-│  7. Register Brigadier commands                        │
-│     └─ /bal, /pay, /baltop, /shop, /sell, /ah,       │
-│        /transactions                                   │
+│  7. new ChatPrompts() + new TradeManager(engine, prompts)│
 │                                                        │
-│  8. Register SERVER_STOPPING hook                      │
-│     └─ Clean shutdown: auctionMgr → economy → limiter │
+│  8. new PacketHandler(shop, auction, trade, limiter)   │
+│     └─ Registers DISCONNECT cleanup (rate limiter,     │
+│        pending shop transactions, sell-GUI recovery)   │
 │                                                        │
-│  9. Register SERVER_STARTED hook                       │
-│     ├─ Inject MinecraftServer into AuctionManager     │
-│     └─ Initialize SolidusAPI singleton                │
+│  9. Register Brigadier commands                        │
+│     └─ /bal, /pay, /baltop, /shop, /sell, /ah,        │
+│        /trade, /transactions                           │
 │                                                        │
-│  10. Register END_SERVER_TICK hook                     │
-│      └─ Auction expiry check every 6000 ticks (5min)  │
+│ 10. Register SERVER_STOPPING hook                      │
+│     └─ Clean shutdown: trade → auction → economy →     │
+│        rate limiter                                    │
 │                                                        │
-│  11. Register ServerPlayConnectionEvents.JOIN          │
-│      └─ Deliver pending offline notifications         │
+│ 11. Register SERVER_STARTED hook                       │
+│     └─ Inject MinecraftServer into AuctionManager +    │
+│        TradeManager                                    │
+│                                                        │
+│ 12. Register END_SERVER_TICK hook                      │
+│     └─ Every 6000 ticks: auction expiry check +        │
+│        reap idle trade sessions                        │
+│                                                        │
+│ 13. Register JOIN / DISCONNECT events                  │
+│     └─ JOIN: deliver pending offline notifications      │
+│     └─ DISCONNECT: cancel trade session + chat prompt  │
 └──────────────────────────────────────────────────────┘
 ```
 
@@ -263,9 +279,10 @@ The entire mod lifecycle is managed by `SolidusMod.java`, which implements `Dedi
 
 ```
 SERVER_STOPPING event fires:
-  1. auctionManager.shutdown()    — Executor shutdown + final DB writes
-  2. economyEngine.shutdown()     — SQLite connection close + cache flush
-  3. rateLimiter.clear()          — Clear cooldown map
+  1. tradeManager.shutdown()      — Cancel open sessions, return offered items
+  2. auctionManager.shutdown()    — Executor shutdown + final DB writes
+  3. economyEngine.shutdown()     — SQLite connection close + cache flush
+  4. rateLimiter.clear()          — Clear cooldown map
 ```
 
 The shutdown order is the reverse of initialization, ensuring that dependent systems are torn down after their dependencies.
@@ -279,45 +296,61 @@ com.solidus
 ├── SolidusMod.java              // Entry point, subsystem orchestrator
 ├── api/                          // Public integration API
 │   ├── SolidusAPI.java           // Stable singleton API (reflection-accessible)
+│   ├── SolidusTransactionHook.java // Veto + notification hook interface (2.1.0+)
+│   ├── EconomyHooks.java         // Hook registry & dispatch (internal, fail-open)
 │   ├── SolidusIntegration.java   // Reference implementation for external mods
 │   ├── SolidusPermissions.java   // Permission node constants
 │   ├── PermissionChecker.java    // Unified checking (LuckPerms + OP fallback)
 │   └── PermissionConfig.java     // OP-level config loader
 ├── auction/                      // Auction House subsystem
-│   ├── AuctionManager.java       // Core controller (954 lines)
+│   ├── AuctionManager.java       // Core controller (2570 lines incl. bidding)
 │   ├── AuctionEntry.java         // Immutable listing record
 │   ├── ListingStatus.java        // ACTIVE/SOLD/EXPIRED enum
-│   ├── AuctionGUI.java           // Virtual chest builder
-│   ├── AuctionScreenHandler.java // Click handler
+│   ├── BidRules.java             // Pure bid validation + anti-snipe arithmetic
+│   ├── BidState.java             // Per-listing bid state snapshot record
+│   ├── AuctionGUI.java           // Virtual chest builder (bid-aware lore)
+│   ├── AuctionScreenHandler.java // Click handler (left=buy, right=bid prompt)
 │   └── AuctionDummyContainer.java // Display-only container
+├── chat/                         // Chat-driven input
+│   └── ChatPrompts.java          // "Type amount in chat" prompt service (2.2.0+)
 ├── commands/                     // Brigadier command registrations
 │   ├── BalanceCommand.java       // /bal
 │   ├── PayCommand.java           // /pay (online + offline)
 │   ├── BaltopCommand.java        // /baltop
-│   ├── ShopCommand.java          // /shop, /shop search
-│   ├── SellCommand.java          // /sell gui, /sell all
-│   ├── AuctionCommand.java       // /ah, /ah sell/collect/cancel/sort
+│   ├── ShopCommand.java          // /shop, /shop search, /shop reload
+│   ├── SellCommand.java          // /sell gui, /sell all [item] (+shulkers)
+│   ├── AuctionCommand.java       // /ah sell/bid/collect/cancel/sort/search
+│   ├── TradeCommand.java         // /trade <player>|accept|deny|cancel (2.2.0+)
 │   └── TransactionsCommand.java  // /transactions [page] [export [days] | exportall [days]]
 ├── economy/                      // Core economy engine
 │   ├── EconomyEngine.java        // Central coordinator
-│   ├── SQLiteStorage.java        // Async persistent backend
+│   ├── SQLiteStorage.java        // Async persistent backend (941 lines)
 │   ├── BalanceManager.java       // High-level balance API
-│   └── TransactionLog.java       // Audit trail + notifications
+│   ├── TransactionLog.java       // Audit trail + notifications + CSV export
+│   └── EscrowAccount.java        // Bid-escrow system account (2.2.0+)
+├── gui/                          // Shared GUI primitives
+│   └── DisplaySlot.java          // Display-only Slot (no place/pickup/set)
 ├── mixin/                        // Mixin injections
-│   ├── ServerPlayerEntityMixin.java // Packet interception
-│   └── ScreenHandlerMixin.java      // Safety net for virtual GUIs
+│   └── ServerPlayerEntityMixin.java // Packet interception (the ONLY mixin)
 ├── networking/                   // Packet processing
-│   ├── PacketHandler.java        // Click routing gateway
-│   └── RateLimiter.java         // 150ms cooldown per player
+│   ├── PacketHandler.java        // Click routing gateway + resync policy
+│   └── RateLimiter.java          // 150ms click / 1s /pay cooldowns
 ├── sell/                         // Sell GUI subsystem
 │   ├── SellGUI.java              // Virtual chest builder
-│   ├── SellScreenHandler.java    // Full cursor item movement (746 lines)
+│   ├── SellScreenHandler.java    // Full cursor item movement (826 lines)
 │   └── SellContainer.java        // Real container (stores player items)
 ├── shop/                         // Virtual Shop subsystem
 │   ├── ShopManager.java          // Config loader + transaction processor
-│   ├── ShopGUI.java              // Virtual chest builder
+│   ├── ShopGUI.java              // Virtual chest builder (bordered layout)
+│   ├── ShopGUILayout.java        // Pure-Java centering layout engine
 │   ├── ShopScreenHandler.java    // Click rewriting handler
 │   └── ShopDummyContainer.java   // Display-only container
+├── trade/                        // Direct trade subsystem (2.2.0+)
+│   ├── TradeManager.java         // Requests, sessions, execution, reaping
+│   ├── TradeSession.java         // Player-agnostic session state machine
+│   ├── TradeContainer.java       // 54-slot session container (item escrow)
+│   ├── TradeGUI.java             // Window layout + display builders
+│   └── TradeScreenHandler.java   // Manual cursor movement + click safety
 └── util/                         // Shared utilities
     ├── ConfigManager.java        // File I/O, JSON loading, JAR resource copying
     ├── CurrencyUtil.java         // Currency constants, formatting, validation
@@ -343,24 +376,31 @@ The economy engine is the heart of Solidus. It manages virtual currency persiste
 | `TransactionLog` | Persistent audit trail and notifications |
 
 ```java
-// Simplified lifecycle
+// Simplified lifecycle (matches EconomyEngine.java)
 public class EconomyEngine {
     private SQLiteStorage storage;
     private BalanceManager balanceManager;
-    private TransactionLog transactionLog;
     private volatile boolean initialized = false;
 
     public void initialize() {
-        storage = new SQLiteStorage();
-        storage.initialize();           // Opens DB, creates tables, pre-loads cache
-        transactionLog = new TransactionLog(storage);
-        balanceManager = new BalanceManager(storage, transactionLog);
+        ConfigManager.initialize(...);          // resolves config/solidus
+        storage = new SQLiteStorage(configDir);
+        storage.initialize();                   // Opens DB, creates tables, pre-loads cache,
+                                                // creates the TransactionLog on the same executor
+        // Pre-create the bid-escrow system account at balance 0 so the first
+        // transfer INTO escrow cannot mint phantom "starting balance" money.
+        storage.setBalance(EscrowAccount.UUID_ZERO, EscrowAccount.NAME, 0.0);
+        balanceManager = new BalanceManager(storage);
         initialized = true;
+    }
+
+    public TransactionLog getTransactionLog() {
+        return storage.getTransactionLog();     // owned by SQLiteStorage
     }
 
     public void shutdown() {
         initialized = false;
-        storage.shutdown();             // Close SQLite connection
+        storage.shutdown();                     // Close SQLite connection
     }
 }
 ```
@@ -442,15 +482,18 @@ In addition to the balance cache, `SQLiteStorage` maintains a `ConcurrentHashMap
 
 | Method | Description | Returns |
 |--------|-------------|---------|
-| `getBalance(UUID)` | Reads from in-memory cache (instant) | `CompletableFuture<Double>` |
-| `addBalance(UUID, String, double)` | Validates → updates cache → persists to SQLite | `CompletableFuture<Double>` |
+| `getBalance(UUID)` | Reads from in-memory cache (instant; new players are created at the configured starting balance on the executor) | `CompletableFuture<Double>` |
+| `addBalance(UUID, String, double)` | Validates → updates cache → persists to SQLite (rollback on persist failure) | `CompletableFuture<Double>` |
 | `subtractBalance(UUID, String, double)` | Atomic check-and-deduct (TOCTOU-safe) | `CompletableFuture<Double>` |
-| `setBalance(UUID, String, double)` | Direct balance set (admin operation) | `CompletableFuture<Double>` |
+| `setBalance(UUID, String, double)` | Direct balance set (admin operation) | `CompletableFuture<Boolean>` |
+| `transferAtomic(...)` | Both legs inside one `BEGIN IMMEDIATE ... COMMIT` transaction | `CompletableFuture<TransferOutcome>` |
+| `transferAtomicWithLedger(..., rows)` | Same, plus ledger rows inserted INSIDE the money transaction (audit 2.1.3) | `CompletableFuture<TransferOutcome>` |
 | `hasBalance(UUID, double)` | Checks cache for sufficient funds | `CompletableFuture<Boolean>` |
 | `getTopBalances(int)` | Queries SQLite for leaderboard (first page) | `CompletableFuture<List<BalanceEntry>>` |
-| `getTopBalances(int, int)` | Paged leaderboard via SQL LIMIT/OFFSET on idx_balance_rank; ranks continue across pages | `CompletableFuture<List<BalanceEntry>>` |
+| `getTopBalances(int, int)` | Paged leaderboard via SQL LIMIT/OFFSET on idx_balance_rank; ranks continue across pages; **escrow system account excluded** | `CompletableFuture<List<BalanceEntry>>` |
 | `getBalanceEntryCount()` | Cheap COUNT(*) of economy entries for "Page X/Y" footers | `CompletableFuture<Integer>` |
-| `ensurePlayerExists(UUID, String)` | Creates player record if missing | `CompletableFuture<Void>` |
+| `getEconomyStats()` | One-query aggregates: player count, mean, supply, Gini (no rows pulled) | `CompletableFuture<EconomyStats>` |
+| `getPlayerNameCache()` | Read-only view for offline name lookups | `Map<UUID, String>` |
 
 #### The `subtractBalance` Atomic Guarantee
 
@@ -484,34 +527,38 @@ Because all mutations go through the single-thread executor, and the cache is up
 - **Amount validation**: Rejects negative, zero, NaN, infinite amounts
 - **Balance limits**: Enforces `MAX_BALANCE` (100,000,000 S$) and `MAX_TRANSACTION` (10,000,000 S$)
 - **Player resolution**: Converts `ServerPlayer` → UUID + name for storage operations
-- **Atomic transfers**: `transferOffline()` implements deduct-then-add with rollback on failure
+- **Atomic transfers**: `transferOffline()` runs both legs inside ONE SQLite transaction via `transferAtomic` — no manual refund path exists
 
 #### TransferResult
 
 All transfer operations return a `TransferResult` record:
 
 ```java
-public record TransferResult(boolean success, String message) {
-    public static TransferResult ok(String msg) { return new TransferResult(true, msg); }
-    public static TransferResult fail(String msg) { return new TransferResult(false, msg); }
-}
+public record TransferResult(
+    boolean success,
+    String message,
+    double senderNewBalance,     // 0 when the transfer failed
+    double receiverNewBalance    // 0 when the transfer failed
+) {}
 ```
 
-#### Atomic Transfer with Rollback
+#### Atomic Transfer (Single SQLite Transaction)
 
-The `transferOffline` method implements a **deduct-then-add** pattern with automatic rollback:
+`transferOffline` delegates to `SQLiteStorage.transferAtomic`, which runs **both legs inside ONE `BEGIN IMMEDIATE ... COMMIT` transaction** on the economy executor:
 
 ```
-1. Validate amount (positive, within limits)
-2. Check sender has sufficient balance
-3. Deduct from sender (cache update + queue DB write)
-4. Add to receiver (cache update + queue DB write)
-5. If receiver add fails → rollback: add back to sender
-6. Log transaction for both parties
-7. Queue offline notification for receiver (if offline)
+1. Validate amount (positive, within limits, not self-transfer)
+2. Fire the allowTransfer governance veto (2.1.0+ hooks)
+3. BEGIN IMMEDIATE — grab the write lock up front
+4. Read both balances inside the transaction (missing row = starting balance)
+5. Insufficient funds / receiver-overflow → ROLLBACK, nothing moved
+6. UPSERT both balances + insert the ledger rows in the same transaction
+7. COMMIT — then publish both new balances to the in-memory cache
+8. Fire the afterTransfer governance notification (post-settlement)
 ```
 
-Because all operations are serialized through the same single-thread executor, the deduct and add happen atomically — no other operation can interleave between them.
+There is no manual deduct-then-refund path anymore: a crash between the legs is
+impossible by construction, because both legs commit or roll back as one unit.
 
 ---
 
@@ -526,47 +573,49 @@ The `TransactionLog` serves two purposes:
 
 #### Transaction Types
 
-| Code | Type | Color | Description |
-|------|------|-------|-------------|
-| 0 | `PAY_SEND` | Gold | Sent currency to another player |
-| 1 | `PAY_RECEIVE` | Green | Received currency from another player |
-| 2 | `SHOP_BUY` | Red | Purchased item from shop |
-| 3 | `SHOP_SELL` | Green | Sold item to shop |
-| 4 | `AUCTION_BUY` | Red | Purchased auction listing |
-| 5 | `AUCTION_SELL` | Green | Auction listing sold |
-| 6 | `AUCTION_LIST` | Yellow | Listed item on auction (fee) |
-| 7 | `AUCTION_EXPIRE` | Gray | Auction listing expired |
-| 8 | `ADMIN_SET` | Aqua | Admin set balance |
-| 9 | `PENALTY` | Dark Red | Death penalty or other deduction |
+The `type` column stores TEXT codes (not numeric). 15 types exist (2.2.0):
+
+| Code | Direction | Description |
+|------|-----------|-------------|
+| `PAY_SEND` | money out | Sent currency to another player |
+| `PAY_RECEIVE` | money in | Received currency from another player |
+| `SHOP_BUY` | money out | Purchased item from shop |
+| `SHOP_SELL` | money in | Sold item to shop |
+| `AUCTION_LIST` | money out | Listed item on auction (fee) |
+| `AUCTION_SOLD` | money in | Auction listing sold (seller side) |
+| `AUCTION_BOUGHT` | money out | Purchased auction listing (buyer side) |
+| `AUCTION_EXPIRED` | item flow | Auction listing expired |
+| `BID_PLACED` | money out (2.2.0) | Escrowed bid placed — amount moved to escrow |
+| `BID_REFUNDED` | money in (2.2.0) | Escrowed amount returned to the bidder |
+| `AUCTION_WON` | money in (2.2.0) | Bidding auction settled to the highest bidder |
+| `TRADE_SEND` | money/items out (2.2.0) | Direct trade: what this player gave |
+| `TRADE_RECEIVE` | money/items in (2.2.0) | Direct trade: what this player received |
+| `DEATH_PENALTY` | money out | Lost money from being killed |
+| `DEATH_REWARD` | money in | Gained money from killing another player |
+
+`Type.fromCode` logs a warning and falls back to `SHOP_BUY` for unknown codes, so
+companion mods compiled against older type lists keep rendering safely.
 
 #### Offline Notification Architecture
 
+Notifications are **purely database-driven** (single source of truth — the
+`pending_notifications` table in `economy.db`):
+
 ```
-┌──────────────────────────────────────────────┐
-│        TransactionLog                         │
-│                                               │
-│  ConcurrentHashMap<UUID,                      │
-│      CopyOnWriteArrayList<String>>            │
-│  pendingNotifications                         │
-│                                               │
-│  ┌─────────────┐     ┌──────────────────┐    │
-│  │ onTransaction│     │ DB: notifications│    │
-│  │ (recipient   │────▶│ table            │    │
-│  │  is offline) │     │ (persistent)     │    │
-│  └─────────────┘     └──────────────────┘    │
-│                                               │
-│  ┌─────────────────────────────────────┐     │
-│  │ deliverPendingNotifications(player)  │     │
-│  │ - Called on ServerPlayConnectionEvents│    │
-│  │   .JOIN                              │     │
-│  │ - Reads from memory + DB            │     │
-│  │ - Sends formatted messages          │     │
-│  │ - Clears from memory + DB           │     │
-│  └─────────────────────────────────────┘     │
-└──────────────────────────────────────────────┘
+queueNotification(uuid, msg, server)
+  ├─ Player ONLINE  → deliver immediately as chat
+  └─ Player OFFLINE → INSERT row into pending_notifications
+
+deliverPendingNotifications(player)      [on JOIN]
+  ├─ SELECT exact rows ordered by timestamp
+  ├─ Send messages on the server thread (still-connected check first)
+  └─ DELETE only the delivered row ids — a newer notification queued
+     after the snapshot survives (no loss window)
 ```
 
-`CopyOnWriteArrayList` is chosen for thread safety: multiple threads may add notifications concurrently, while the rare read operation (delivery) gets a consistent snapshot.
+The old in-memory mirror (a `ConcurrentHashMap<UUID, CopyOnWriteArrayList<String>>`
+of pending messages) was removed: it could diverge from the database, and delivery
+used to wipe freshly queued rows.
 
 #### CSV Export (`/transactions export`)
 
@@ -701,7 +750,7 @@ The `ShopScreenHandler` intercepts every click in the shop GUI and translates it
 | Go Back | Left-click arrow | Returns to main menu |
 | Next/Prev Page | Left-click arrows | Paginates through items |
 
-The handler completely cancels vanilla container behavior (via the `ScreenHandlerMixin` safety net) and implements its own click logic. This prevents players from actually picking up shop display items.
+The handler completely cancels vanilla container behavior by overriding `clicked()`/`quickMoveStack()` and backing every display slot with `DisplaySlot` + `ShopDummyContainer`. This prevents players from actually picking up shop display items.
 
 ---
 
@@ -711,7 +760,7 @@ The auction house is a peer-to-peer marketplace where players list items for sal
 
 ### 8.1 AuctionManager — Race-Condition-Free Controller
 
-**File**: `com.solidus.auction.AuctionManager` (954 lines)
+**File**: `com.solidus.auction.AuctionManager` (2,570 lines — the largest class in the mod; it now also owns the 2.2.0 bidding system, see `docs/FEATURES_TRADE_BIDDING.md`)
 
 The auction house faces the most complex concurrency challenges in Solidus. Two players might attempt to purchase the same listing simultaneously, or a player might try to cancel a listing at the same moment another player buys it.
 
@@ -846,7 +895,7 @@ The auction GUI follows the same virtual chest pattern as the shop:
 │                              []  [X]             │
 ├─────────────────────────────────────────────────┤
 │ [Item1] [Item2] [Item3] [Item4] [Item5] ...     │  Rows 1-5: Listings
-│ [Item6] [Item7] [Item8] [Item9] [Item10] ...    │  (45 slots)
+│ [Item6] [Item7] [Item8] [Item9] [Item10] ...    │  (42 listing slots — slots 48/50/53 are reserved for navigation)
 │ ...                                              │
 ├─────────────────────────────────────────────────┤
 │ [←Prev] []  []  []  []  []  []  []  [Next→]     │  Row 6: Navigation
@@ -888,7 +937,7 @@ In vanilla Minecraft, when a player clicks a slot in a container:
 3. The server updates the cursor and slot state
 4. The client and server synchronize
 
-For shop and auction GUIs, Solidus cancels this entirely (via `ScreenHandlerMixin`) because no real items should move. But for the sell GUI, players **must** be able to place items into input slots. The solution: implement a custom `clicked()` method that handles item movement for input slots while blocking it for UI slots.
+For shop and auction GUIs, Solidus cancels this entirely inside `PacketHandler` (which intercepts the packet and never lets vanilla `clicked()` run) because no real items should move. But for the sell GUI, players **must** be able to place items into input slots. The solution: implement a custom `clicked()` method that handles item movement for input slots while blocking it for UI slots.
 
 #### Slot Layout
 
@@ -905,7 +954,7 @@ Slots 9-53: Input area (player can place items here)
 1. ServerPlayerEntityMixin intercepts handleContainerClick
 2. PacketHandler.handleContainerClick() is called
 3. For SellScreenHandler, the Mixin does NOT cancel (unlike shop/auction)
-4. Instead, ScreenHandlerMixin allows it through
+4. PacketHandler routes the click to SellScreenHandler (rate-limited, then a full resync)
 5. SellScreenHandler.clicked() is called
 6. Custom logic determines:
    - If UI slot (0-8): ignore click
@@ -1003,40 +1052,47 @@ private void onContainerClick(ServerboundContainerClickPacket packet, CallbackIn
     PacketHandler packetHandler = SolidusMod.getPacketHandler();
     if (packetHandler == null) return;
 
+    // Desync guard (audit 2.1.3): only process clicks whose packet
+    // containerId matches the currently open menu.
+    if (player.containerMenu == null
+        || packet.containerId() != player.containerMenu.containerId) {
+        return;
+    }
+
     boolean handled = packetHandler.handleContainerClick(
         player, packet.slotNum(), packet.buttonNum(), packet.containerInput());
 
     if (handled) {
-        ci.cancel();                          // Prevent vanilla processing
-        player.containerMenu.broadcastChanges(); // Force client-server resync
+        ci.cancel();  // Prevent vanilla processing.
+        // Resync policy lives in PacketHandler: broadcastFullState() after
+        // every PROCESSED click; a throttled full resync (max 1 per 200ms)
+        // for clicks dropped by the rate limiter.
     }
 }
 ```
 
-**Critical**: `ci.cancel()` prevents vanilla from processing the click (which would move items in the container). `broadcastChanges()` forces a full resync, preventing ghost items that would appear if the client processed the click but the server didn't.
+**Critical**: `ci.cancel()` prevents vanilla from processing the click. A plain `broadcastChanges()` was NOT enough (the 2.1.0 ghost-item bug): it only sends slots whose server state changed, and a rejected click changes nothing — so the client's optimistic prediction survived. `broadcastFullState()` always resends the complete container state (plus the carried stack), erasing any ghost item in the same tick it is created (the PR#13 guarantee).
 
-### 10.2 ScreenHandlerMixin — Safety Net
+### 10.2 ScreenHandler-Level Protections (No Second Mixin)
 
-**File**: `com.solidus.mixin.ScreenHandlerMixin`
+**Note (2.2.0 audit):** an older revision of this document described a
+`ScreenHandlerMixin` safety net. **That mixin does not exist** —
+`solidus.mixins.json` registers exactly one mixin,
+`ServerPlayerEntityMixin`. Vanilla `clicked()` never runs for Solidus display
+GUIs because the packet is consumed one layer above (Mixin + PacketHandler), and
+the handlers themselves are hardened:
 
-This is a second layer of protection. Even if the `ServerPlayerEntityMixin` somehow fails to intercept a click (edge case), this Mixin catches it at the `AbstractContainerMenu.clicked()` level:
-
-```java
-@Inject(method = "clicked", at = @At("HEAD"), cancellable = true)
-private void onClicked(Slot slot, int slotIndex, int button,
-                       ContainerInput containerInput, Player player, CallbackInfo ci) {
-    if (player instanceof ServerPlayer serverPlayer) {
-        AbstractContainerMenu currentMenu = serverPlayer.containerMenu;
-        if (currentMenu instanceof ShopScreenHandler || currentMenu instanceof AuctionScreenHandler) {
-            ci.cancel();
-            currentMenu.broadcastChanges();
-        }
-        // Note: SellScreenHandler is EXCLUDED — it implements its own item movement
-    }
-}
-```
-
-The explicit exclusion of `SellScreenHandler` is crucial — the sell GUI needs to handle real item movement, so vanilla's `clicked()` must not be blocked for it.
+- **Ownership check** — every ScreenHandler (`Shop`, `Auction`, `Trade`, `Sell`)
+  rejects clicks from any actor other than the owning player (defensive, audit 2.1.3).
+- **Click-type whitelisting** — e.g. `AuctionScreenHandler` accepts only a plain
+  `PICKUP` left-click for purchases (right-click on bid-enabled listings opens the
+  bid chat prompt); SWAP/THROW/drag gestures are ignored.
+- **`quickMoveStack()` returns `ItemStack.EMPTY`** in all display handlers —
+  shift-click cannot move anything.
+- **`DisplaySlot`** (see §12) freezes the slots themselves.
+- Handlers that DO move real items (`SellScreenHandler`, `TradeScreenHandler`)
+  implement manual cursor movement and are routed through `PacketHandler` like
+  every other Solidus GUI.
 
 ### 10.3 PacketHandler — Click Routing Gateway
 
@@ -1048,30 +1104,36 @@ The explicit exclusion of `SellScreenHandler` is crucial — the sell GUI needs 
 Incoming Click
       │
       ▼
+┌───────────────────────────────┐
+│ SCOPE CHECK FIRST (audit 2.1.3)│──▶ Not a Solidus menu? → return false
+│ Only Solidus GUIs are limited  │    (vanilla containers pass untouched)
+└────────┬──────────────────────┘
+         ▼
 ┌─────────────────┐
-│ RateLimiter Check│──▶ Rejected if < 150ms since last click
-└────────┬────────┘
+│ RateLimiter Check│──▶ Dropped if < 150ms since last click
+│ (150ms, per GUI) │    (+ at most ONE throttled full resync per 200ms,
+└────────┬────────┘      so floods cannot amplify into multi-KB broadcasts)
          │ Passed
          ▼
 ┌─────────────────────────────────────────┐
-│ Determine current ScreenHandler type     │
+│ Route by current ScreenHandler type      │
 │                                          │
-│  ShopScreenHandler?  → ShopScreenHandler │
-│                       .handleClick()     │
+│  ShopScreenHandler?    → shop.clicked()  │
+│  AuctionScreenHandler? → auction.clicked()│
+│  SellScreenHandler?    → sell.clicked()  │ (manual item movement)
+│  TradeScreenHandler?   → trade.clicked() │ (manual item movement, 2.2.0+)
 │                                          │
-│  SellScreenHandler?  → Allow through     │
-│                       (SellScreenHandler │
-│                        handles itself)   │
-│                                          │
-│  AuctionScreenHandler?→ AuctionScrHandler│
-│                       .handleClick()     │
+│  After EVERY processed click:            │
+│  broadcastFullState() (anti-ghost, PR#13)│
 │                                          │
 │  Other?              → Return false      │
-│                       (not a Solidus GUI)│
 └─────────────────────────────────────────┘
 ```
 
-The handler also manages cleanup when players disconnect, removing rate limit entries and any pending state.
+The `register()` hook also cleans up on disconnect: rate-limiter entry, drop-resync
+bookkeeping, pending shop buy/sell locks, and sell-GUI item recovery (vanilla never
+invokes `removed()` for a menu open at disconnect — the handler runs it explicitly
+so placed items are sold/returned instead of being lost).
 
 ### 10.4 RateLimiter — Click & Transfer Cooldowns
 
@@ -1117,28 +1179,37 @@ Solidus implements a fine-grained permission system that integrates with LuckPer
 
 All permission nodes follow the convention `solidus.<module>.<category>.<action>`:
 
-| Module | Permission | Default OP Level |
-|--------|-----------|-----------------|
-| Core | `solidus.core.balance.view` | 0 (all players) |
-| Core | `solidus.core.balance.others` | 1 (OPs) |
-| Core | `solidus.core.pay` | 0 |
-| Core | `solidus.core.pay.offline` | 0 |
-| Core | `solidus.core.baltop` | 0 |
-| Shop | `solidus.core.shop.view` | 0 |
-| Shop | `solidus.core.shop.buy` | 0 |
-| Shop | `solidus.core.shop.sell` | 0 |
-| Auction | `solidus.core.auction.view` | 0 |
-| Auction | `solidus.core.auction.sell` | 0 |
-| Auction | `solidus.core.auction.collect` | 0 |
-| Auction | `solidus.core.auction.cancel` | 0 |
-| Auction | `solidus.core.auction.sort` | 0 |
-| Analytics | `solidus.analytics.view` | 1 |
-| Analytics | `solidus.analytics.export` | 2 |
-| Territory | `solidus.territory.claim` | 0 |
-| Territory | `solidus.territory.admin` | 3 |
-| Governance | `solidus.governance.policy` | 2 |
-| Governance | `solidus.governance.tax` | 2 |
-| Governance | `solidus.governance.audit` | 2 |
+Core command nodes follow `solidus.command.<command>[.<sub>]` (all default to
+OP 0 unless noted). The authoritative list lives in `SolidusPermissions`:
+
+| Permission | Default OP Level | Controls |
+|-----------|-----------------|----------|
+| `solidus.command.balance` | 0 | `/balance`, `/bal` |
+| `solidus.command.pay` | 0 | `/pay <player> <amount>` |
+| `solidus.command.pay.offline` | 0 | `/pay offline <name> <amount>` |
+| `solidus.command.baltop` | 0 | `/baltop` |
+| `solidus.command.shop` | 0 | `/shop` |
+| `solidus.command.shop.search` | 0 | `/shop search <query>` |
+| `solidus.command.shop.reload` | **2** | `/shop reload` |
+| `solidus.command.sell` | 0 | `/sell gui`, `/sell all [item]` |
+| `solidus.command.auction` | 0 | `/ah` |
+| `solidus.command.auction.sell` | 0 | `/ah sell <price> [startbid]` |
+| `solidus.command.auction.bid` | 0 | `/ah bid <uuid> <amount>` + GUI right-click bid (2.2.0+) |
+| `solidus.command.auction.collect` | 0 | `/ah collect` |
+| `solidus.command.auction.cancel` | 0 | `/ah cancel <uuid>` |
+| `solidus.command.auction.sort` | 0 | `/ah sort <order>` |
+| `solidus.command.trade` | 0 | the whole `/trade` family (2.2.0+) |
+| `solidus.command.transactions` | 0 | `/transactions [page]` |
+| `solidus.command.transactions.export` | 0 | `/transactions export [days]` |
+| `solidus.command.transactions.exportall` | **2** | `/transactions exportall [days]` |
+
+Companion-module nodes (declared here for ecosystem-wide defaults): analytics
+viewing defaults to OP 2 and analytics management (`snapshot`, `export`,
+`dashboard.manage`, `license`, `fingerprint`) to OP 3; territory `land`/`claim`
+default to OP 0 with `admin`/`bypass` at OP 2; governance viewing defaults to
+OP 2 and management (tax, intervention, recovery, limits.set, event.manage,
+policy.manage, rules.manage, simulation, license, fingerprint) to OP 3.
+Unknown nodes fall back to OP 2 (safe default).
 
 The `getDefaultOpLevel(String permission)` method provides fallback OP levels for the permission configuration file. This ensures that even without LuckPerms, server admins can control access.
 
@@ -1195,11 +1266,11 @@ When LuckPerms is not installed, `PermissionConfig` loads a `permissions.json` f
 
 ```json
 {
-  "solidus.core.balance.view": 0,
-  "solidus.core.pay": 0,
-  "solidus.core.auction.view": 0,
-  "solidus.analytics.view": 1,
-  "solidus.governance.policy": 2
+  "solidus.command.balance": 0,
+  "solidus.command.pay": 0,
+  "solidus.command.auction": 0,
+  "solidus.analytics.dashboard": 2,
+  "solidus.governance.audit": 2
 }
 ```
 
@@ -1239,25 +1310,26 @@ This means even if a click somehow reaches the container (bypassing all other pr
 "Ghost items" are items that appear on the client's screen but don't exist on the server. They occur when the client processes a click (predicting the server will agree) but the server rejects it. Solidus prevents this through multiple layers:
 
 ```
-Layer 1: RateLimiter
+Layer 1: RateLimiter (Solidus GUIs only)
   └─ Rejects rapid-fire clicks before they reach any handler
 
-Layer 2: ServerPlayerEntityMixin
-  └─ Intercepts handleContainerClick at HEAD
+Layer 2: ServerPlayerEntityMixin (the ONLY mixin)
+  └─ Intercepts handleContainerClick at HEAD (with containerId desync guard)
   └─ If Solidus handles the click → cancel vanilla processing
-  └─ Call broadcastChanges() → forces full resync
 
-Layer 3: ScreenHandlerMixin
-  └─ Safety net: cancels clicked() for Shop/Auction GUIs
-  └─ Even if Layer 2 somehow misses, this catches it
+Layer 3: ScreenHandler hardening
+  └─ Ownership checks, click-type whitelisting, quickMoveStack() blocked
 
-Layer 4: DummyContainer
-  └─ Even if both Mixins fail, container blocks all mutations
-  └─ Items physically cannot be inserted or removed
+Layer 4: DisplaySlot
+  └─ mayPlace/mayPickup return false; set() is a no-op — vanilla slot logic
+     can never insert, merge, swap, split or throw display items
 
-Layer 5: broadcastChanges()
-  └─ After every handled click, forces complete state resync
-  └─ Client's view is corrected to match server state
+Layer 5: DummyContainer
+  └─ Even if everything above fails, the container blocks all mutations
+
+Layer 6: broadcastFullState() resyncs
+  └─ After EVERY processed click (throttled for dropped ones): the client's
+     optimistic prediction is erased in the same tick it was created
 ```
 
 ---
@@ -1284,6 +1356,8 @@ Layer 5: broadcastChanges()
 | `transfer(ServerPlayer, ServerPlayer, double)` | `CompletableFuture<TransferResult>` | Atomic online transfer |
 | `transferOffline(UUID, String, UUID, String, double)` | `CompletableFuture<TransferResult>` | Atomic offline transfer |
 | `getTopBalances(int, int)` | `CompletableFuture<List<BalanceEntry>>` | Paged leaderboard query (offset 10 → ranks start at 11) |
+| `getBalanceEntryCount()` | `CompletableFuture<Integer>` | Count of economy entries (page footers) |
+| `getEconomyStats()` | `CompletableFuture<EconomyStats>` | Aggregates: count, mean, supply, Gini |
 | `getTransactionLog()` | `TransactionLog` | Access to transaction logging |
 | `registerTransactionHook(hook)` | `boolean` | Register an economy transaction hook (false if name taken) |
 | `unregisterTransactionHook(hook)` | `boolean` | Remove a previously registered hook |
@@ -1379,7 +1453,7 @@ If you prefer type-safe integration, add solidus-core as a dependency in your `b
 
 ```groovy
 dependencies {
-    modImplementation "com.github.MOHD-Gs15:solidus-core:v2.0.0"
+    modImplementation "com.github.MOHD-Gs15:solidus-core:v2.2.0"
 }
 ```
 
@@ -1642,6 +1716,7 @@ CREATE INDEX IF NOT EXISTS idx_transaction_player
 
 `type` values (TEXT, not numeric codes): `SHOP_BUY`, `SHOP_SELL`,
 `AUCTION_LIST`, `AUCTION_SOLD`, `AUCTION_BOUGHT`, `AUCTION_EXPIRED`,
+`BID_PLACED`, `BID_REFUNDED`, `AUCTION_WON`, `TRADE_SEND`, `TRADE_RECEIVE`,
 `PAY_SEND`, `PAY_RECEIVE`, `DEATH_PENALTY`, `DEATH_REWARD`.
 
 `idx_transaction_player (player_uuid, timestamp DESC)` serves `/transactions`
@@ -1758,9 +1833,66 @@ CREATE INDEX IF NOT EXISTS idx_sold_history_time
     ON auction_sold_history (settled_timestamp DESC);
 ```
 
-`settled_reason` values: `SOLD`, `EXPIRED_RETURN`, `EXPIRED_COLLECT`,
+`settled_reason` values: `SOLD` (buy-now), `WON` (bidding auction expired with
+a winning bid, buyer attributed), `EXPIRED_RETURN`, `EXPIRED_COLLECT`,
 `CANCELLED`, `CORRUPT` (the row's item data could not be deserialized —
 undeliverable).
+
+#### Table: `auction_bid_state` (2.2.0)
+
+Bid state for bidding-enabled listings — one optional row per listing, keyed by
+listing id. A listing WITHOUT a row is a buy-now-only listing; the feature is
+purely additive and `AuctionEntry` is untouched.
+
+| Column | Type | Constraints | Description |
+|--------|------|-------------|-------------|
+| `listing_id` | TEXT | PRIMARY KEY NOT NULL | Listing UUID (hyphenated) |
+| `start_price` | REAL | NOT NULL | Opening (reserve) bid |
+| `current_bid` | REAL | | Current highest bid (NULL = no bids yet) |
+| `current_bidder_uuid` | TEXT | | Highest bidder UUID |
+| `current_bidder_name` | TEXT | | Highest bidder display name |
+| `bid_count` | INTEGER | NOT NULL DEFAULT 0 | Number of bids placed |
+| `extensions_used` | INTEGER | NOT NULL DEFAULT 0 | Anti-snipe extensions applied |
+
+The top-bid slot is claimed with a conditional
+`UPDATE ... WHERE current_bid IS NULL OR current_bid < ?` (exactly-once), and
+refund/release flows move money through `transferAtomicWithLedger`.
+
+#### Table: `auction_bids` (2.2.0)
+
+Append-only bid history (audit/analytics):
+
+| Column | Type | Constraints | Description |
+|--------|------|-------------|-------------|
+| `bid_id` | INTEGER | PRIMARY KEY AUTOINCREMENT | Bid ID |
+| `listing_id` | TEXT | NOT NULL | Listing UUID |
+| `bidder_uuid` | TEXT | NOT NULL | Bidder UUID |
+| `bidder_name` | TEXT | NOT NULL | Bidder display name |
+| `amount` | REAL | NOT NULL | Bid amount |
+| `bid_timestamp` | INTEGER | NOT NULL | Epoch millis |
+
+`CREATE INDEX idx_bids_listing ON auction_bids (listing_id, bid_timestamp DESC)`.
+
+#### Table: `auction_won_items` (2.2.0)
+
+Offline winner delivery queue (claimed and deleted by `/ah collect`):
+
+| Column | Type | Constraints | Description |
+|--------|------|-------------|-------------|
+| `win_id` | INTEGER | PRIMARY KEY AUTOINCREMENT | Win ID |
+| `listing_id` | TEXT | NOT NULL UNIQUE | Listing UUID (idempotent inserts) |
+| `winner_uuid` | TEXT | NOT NULL | Winner UUID |
+| `winner_name` | TEXT | NOT NULL | Winner display name |
+| `material_name` | TEXT | NOT NULL | Material registry key |
+| `item_nbt` | TEXT | | Serialized item data (NULL in one narrow crash case — see AGENT_NOTES) |
+| `quantity` | INTEGER | NOT NULL | Stack size |
+| `win_price` | REAL | NOT NULL | Winning bid amount |
+| `won_timestamp` | INTEGER | NOT NULL | Epoch millis |
+
+`CREATE INDEX idx_won_items_winner ON auction_won_items (winner_uuid)`. A
+startup sweep (`refundOrphanedBidStates`) refunds any bid whose listing is no
+longer ACTIVE, and an escrow-consistency check compares the escrow account
+balance against the sum of open top bids on every boot.
 
 ---
 
@@ -1818,7 +1950,7 @@ undeliverable).
 
 - **Load from JAR**: Copies default configuration files from the mod JAR to the config directory on first run
 - **JSON parsing**: Uses Gson for reading/writing configuration
-- **Hot reload**: Configuration can be reloaded without server restart (future enhancement)
+- **Hot reload**: `/shop reload` (OP 2+) re-reads `shop.json` and re-applies the global overrides without a server restart
 
 ---
 
@@ -1826,23 +1958,30 @@ undeliverable).
 
 | Command | Permission | Description |
 |---------|-----------|-------------|
-| `/balance` or `/bal` | `solidus.core.balance.view` | View your balance |
-| `/pay <player> <amount>` | `solidus.core.pay` | Pay an online player |
-| `/pay offline <name> <amount>` | `solidus.core.pay.offline` | Pay an offline player |
-| `/baltop` | `solidus.core.baltop` | View top 10 leaderboard |
-| `/shop` | `solidus.core.shop.view` | Open the virtual shop |
-| `/shop search <query>` | `solidus.core.shop.view` | Search shop items |
-| `/sell gui` | `solidus.core.shop.sell` | Open sell GUI |
-| `/sell all` | `solidus.core.shop.sell` | Sell all sellable items |
-| `/sell all <item>` | `solidus.core.shop.sell` | Sell all of a specific item |
-| `/ah` | `solidus.core.auction.view` | Open auction house |
-| `/ah sell <price>` | `solidus.core.auction.sell` | List held item for sale |
-| `/ah collect` | `solidus.core.auction.collect` | Collect expired items/proceeds |
-| `/ah cancel <uuid>` | `solidus.core.auction.cancel` | Cancel a listing |
-| `/ah sort <order>` | `solidus.core.auction.sort` | Sort listings |
-| `/transactions [page]` | `solidus.core.balance.view` | View transaction history |
+| `/balance` or `/bal` | `solidus.command.balance` | View your balance |
+| `/pay <player> <amount>` | `solidus.command.pay` | Pay an online player |
+| `/pay offline <name> <amount>` | `solidus.command.pay.offline` | Pay an offline player |
+| `/baltop [page]` | `solidus.command.baltop` | Wealth leaderboard, 10 per page, ranks continue across pages |
+| `/shop` | `solidus.command.shop` | Open the virtual shop |
+| `/shop search <query>` | `solidus.command.shop.search` | Search shop items |
+| `/shop reload` | `solidus.command.shop.reload` (OP 2) | Hot-reload `shop.json` |
+| `/sell gui` | `solidus.command.sell` | Open sell GUI |
+| `/sell all` | `solidus.command.sell` | Sell all sellable items (incl. shulker contents) |
+| `/sell all <item>` | `solidus.command.sell` | Sell all of a specific item |
+| `/ah` | `solidus.command.auction` | Open auction house |
+| `/ah sell <price> [startbid]` | `solidus.command.auction.sell` | List held item; an opening bid enables bidding |
+| `/ah bid <uuid> <amount>` | `solidus.command.auction.bid` | Bid on a bid-enabled listing (or right-click it in the GUI) |
+| `/ah collect` | `solidus.command.auction.collect` | Collect expired items AND won auction items |
+| `/ah cancel <uuid>` | `solidus.command.auction.cancel` | Cancel a listing (top bidder auto-refunded) |
+| `/ah sort <order>` | `solidus.command.auction.sort` | Sort: newest / price_low / price_high / material |
+| `/ah search <term>` | `solidus.command.auction` | Free-text search (cheapest first, max 15 results) |
+| `/trade <player>` | `solidus.command.trade` | Request a direct trade (within 10 blocks) |
+| `/trade accept` / `deny` | `solidus.command.trade` | Respond to a pending trade request |
+| `/trade cancel` | `solidus.command.trade` | Cancel the trade you are in |
+| `/transactions [page]` | `solidus.command.transactions` | View transaction history (10 per page) |
 | `/transactions export [days]` | `solidus.command.transactions.export` (OP 0) | Export own history to CSV (default 7 days) |
-| `/transactions exportall [days]` | `solidus.command.transactions.exportall` (OP 2+) | Export the full ledger to CSV |
+| `/transactions exportall [days]` | `solidus.command.transactions.exportall` (OP 2) | Export the full ledger to CSV |
+
 
 ---
 
@@ -1852,13 +1991,40 @@ Solidus includes a comprehensive test suite using JUnit 5 and Mockito.
 
 ### Test Files
 
+20 test classes, 309 `@Test` methods (all green on JDK 25). Storage/state-level
+tests run on plain SQLite or pure Java — no Minecraft bootstrap required:
+
 | Test | Coverage |
 |------|----------|
-| `BalanceManagerTest` | getBalance, addBalance, subtractBalance, transferOffline (success, negative/zero/self/over-max rejection, insufficient funds, atomicity) |
-| `SQLiteStorageTest` | New player creation, addBalance, subtractBalance, setBalance, hasBalance, getTopBalances, concurrency (100 concurrent adds, no overdraft, new player race), persistence across restart |
-| `CurrencyUtilTest` | Constants, isValidAmount, isValidBalance, round, format, formatCompact, edge cases |
-| `TextUtilTest` | formatCurrency, sanitizeLegacyFormatting (color codes, format codes, null, empty, mixed, uppercase, standalone section sign) |
+| `BalanceManagerTest` (17) | get/add/subtract balances, transfer validation, atomicity |
+| `SQLiteStorageTest` (27) | Player creation, persistence, concurrency (100-thread races), restart survival |
+| `TransferAtomicTest` (10) | Single-transaction transfer semantics (success/insufficient/overflow/self) |
+| `TransferAtomicLedgerTest` (5) | Ledger rows commit inside the money transaction; failure rolls back both |
+| `TransactionLogExportTest` (12) | CSV building, RFC 4180 escaping, formula-injection guard |
+| `TransactionLogPaginationTest` (10) | LIMIT/OFFSET pages, counts |
+| `BaltopPaginationTest` (10) | Paged leaderboard, rank continuity, escrow exclusion |
+| `EconomyStatsTest` (5) | Aggregates: count, mean, supply, Gini |
+| `BidEscrowFlowTest` (13) | 2.2.0: escrow charge/refund/release, exactly-once claims, BidRules arithmetic |
+| `TradeSessionStateTest` (8) | 2.2.0: anti bait-and-switch, empty-trade rejection, lifecycle, isolation |
+| `AuctionSettlementTest` (5) | Buy-now settlement claims |
+| `AuctionSettlementHistoryTest` (10) | Archive + delete invariants, startup recovery sweeps |
+| `AuctionSearchTest` (8) | Sanitized free-text search, escaping, caps |
+| `ShopGUILayoutTest` (36) | Layout arithmetic, centering, slot classification |
+| `RateLimiterTest` (32) | Cooldowns, per-player isolation, concurrency, cleanup |
+| `SolidusPermissionsTest` (10) | Naming convention, default OP levels |
+| `EconomyHooksTest` (16) | Hook registry: duplicates, fail-open, dispatch |
+| `TransferHookIntegrationTest` (8) | Veto/notification flow through transfers |
+| `CurrencyUtilTest` (48) | Constants, validation, rounding, formatting |
+| `TextUtilTest` (19) | Currency formatting, legacy-code sanitization |
 
+### Concurrency Testing
+
+`SQLiteStorageTest` includes critical concurrency tests:
+
+- **100 concurrent adds**: 100 threads simultaneously add to the same balance; the final balance must be exactly `startBalance + (100 × addAmount)`
+- **No overdraft**: 100 threads simultaneously try to subtract more than the balance holds; the balance must never go negative
+- **New player race**: 100 threads simultaneously create the same player; only one record should exist
+- **Persistence**: Data survives a simulated restart (close + reopen database)
 ### Concurrency Testing
 
 `SQLiteStorageTest` includes critical concurrency tests:
@@ -1917,7 +2083,7 @@ Solidus's virtual GUI pattern can be extended for custom menus:
 | **Double-spending** | `pendingBuys`/`pendingSells` guards in ShopManager; atomic balance operations |
 | **Dupe via race conditions** | Single-thread executor for all mutations; no concurrent DB writes |
 | **Click automation** | 150ms `RateLimiter` per player; `compute()` atomic check-and-update |
-| **Ghost item exploitation** | 5-layer defense-in-depth (rate limiter → Mixin → ScreenHandler → DummyContainer → broadcastChanges) |
+| **Ghost item exploitation** | Layered defense: rate limiter → Mixin → handler hardening → DisplaySlot → DummyContainer → broadcastFullState resyncs (see §12.2) |
 | **Negative balance** | `subtractBalance` rejects if funds insufficient; `BalanceManager` validates all amounts |
 | **Overflow** | `MAX_BALANCE` (100M) and `MAX_TRANSACTION` (10M) caps; `isValidAmount` and `isValidBalance` validation |
 | **NaN/Infinity injection** | Explicit checks in `CurrencyUtil.isValidAmount()` reject `Double.NaN` and `Double.isInfinite()` |
@@ -1982,7 +2148,7 @@ Transaction log size grows with usage; consider periodic pruning for high-traffi
 | **Ghost Item** | An item that appears on the client's screen but doesn't exist on the server, caused by client-server desync |
 | **Virtual GUI** | A GUI that renders as a vanilla chest menu but is entirely custom logic on the server side |
 | **Single-Thread Executor** | An `ExecutorService` backed by a single thread, serializing all submitted tasks to eliminate concurrency |
-| **broadcastChanges()** | A method on `AbstractContainerMenu` that forces the server to resend the entire container state to the client |
+| **broadcastFullState()** | A method on `AbstractContainerMenu` that forces the server to resend the ENTIRE container state (all slots + carried stack) to the client — used after every processed Solidus click; `broadcastChanges()` alone was insufficient because it only sends changed slots |
 | **Mixin** | A Fabric tool that injects custom code into Minecraft's compiled classes at runtime |
 | **Brigadier** | Minecraft's command framework, used for registering `/bal`, `/pay`, etc. |
 | **CompletableFuture** | Java's async computation wrapper; used throughout Solidus for non-blocking operations |

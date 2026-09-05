@@ -1,6 +1,6 @@
 # Solidus Economy — Server-Side Minecraft Fabric Mod
 
-[![Solidus Family](https://img.shields.io/badge/Solidus_Family-2.1.0-8B5CF6.svg)](VERSIONING.md)
+[![Solidus Family](https://img.shields.io/badge/Solidus_Family-2.2.0-8B5CF6.svg)](VERSIONING.md)
 [![Platform](https://img.shields.io/badge/Platform-Fabric-blue.svg)](https://fabricmc.net/)
 [![Minecraft](https://img.shields.io/badge/Minecraft-26.1.x-green.svg)](https://www.minecraft.net/)
 [![Java](https://img.shields.io/badge/Java-25-orange.svg)](https://adoptium.net/)
@@ -24,7 +24,7 @@ Stable economies · Vanilla compatibility · Zero client installation · Minecra
   "applicationCategory": "GameModification",
   "operatingSystem": "Minecraft 26.1.x",
   "programmingLanguage": "Java 25",
-  "runtimePlatform": "Fabric Loader 0.19.2+",
+  "runtimePlatform": "Fabric Loader 0.19.4+",
   "license": "MIT",
   "description": "Server-side economy engine for Minecraft Fabric with virtual currency, GUI shop, auction house, and crash-resilient persistence. No client mods required.",
   "author": { "@type": "Person", "name": "MOHD-Gs15", "url": "https://github.com/MOHD-Gs15" },
@@ -43,12 +43,12 @@ Every transaction is persisted through crashes using async SQLite with WAL journ
 
 * **Fully server-side architecture** — works with any vanilla client, zero client installation
 * **Built-in virtual economy** with async persistence via SQLite (WAL mode, `CompletableFuture`-based)
-* **GUI-based server shop** — 11 categories, 120+ configured items, hot-reload pricing
-* **Player-driven auction house** — listing, expiration, reclaim, sorting, offline notifications
+* **GUI-based server shop** — 11 categories, 185 configured items, hot-reload pricing
+* **Player-driven auction house** — buy-now listings plus optional **bidding** with money escrow, anti-snipe protection, and self-healing refunds
+* **Direct player-to-player trade** (`/trade`) — a dual-preview window for items AND money that executes only when both players are ready
 * **Hot-reload configuration** — change prices, categories, and settings without restart
 * **Inter-mod API** (`SolidusAPI`) — reflection-based, zero compile-time dependency for third-party mods
 * **Crash-resilient data storage** — WAL journaling ensures no data loss on server crash
-* **Anti-farm economy protection** — configurable sell-price reductions for farmed resources
 * **Shulker box support** — all sell commands scan and process items inside shulker boxes
 
 ---
@@ -86,29 +86,46 @@ A lightweight virtual economy designed for multiplayer survival servers. All ope
 
 Virtual shop interface powered entirely by the server. Uses vanilla container packets — no client mod or resource pack needed. Players see a GUI with categorized items, buy with one click, and items appear directly in their inventory.
 
-* 11 categories with 120+ configured items
+* 11 categories with 185 configured items
 * Stack trading support — buy in bulk
 * Item search (`/shop search <query>`) — partial name matching
-* Hot-reload configuration — edit `shop.json` and reload without restart
+* Hot-reload configuration — edit `shop.json` and run `/shop reload` (OP 2+) without restart
 * Display-only GUI protection — no item movement exploits (server validates every click)
-* Per-item buy and sell pricing
-* Anti-farm sell-price reductions — configurable per material to counter automated farm inflation
+* Per-item buy and sell pricing — fully operator-controlled in `shop.json`
 
 ### Auction House (`/ah`)
 
-Marketplace for player-to-player trading. Players list items from their inventory, other players browse and buy. The server handles listing, expiration, refunds, and notifications — all server-side.
+Marketplace for player-to-player trading. Players list items from their inventory, other players browse, bid, or buy. The server handles listing, bidding, expiration, refunds, and notifications — all server-side.
 
 * Item listing directly from inventory (`/ah sell <price>`)
+* **Optional bidding** (`/ah sell <price> <startbid>`) — bid money is held in a system escrow account the moment a bid is placed, refunded instantly on outbid/cancel/buy-now, and released to the seller when the auction expires with a winner
+* **Anti-snipe protection** — a bid in the last 10 minutes extends the auction by 5 minutes (capped at 12 extensions)
+* Won items are delivered immediately if the winner is online, or wait in `/ah collect` if offline
 * Listing expiration with automatic item return to seller
-* Reclaim expired items (`/ah collect`)
-* Cancel own listings (`/ah cancel <uuid>`)
-* Sort listings by price, newest, or material (`/ah sort`)
+* Reclaim expired and won items (`/ah collect`)
+* Cancel own listings (`/ah cancel <uuid>`) — the top bidder is refunded automatically
+* Sort listings (`/ah sort <newest|price_low|price_high|material>`) and free-text search (`/ah search <term>`)
 * Listing fee support — configurable to add money sinks
 * Offline seller notifications — players see sold items when they log in
 
+See [docs/FEATURES_TRADE_BIDDING.md](docs/FEATURES_TRADE_BIDDING.md) for the full bidding reference.
+
+### Direct Trade (`/trade`)
+
+A mutual-preview trade window between two nearby players — items AND money on both sides — that executes only when **both** players press READY. This replaces the old `/pay`-then-drop-items flow that enabled half-payment scams.
+
+* `/trade <player>` sends a request (both players within 10 blocks, 30-second TTL, 5-second cooldown)
+* 54-slot window: your offer on the left 3 columns, your partner's live offer mirrored on the right
+* Offer items (real inventory interaction) and money (click the gold ingot, type the amount in chat)
+* Any change to either offer un-readies BOTH sides — a last-second bait-and-switch is impossible
+* Offered items are held by the session the moment they are placed; every cancel path (ESC, close, disconnect, idle timeout, `/trade cancel`) returns them to their owners
+* Money legs run through the same atomic transfer as `/pay`, so governance hooks and limits apply
+
+See [docs/FEATURES_TRADE_BIDDING.md](docs/FEATURES_TRADE_BIDDING.md) for the full trade reference.
+
 ### Sell System (`/sell`)
 
-Sell items directly from your inventory or through a visual GUI. Supports shulker box scanning, partial name matching, and configurable per-material pricing with anti-farm reductions.
+Sell items directly from your inventory or through a visual GUI. Supports shulker box scanning, partial name matching, and configurable per-material pricing.
 
 * **`/sell gui`** — Opens a virtual chest interface where you place items to sell. Sellable items are processed and paid for; unsellable items are returned to your inventory (or dropped on the ground if inventory is full).
 * **`/sell all`** — Instantly sells every sellable item in your inventory.
@@ -123,9 +140,9 @@ All sell commands fully support shulker boxes:
 * When using `/sell all` or `/sell all <item>`, matching items inside shulker boxes are sold as well. The shulker box is updated in place with only the remaining unsellable items.
 * If all items inside a shulker box are sold and the shulker box itself is sellable (listed in the shop), it will also be sold automatically.
 
-### Economy Protection
+### Economy Price Control
 
-Solidus applies sell-price reductions to farmed resources, configured directly in `shop.json` by the server operator. This gives you full control over economic balance — adjust prices to counter inflation from automated farms without needing to restart the server. When a player sells a farmable item (like iron from an iron farm), the sell price is automatically reduced by the configured percentage, keeping the economy balanced even on servers with large-scale redstone farms.
+There is no automatic "farm detection" or percentage-reduction mechanism in the code. Price control is fully manual and fully operator-owned: every material's buy and sell price is set explicitly per material in `shop.json` (keys `buy-price` / `sell-price`), and prices can be lowered on farmed resources at any time and applied live via `/shop reload`. Setting the sell price of iron ingots below the buy price — or to `null` to make an item unsellable — is the supported way to counter inflation from automated farms. Sell prices are charged/paid exactly as configured; the server applies no hidden multipliers.
 
 ### Inter-Mod API
 
@@ -153,7 +170,7 @@ A veto denial aborts the transaction cleanly — balances untouched, items stay 
 
 ### Installation
 
-> **Requirements:** Minecraft 26.1.x · Java 25 · Fabric Loader 0.19.2+ · Fabric API 0.149.0+
+> **Requirements:** Minecraft 26.1.x · Java 25 · Fabric Loader 0.19.4+ · Fabric API 0.155.2+
 
 1. Install [Fabric Loader](https://fabricmc.net/use/) on your server
 2. Install [Fabric API](https://modrinth.com/mod/fabric-api) on the server
@@ -209,7 +226,8 @@ All modules auto-detect Solidus Core via reflection and activate automatically. 
 | `/ah bid <uuid> <amount>` | Bid on a bidding-enabled listing (or right-click it in the GUI) |
 | `/ah collect` | Reclaim expired items **and won auction items** |
 | `/ah cancel <uuid>` | Cancel own listing (top bidder auto-refunded) |
-| `/ah sort <criteria>` | Sort listings (price/newest/material) |
+| `/ah sort <criteria>` | Sort listings (newest/price_low/price_high/material) |
+| `/ah search <term>` | Free-text search across active listings (cheapest first) |
 | `/trade <player>` | Request a direct trade with a nearby player |
 | `/trade accept` / `deny` | Respond to a pending trade request |
 | `/trade cancel` | Cancel the trade you are in |
@@ -238,9 +256,9 @@ Solidus generates configuration automatically on first run. All configuration su
 Supports:
 
 * Categories and per-item pricing (buy and sell prices per material)
-* Sell-price reductions for farmable items (anti-farm inflation protection)
+* Optional top-level economy keys: `startingBalance`, `currency`, `listingFee` (whole percent)
 * Text formatting and currency symbol customization
-* Hot reload without restart — edit `shop.json` and reload in-game
+* Hot reload without restart — edit `shop.json` and run `/shop reload` (OP 2+)
 
 ---
 
@@ -264,25 +282,66 @@ Supports:
 com.solidus/
 ├── SolidusMod.java              — Entry point, lifecycle, tick scheduler
 ├── api/
-│   └── SolidusAPI.java          — Public API (reflection-safe, thread-safe)
+│   ├── SolidusAPI.java          — Public API (reflection-safe, thread-safe)
+│   ├── SolidusTransactionHook.java — Veto + notification hook interface
+│   ├── EconomyHooks.java        — Hook registry & dispatch (fail-open)
+│   ├── SolidusIntegration.java  — Reference integration example
+│   ├── SolidusPermissions.java  — Permission node constants
+│   ├── PermissionChecker.java   — LuckPerms + OP-level checking
+│   └── PermissionConfig.java    — permissions.json loader/generator
 ├── economy/
-│   ├── EconomyManager.java      — Balance operations, transfers, leaderboard
-│   └── TransactionLogger.java   — Full transaction history with pagination
-├── shop/
-│   ├── ShopManager.java         — 11 categories, 120+ items, hot-reload
-│   └── ShopGUI.java             — Server-side GUI via vanilla container packets
+│   ├── EconomyEngine.java       — Lifecycle coordinator (storage + balances)
+│   ├── SQLiteStorage.java       — SQLite + WAL + single-thread executor + cache
+│   ├── BalanceManager.java      — Validated balance/transfer API
+│   ├── TransactionLog.java      — Ledger, CSV export, offline notifications
+│   └── EscrowAccount.java       — Bid-escrow system account (sentinel UUID)
 ├── auction/
-│   ├── AuctionHouse.java        — Listing, expiration, reclaim, sorting
-│   └── AuctionGUI.java          — Browse/search/buy interface
+│   ├── AuctionManager.java      — Listings, purchase, expiry, bidding, recovery
+│   ├── AuctionEntry.java        — Immutable listing record
+│   ├── ListingStatus.java       — ACTIVE/SOLD/EXPIRED enum
+│   ├── BidRules.java            — Pure bid validation + anti-snipe rules
+│   ├── BidState.java            — Per-listing bid state snapshot
+│   ├── AuctionGUI.java          — Browse/search/buy/bid interface
+│   ├── AuctionScreenHandler.java — Click routing (buy / bid prompt)
+│   └── AuctionDummyContainer.java — Display-only container
+├── trade/
+│   ├── TradeManager.java        — Requests, sessions, execution, reaping
+│   ├── TradeSession.java        — Player-agnostic session state machine
+│   ├── TradeContainer.java      — 54-slot session container (item escrow)
+│   ├── TradeGUI.java            — Window layout + display builders
+│   └── TradeScreenHandler.java  — Manual cursor movement + click safety
+├── chat/
+│   └── ChatPrompts.java         — "Type amount in chat" prompt service
+├── commands/
+│   ├── BalanceCommand.java      — /balance, /bal
+│   ├── PayCommand.java          — /pay, /pay offline
+│   ├── BaltopCommand.java       — /baltop
+│   ├── ShopCommand.java         — /shop, /shop search, /shop reload
+│   ├── SellCommand.java         — /sell gui, /sell all [item]
+│   ├── AuctionCommand.java      — /ah sell/bid/collect/cancel/sort/search
+│   ├── TradeCommand.java        — /trade <player>|accept|deny|cancel
+│   └── TransactionsCommand.java — /transactions, export, exportall
+├── shop/
+│   ├── ShopManager.java         — Config parsing + buy/sell transactions
+│   ├── ShopGUI.java             — Virtual chest builder (bordered layout)
+│   ├── ShopGUILayout.java       — Pure-Java centering layout engine
+│   ├── ShopScreenHandler.java   — Click rewriting handler
+│   └── ShopDummyContainer.java  — Display-only container
 ├── sell/
-│   ├── SellManager.java         — Per-material pricing, shulker box scanning
-│   └── SellGUI.java             — Visual sell interface
-├── storage/
-│   └── EconomyDatabase.java     — SQLite + WAL + single-thread executor
-├── config/
-│   └── ConfigManager.java       — Hot-reload JSON configuration
-└── integration/
-    └── ModuleBridge.java         — Reflection bridge for ecosystem modules
+│   ├── SellGUI.java             — Sell window builder
+│   ├── SellScreenHandler.java   — Full cursor item movement (825 lines)
+│   └── SellContainer.java       — Real container (stores player items)
+├── gui/
+│   └── DisplaySlot.java         — Display-only Slot (no place/pickup/set)
+├── mixin/
+│   └── ServerPlayerEntityMixin.java — Click packet interception + resync
+├── networking/
+│   ├── PacketHandler.java       — Click routing gateway + full resyncs
+│   └── RateLimiter.java         — 150ms click / 1s pay cooldowns
+└── util/
+    ├── ConfigManager.java       — File I/O, JSON loading, JAR resource copying
+    ├── CurrencyUtil.java        — Currency constants, formatting, validation
+    └── TextUtil.java            — Component utilities, material names
 ```
 
 ### Key Design Decisions
@@ -291,9 +350,9 @@ com.solidus/
 
 2. **Reflection-based API** — `SolidusAPI` exposes economy operations through `MethodHandle` reflection. Third-party mods call these methods without any compile-time dependency on Solidus. If Solidus is absent, calls return empty/default values rather than throwing `NoClassDefFoundError`.
 
-3. **Server-side GUI via vanilla packets** — Shop and auction interfaces use vanilla container/window packets. No custom client mod, no resource pack, no custom network channel. Works on any client — vanilla, Fabric, Forge (via protocol translation).
+3. **Server-side GUI via vanilla packets** — Shop, auction, sell, and trade interfaces use vanilla container/window packets. No custom client mod, no resource pack, no custom network channel. Works on any client — vanilla, Fabric, Forge (via protocol translation).
 
-4. **Hot-reload configuration** — `shop.json` is watched for changes. Operators can adjust prices, add categories, or modify items and reload without restarting the server. This enables live economy tuning in response to market conditions.
+4. **Hot-reload configuration** — Operators adjust prices, add categories, or modify items in `shop.json` and apply them live with `/shop reload` (OP 2+), without restarting the server. This enables live economy tuning in response to market conditions.
 
 ---
 
@@ -321,7 +380,7 @@ com.solidus/
 
 ### How does Solidus protect against inflation from automated farms?
 
-Solidus applies configurable sell-price reductions to farmable resources. Server operators set reduction percentages per material in `shop.json` — for example, reducing the sell price of iron ingots by 40% to counter iron farm output. This gives fine-grained control over economic balance without requiring a server restart.
+There is no automatic farm detection — price control is manual and operator-owned. Server operators set each material's buy and sell price explicitly in `shop.json` (and can lower the sell price of farmed items such as iron ingots, or make them unsellable entirely). Edits apply live via `/shop reload` without a restart, which is the supported way to counter farm-driven inflation.
 
 ### What happens to economy data if the server crashes?
 
