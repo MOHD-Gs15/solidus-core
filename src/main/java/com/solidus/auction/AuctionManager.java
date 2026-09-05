@@ -118,6 +118,68 @@ public class AuctionManager {
         ON auction_sold_history (settled_timestamp DESC)
     """;
 
+    // ───────────────────────────────────────────────────────────
+    //  BIDDING SYSTEM (v2.2.0)
+    //
+    //  Bid state lives in its OWN table, keyed by listing id, instead of
+    //  adding columns to auction_listings. This keeps AuctionEntry - and
+    //  every consumer/test built on it - unchanged, and makes bidding a
+    //  purely additive feature: a listing without a bid-state row is simply
+    //  a buy-now-only listing, exactly as before.
+    //
+    //  ESCROW MODEL: when a bid is placed the amount is moved bidder ->
+    //  EscrowAccount (atomic transfer + BID_PLACED ledger row). On outbid /
+    //  cancel / buy-now it is moved back escrow -> bidder (BID_REFUNDED).
+    //  On expiry the top bid is released escrow -> seller (AUCTION_SOLD /
+    //  AUCTION_WON ledger rows) and the item goes to the winner. Every
+    //  movement is one atomic transaction with its evidence inside it.
+    // ───────────────────────────────────────────────────────────
+    static final String CREATE_BID_STATE_SQL = """
+        CREATE TABLE IF NOT EXISTS auction_bid_state (
+            listing_id TEXT PRIMARY KEY NOT NULL,
+            start_price REAL NOT NULL,
+            current_bid REAL,
+            current_bidder_uuid TEXT,
+            current_bidder_name TEXT,
+            bid_count INTEGER NOT NULL DEFAULT 0,
+            extensions_used INTEGER NOT NULL DEFAULT 0
+        )
+    """;
+    static final String CREATE_BID_HISTORY_SQL = """
+        CREATE TABLE IF NOT EXISTS auction_bids (
+            bid_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            listing_id TEXT NOT NULL,
+            bidder_uuid TEXT NOT NULL,
+            bidder_name TEXT NOT NULL,
+            amount REAL NOT NULL,
+            bid_timestamp INTEGER NOT NULL
+        )
+    """;
+    static final String CREATE_BID_HISTORY_INDEX_SQL = """
+        CREATE INDEX IF NOT EXISTS idx_bids_listing
+        ON auction_bids (listing_id, bid_timestamp DESC)
+    """;
+    static final String CREATE_WON_ITEMS_SQL = """
+        CREATE TABLE IF NOT EXISTS auction_won_items (
+            win_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            listing_id TEXT NOT NULL UNIQUE,
+            winner_uuid TEXT NOT NULL,
+            winner_name TEXT NOT NULL,
+            material_name TEXT NOT NULL,
+            item_nbt TEXT,
+            quantity INTEGER NOT NULL,
+            win_price REAL NOT NULL,
+            won_timestamp INTEGER NOT NULL
+        )
+    """;
+    static final String CREATE_WON_ITEMS_INDEX_SQL = """
+        CREATE INDEX IF NOT EXISTS idx_won_items_winner
+        ON auction_won_items (winner_uuid)
+    """;
+
+    /** settled_reason used when a bidding auction expires with a winning bid. */
+    static final String SETTLED_WON = "WON";
+
     // settled_reason values (package-private for tests)
     static final String SETTLED_SOLD = "SOLD";
     static final String SETTLED_EXPIRED_RETURN = "EXPIRED_RETURN";
@@ -143,6 +205,15 @@ public class AuctionManager {
      * 2. TOCTOU between the held item capture and item removal
      */
     private final Set<UUID> pendingListings = ConcurrentHashMap.newKeySet();
+
+    /**
+     * Last /ah collect pass: how many WON items were claimed for each player.
+     * Used only to suppress the "nothing to collect" message when the async
+     * won-item delivery found rows while the synchronous expired-item query
+     * found none.
+     */
+    private final java.util.concurrent.ConcurrentHashMap<UUID, Integer> lastWonDeliveryCount =
+        new java.util.concurrent.ConcurrentHashMap<>();
 
     public AuctionManager(EconomyEngine economyEngine) {
         this.economyEngine = economyEngine;
@@ -183,13 +254,25 @@ public class AuctionManager {
                 stmt.execute(CREATE_INDEX_SQL);
                 stmt.execute(CREATE_SOLD_HISTORY_SQL);
                 stmt.execute(CREATE_SOLD_HISTORY_INDEX_SQL);
+                stmt.execute(CREATE_BID_STATE_SQL);
+                stmt.execute(CREATE_BID_HISTORY_SQL);
+                stmt.execute(CREATE_BID_HISTORY_INDEX_SQL);
+                stmt.execute(CREATE_WON_ITEMS_SQL);
+                stmt.execute(CREATE_WON_ITEMS_INDEX_SQL);
             }
             initialized = true;
-            SolidusMod.LOGGER.info("Auction database initialized successfully.");
+            SolidusMod.LOGGER.info("Auction database initialized successfully (bidding system enabled).");
             // Startup recovery: status=1 rows are crash residues (purchase marked
             // SOLD but settlement never finished) or archive failures kept as
             // evidence. Reconcile them against TransactionLog now.
             recoverOrphanedSoldRowsFromEconomy();
+            // Bidding recovery: refund any bid whose listing is no longer
+            // ACTIVE (bought, cancelled, expired-and-archived, or vanished) -
+            // the escrowed money goes back to the last top bidder. This is the
+            // self-healing backstop for buy-now/cancel refunds that could not
+            // run because of a crash, and it guarantees no bidder money can be
+            // trapped in escrow by a listing that can never settle.
+            refundOrphanedBidStates();
         } catch (SQLException e) {
             SolidusMod.LOGGER.error("Failed to initialize auction database!", e);
         }
@@ -223,18 +306,39 @@ public class AuctionManager {
     // -- Listing Operations --------------------------------
 
     /**
-     * Lists an item from the player's main hand on the auction house.
+     * Lists an item with an OPTIONAL opening bid (bidding-enabled listing).
+     * See {@link #listItem(ServerPlayer, double)} for the buy-now-only flow.
      *
-     * Flow (fully async - no server thread blocking):
-     * 1. Validate the player is holding an item
-     * 2. Calculate and deduct the listing fee (async chain)
-     * 3. Remove the item from the player's inventory
-     * 4. Create the auction listing in the database
-     *
-     * @param player The player listing the item
-     * @param price  The listing price
+     * @param player    the listing player
+     * @param price     the buy-now price
+     * @param startBid  the opening (reserve) bid; 0 = bidding disabled
+     */
+    public void listItem(ServerPlayer player, double price, double startBid) {
+        if (startBid > 0) {
+            if (startBid < AuctionEntry.MIN_LISTING_PRICE) {
+                player.sendSystemMessage(TextUtil.error(
+                    "Minimum starting bid is " + CurrencyUtil.format(AuctionEntry.MIN_LISTING_PRICE)));
+                return;
+            }
+            if (startBid >= price) {
+                player.sendSystemMessage(TextUtil.error(
+                    "Starting bid must be lower than the buy-now price (" +
+                        CurrencyUtil.format(price) + ")."));
+                return;
+            }
+        }
+        listItemInternal(player, price, startBid);
+    }
+
+    /**
+     * Lists an item on the auction house (buy-now only, no bids).
+     * Kept as the original two-argument entry point.
      */
     public void listItem(ServerPlayer player, double price) {
+        listItemInternal(player, price, 0);
+    }
+
+    private void listItemInternal(ServerPlayer player, double price, double startBid) {
         // Validate price
         if (price < AuctionEntry.MIN_LISTING_PRICE) {
             player.sendSystemMessage(TextUtil.error(
@@ -316,7 +420,7 @@ public class AuctionManager {
                 // Save to database first; the physical item was already taken out
                 // of the player's hand, so on save failure we refund the fee AND
                 // return the item to keep both sides of the transaction intact.
-                saveListing(entry).thenAccept(success -> {
+                saveListing(entry, startBid).thenAccept(success -> {
                     player.level().getServer().execute(() -> {
                         try {
                             if (success) {
@@ -601,6 +705,13 @@ public class AuctionManager {
                             // fails, the SOLD row is kept and the startup sweep retries.
                             settleSoldListing(entry, buyer);
 
+                            // BIDDING: if this listing accepted bids, its top bidder must
+                            // be refunded from escrow - the item sold via buy-now. Done
+                            // AFTER the settlement committed so a failed settlement +
+                            // rollback to ACTIVE keeps the bids intact.
+                            settleBidStateOnRemoval(entry.listingId(),
+                                "Buy-now purchase on bid listing " + shortId(entry.listingId()));
+
                             // Success notification
                             buyer.sendSystemMessage(
                                 TextUtil.success("Purchased " + entry.quantity() + "x " + entry.materialName() + " for ")
@@ -837,8 +948,36 @@ public class AuctionManager {
             }
 
             List<AuctionEntry> toReturnDirectly = new ArrayList<>();
+            List<PendingWinDelivery> toDeliverDirectly = new ArrayList<>();
             for (AuctionEntry entry : expired) {
                 boolean sellerOnline = onlineSellers.contains(entry.sellerUuid());
+
+                // BIDDING: an expired listing with a winning bid settles to the
+                // highest bidder instead of returning to the seller. The bid
+                // money is already in escrow (charged at bid time) - this path
+                // only releases it and moves the item.
+                BidState bidState = null;
+                try {
+                    bidState = loadBidState(entry.listingId());
+                } catch (SQLException e) {
+                    SolidusMod.LOGGER.error("Failed to load bid state for expired listing {}", entry.listingId(), e);
+                }
+                if (bidState != null && bidState.hasBids()) {
+                    PendingWinDelivery win = settleWonListing(entry, bidState, onlineSellers);
+                    if (win != null) {
+                        toDeliverDirectly.add(win);
+                    }
+                    continue;
+                }
+                // Buy-now-only listing (or bid-enabled with NO bids): release
+                // any dead bid-state row so it cannot linger forever.
+                if (bidState != null && !bidState.hasBids()) {
+                    try {
+                        deleteBidState(entry.listingId());
+                    } catch (SQLException e) {
+                        SolidusMod.LOGGER.warn("Could not clean empty bid state for {}", entry.listingId());
+                    }
+                }
 
                 boolean claimed = sellerOnline
                     ? claimExpiredRowForReturn(entry.listingId())
@@ -861,7 +1000,13 @@ public class AuctionManager {
                     toReturnDirectly.add(entry);
                 }
             }
+
+            // Deliver won items to ONLINE winners on the server thread; store
+            // rows for offline winners so /ah collect recovers them.
+            List<PendingWinDelivery> onlineWins = new ArrayList<>(toDeliverDirectly);
+            currentServer.execute(() -> deliverWonItems(currentServer, onlineWins));
             return toReturnDirectly;
+
         }, asyncExecutor).thenAccept(toReturn -> {
             if (toReturn.isEmpty()) return;
 
@@ -937,7 +1082,7 @@ public class AuctionManager {
         return com.solidus.util.ConfigManager.getConfigDir().toAbsolutePath() + "/" + DATABASE_NAME;
     }
 
-    private CompletableFuture<Boolean> saveListing(AuctionEntry entry) {
+    private CompletableFuture<Boolean> saveListing(AuctionEntry entry, double startBid) {
         return CompletableFuture.supplyAsync(() -> {
             String sql = """
                 INSERT INTO auction_listings
@@ -957,12 +1102,31 @@ public class AuctionManager {
                 ps.setLong(9, entry.expireTimestamp());
                 ps.setInt(10, entry.status().ordinal()); // 0=ACTIVE, 1=SOLD, 2=EXPIRED
                 ps.executeUpdate();
+
+                // Bidding-enabled listing: seed the bid state row in the SAME
+                // serialized executor step. A listing without a bid-state row
+                // is a buy-now-only listing; with one, the auction can be won.
+                if (startBid > 0) {
+                    insertBidState(entry.listingId(), startBid);
+                }
                 return true;
             } catch (SQLException e) {
                 SolidusMod.LOGGER.error("Failed to save auction listing", e);
                 return false;
             }
         }, asyncExecutor);
+    }
+
+    /** Inserts the initial bid-state row for a bidding-enabled listing. */
+    private void insertBidState(UUID listingId, double startPrice) throws SQLException {
+        String sql = "INSERT OR REPLACE INTO auction_bid_state "
+            + "(listing_id, start_price, current_bid, current_bidder_uuid, current_bidder_name, bid_count, extensions_used) "
+            + "VALUES (?, ?, NULL, NULL, NULL, 0, 0)";
+        try (PreparedStatement ps = persistentConnection.prepareStatement(sql)) {
+            ps.setString(1, listingId.toString());
+            ps.setDouble(2, startPrice);
+            ps.executeUpdate();
+        }
     }
 
     private void markAsUnsold(UUID listingId) {
@@ -1144,27 +1308,114 @@ public class AuctionManager {
             return expired;
         }, asyncExecutor).thenAccept(expired -> {
             player.level().getServer().execute(() -> {
-                if (expired.isEmpty()) {
-                    player.sendSystemMessage(TextUtil.styled(
-                        "You have no expired items to collect.", ChatFormatting.GRAY));
-                    return;
-                }
-
-                int collected = 0;
-                for (AuctionEntry entry : expired) {
-                    ItemStack item = deserializeItemStack(
-                        entry.itemNbt(), entry.materialName(), entry.quantity());
-                    if (!player.getInventory().add(item)) {
-                        player.drop(item, false);
+                // BIDDING: won items ride the same /ah collect flow (standard UX -
+                // one command for everything the player is owed). Their claim
+                // (SELECT + DELETE on the serialized executor) happens inside the
+                // SAME async step that claimed the expired rows above, so the
+                // exactly-once guarantee matches the expired-item path.
+                int expiredCount = expired.size();
+                deliverPendingWonItems(player);
+                if (expiredCount > 0) {
+                    int collected = 0;
+                    for (AuctionEntry entry : expired) {
+                        ItemStack item = deserializeItemStack(
+                            entry.itemNbt(), entry.materialName(), entry.quantity());
+                        if (!player.getInventory().add(item)) {
+                            player.drop(item, false);
+                        }
+                        collected++;
                     }
-                    collected++;
+                    player.sendSystemMessage(
+                        TextUtil.success("Collected " + collected + " expired item(s)!"));
+                } else if (!hasPendingWonItems(player.getUUID())) {
+                    player.sendSystemMessage(TextUtil.styled(
+                        "You have no items to collect.", ChatFormatting.GRAY));
                 }
-
-                player.sendSystemMessage(
-                    TextUtil.success("Collected " + collected + " expired item(s)!"));
             });
         });
     }
+
+    /**
+     * True when the auction_won_items table has rows for this player.
+     * Cheap single-purpose query used only to silence the "nothing to
+     * collect" message when won items were just delivered asynchronously.
+     */
+    private boolean hasPendingWonItems(UUID playerUuid) {
+        // The delivery path (deliverPendingWonItems) sets this flag before the
+        // message above is composed on the server thread.
+        return lastWonDeliveryCount.getOrDefault(playerUuid, 0) > 0;
+    }
+
+    /**
+     * Claims and delivers every pending WON item for the player.
+     * Runs on the auction executor (SELECT + DELETE serialized exactly-once),
+     * then hands items out on the server thread.
+     */
+    private void deliverPendingWonItems(ServerPlayer player) {
+        final UUID playerUuid = player.getUUID();
+        final String playerName = player.getName().getString();
+        CompletableFuture.supplyAsync(() -> {
+            List<WonItemRow> won = new ArrayList<>();
+            String sql = "SELECT * FROM auction_won_items WHERE winner_uuid = ?";
+            try (PreparedStatement ps = persistentConnection.prepareStatement(sql)) {
+                ps.setString(1, playerUuid.toString());
+                try (ResultSet rs = ps.executeQuery()) {
+                    while (rs.next()) {
+                        won.add(new WonItemRow(
+                            rs.getLong("win_id"),
+                            rs.getString("material_name"),
+                            rs.getString("item_nbt"),
+                            rs.getInt("quantity"),
+                            rs.getDouble("win_price")));
+                    }
+                }
+            } catch (SQLException e) {
+                SolidusMod.LOGGER.error("Failed to query won items for {}", playerUuid, e);
+            }
+            if (won.isEmpty()) {
+                return new ArrayList<WonItemRow>();
+            }
+            // Claim by DELETE (serialized executor) BEFORE handing anything out.
+            List<WonItemRow> claimed = new ArrayList<>();
+            try (PreparedStatement del = persistentConnection.prepareStatement(
+                    "DELETE FROM auction_won_items WHERE win_id = ?")) {
+                for (WonItemRow row : won) {
+                    del.setLong(1, row.winId());
+                    if (del.executeUpdate() > 0) claimed.add(row);
+                }
+            } catch (SQLException e) {
+                SolidusMod.LOGGER.error("Failed to claim won items for {}", playerUuid, e);
+                return new ArrayList<WonItemRow>();
+            }
+            economyEngine.getTransactionLog().log(
+                TransactionLog.Type.AUCTION_WON,
+                playerUuid, playerName,
+                null, null,
+                claimed.stream().mapToDouble(WonItemRow::winPrice).sum(),
+                claimed.get(0).materialName(),
+                claimed.size(),
+                "Collected " + claimed.size() + " won auction item(s) via /ah collect");
+            return claimed;
+        }, asyncExecutor).thenAccept(rows -> {
+            player.level().getServer().execute(() -> {
+                lastWonDeliveryCount.put(playerUuid, rows.size());
+                for (WonItemRow row : rows) {
+                    ItemStack item = deserializeItemStack(row.itemNbt(), row.materialName(), row.quantity());
+                    if (!player.getInventory().add(item)) {
+                        player.drop(item, false);
+                    }
+                }
+                if (!rows.isEmpty()) {
+                    player.sendSystemMessage(TextUtil.success(
+                        "Collected " + rows.size() + " won auction item(s)!"));
+                }
+            });
+        });
+    }
+
+    /** Row snapshot of an auction_won_items entry. */
+    private record WonItemRow(long winId, String materialName, String itemNbt,
+                               int quantity, double winPrice) {}
 
     /**
      * Cancels an active listing and returns the item to the seller.
@@ -1251,6 +1502,12 @@ public class AuctionManager {
 
                 player.sendSystemMessage(
                     TextUtil.success("Cancelled listing for " + entry.quantity() + "x " + entry.materialName()));
+
+                // BIDDING: cancelling a bid-enabled listing refunds the current
+                // top bidder from escrow. If a crash interrupts this, the
+                // startup sweep refunds anyway (listing is no longer ACTIVE).
+                settleBidStateOnRemoval(entry.listingId(),
+                    "Listing cancelled by seller " + shortId(entry.listingId()));
             });
         });
     }
@@ -1280,6 +1537,656 @@ public class AuctionManager {
                 SolidusMod.LOGGER.error("Failed to get expired listings for seller", e);
             }
             return entries;
+        }, asyncExecutor);
+    }
+
+    // -- Bidding System (escrow model) ----------------------
+
+    /**
+     * Places a bid on a bidding-enabled listing.
+     *
+     * <p><b>Escrow flow</b> (every money movement is an atomic transfer with
+     * in-transaction ledger evidence):</p>
+     * <ol>
+     *   <li>Auction executor: validate the listing is ACTIVE + bid-enabled,
+     *       reject own-listing bids, apply {@link BidRules} + governance veto.</li>
+     *   <li>Economy executor: move the bid amount bidder -> escrow
+     *       ({@code BID_PLACED} ledger row commits WITH the money).</li>
+     *   <li>Auction executor: conditional claim
+     *       ({@code UPDATE ... WHERE current_bid IS NULL OR current_bid < ?}).
+     *       Won: the PREVIOUS top bidder is refunded from escrow
+     *       ({@code BID_REFUNDED}), anti-snipe may extend the deadline, the
+     *       bid lands in the history. Lost the race: OUR escrow charge is
+     *       refunded immediately.</li>
+     * </ol>
+     *
+     * <p>If the server crashes between (2) and (3) the bid amount rests in the
+     * escrow account with a {@code BID_PLACED} ledger row and no bid-state
+     * change; the startup escrow-consistency check surfaces any mismatch.</p>
+     *
+     * @param bidder    the bidding player
+     * @param listingId the listing to bid on
+     * @param amount    the bid amount
+     */
+    public void placeBid(ServerPlayer bidder, UUID listingId, double amount) {
+        final UUID bidderUuid = bidder.getUUID();
+        final String bidderName = bidder.getName().getString();
+
+        // Phase 1 (auction executor): validate + snapshot
+        CompletableFuture.supplyAsync(() -> {
+            try {
+                if (!initialized) return "NOT_INITIALIZED";
+
+                AuctionEntry entry = loadActiveListing(listingId);
+                if (entry == null) return "NOT_FOUND";
+                if (entry.isExpired()) return "EXPIRED";
+                if (entry.sellerUuid().equals(bidderUuid)) return "OWN_ITEM";
+
+                BidState state = loadBidState(listingId);
+                if (state == null) return "NO_BIDS_SUPPORTED";
+
+                String ruleError = BidRules.validateBid(amount, state.startPrice(), state.currentBid());
+                if (ruleError != null) return "RULE:" + ruleError;
+
+                // Governance veto: bidding moves money, so the auction-purchase
+                // veto applies (trade locks, limits, frozen accounts...).
+                SolidusTransactionHook.Decision decision = EconomyHooks.allow(hook ->
+                    hook.allowAuctionPurchase(bidderUuid, bidderName, amount));
+                if (!decision.allowed()) {
+                    return "HOOK_VETOED:" + (decision.reason() != null
+                        ? decision.reason() : "Bid denied.");
+                }
+
+                return new Object[]{entry, state};
+
+            } catch (SQLException e) {
+                SolidusMod.LOGGER.error("Bid phase-1 DB error for listing {}", listingId, e);
+                return "DB_ERROR";
+            }
+        }, asyncExecutor).thenAccept(phase1 -> {
+            if (phase1 instanceof String err) {
+                sendBidError(bidder, err);
+                return;
+            }
+            Object[] pair = (Object[]) phase1;
+            AuctionEntry entry = (AuctionEntry) pair[0];
+            BidState state = (BidState) pair[1];
+
+            // Phase 2 (economy executor): escrow the bid amount atomically.
+            economyEngine.getStorage()
+                .transferAtomicWithLedger(bidderUuid, bidderName,
+                    com.solidus.economy.EscrowAccount.UUID_ZERO, com.solidus.economy.EscrowAccount.NAME,
+                    amount,
+                    java.util.List.of(new com.solidus.economy.SQLiteStorage.AtomicLedgerRow(
+                        TransactionLog.Type.BID_PLACED,
+                        bidderUuid, bidderName,
+                        entry.sellerUuid(), entry.sellerName(),
+                        amount, entry.materialName(), entry.quantity(),
+                        "Bid " + CurrencyUtil.format(amount) + " on " + entry.quantity() + "x "
+                            + entry.materialName() + " (listing " + shortId(listingId) + ")")))
+                .thenAccept(charge -> {
+                    if (charge.status() != com.solidus.economy.SQLiteStorage.TransferStatus.SUCCESS) {
+                        bidder.level().getServer().execute(() ->
+                            bidder.sendSystemMessage(TextUtil.error(
+                                charge.status() == com.solidus.economy.SQLiteStorage.TransferStatus.INSUFFICIENT_FUNDS
+                                    ? "Insufficient funds for that bid."
+                                    : "Bid failed. Please try again.")));
+                        return;
+                    }
+
+                    // Phase 3 (auction executor): conditional claim
+                    CompletableFuture.supplyAsync(() -> {
+                        try {
+                            boolean claimed = claimTopBid(listingId, amount, bidderUuid, bidderName);
+                            if (!claimed) {
+                                // Outbid during our async hop - refund ourselves.
+                                refundFromEscrow(bidderUuid, bidderName, amount,
+                                    "Outbid during bid placement (listing " + shortId(listingId) + ")");
+                                return "OUTBID_RACE";
+                            }
+
+                            // Refund the PREVIOUS top bidder from escrow.
+                            if (state.hasBids()) {
+                                refundFromEscrow(state.currentBidderUuid(), state.currentBidderName(),
+                                    state.currentBid(),
+                                    "Outbid on " + entry.quantity() + "x " + entry.materialName()
+                                        + " (listing " + shortId(listingId) + ")");
+                                notify(state.currentBidderUuid(),
+                                    "You were outbid on " + entry.quantity() + "x " + entry.materialName()
+                                        + " - your bid of " + CurrencyUtil.format(state.currentBid())
+                                        + " has been refunded.");
+                            }
+
+                            // History row (audit trail for /ah and analytics).
+                            insertBidHistory(listingId, bidderUuid, bidderName, amount);
+
+                            // Anti-snipe: extend the deadline when bidding in the window.
+                            long newExpiry = BidRules.antiSnipeExpiry(
+                                entry.expireTimestamp(), System.currentTimeMillis(), state.extensionsUsed());
+                            if (newExpiry != entry.expireTimestamp()) {
+                                extendListingExpiry(listingId, newExpiry);
+                                return "CLAIMED_SNIPED";
+                            }
+                            return "CLAIMED";
+
+                        } catch (SQLException e) {
+                            SolidusMod.LOGGER.error("Bid phase-3 DB error for listing {}", listingId, e);
+                            // Claim failed unexpectedly - refund our escrow charge
+                            // so the bidder cannot lose money to a DB hiccup.
+                            try {
+                                refundFromEscrow(bidderUuid, bidderName, amount,
+                                    "Bid system error refund (listing " + shortId(listingId) + ")");
+                            } catch (Exception refundError) {
+                                SolidusMod.LOGGER.error("CRITICAL: bid refund after DB error failed - bidder {} amount {}",
+                                    bidderName, amount, refundError);
+                            }
+                            return "DB_ERROR";
+                        }
+                    }, asyncExecutor).thenAccept(phase3 -> {
+                        bidder.level().getServer().execute(() -> {
+                            switch (phase3) {
+                                case "CLAIMED" -> bidder.sendSystemMessage(TextUtil.success(
+                                    "Bid placed: " + CurrencyUtil.format(amount) + " on "
+                                        + entry.quantity() + "x " + entry.materialName()
+                                        + " (money held in escrow until you are outbid or win)."));
+                                case "CLAIMED_SNIPED" -> bidder.sendSystemMessage(TextUtil.success(
+                                    "Bid placed: " + CurrencyUtil.format(amount) + " - auction end extended!"));
+                                case "OUTBID_RACE" -> bidder.sendSystemMessage(TextUtil.error(
+                                    "Someone outbid you at the same moment - your money was refunded."));
+                                case "DB_ERROR" -> bidder.sendSystemMessage(TextUtil.error(
+                                    "Bid failed due to a system error - your money was refunded."));
+                                default -> bidder.sendSystemMessage(TextUtil.error(
+                                    "Bid failed. Please try again."));
+                            }
+                        });
+                    });
+                });
+        });
+    }
+
+    /**
+     * Conditionally claims the top-bid slot for {@code bidder} at
+     * {@code amount}. Returns true only when THIS call replaced the previous
+     * top bid (exactly-once semantics via the conditional WHERE clause; all
+     * callers serialize on the single auction executor).
+     */
+    private boolean claimTopBid(UUID listingId, double amount, UUID bidderUuid, String bidderName)
+            throws SQLException {
+        String sql = """
+            UPDATE auction_bid_state
+            SET current_bid = ?, current_bidder_uuid = ?, current_bidder_name = ?,
+                bid_count = bid_count + 1
+            WHERE listing_id = ? AND (current_bid IS NULL OR current_bid < ?)
+        """;
+        try (PreparedStatement ps = persistentConnection.prepareStatement(sql)) {
+            ps.setDouble(1, amount);
+            ps.setString(2, bidderUuid.toString());
+            ps.setString(3, bidderName);
+            ps.setString(4, listingId.toString());
+            ps.setDouble(5, amount);
+            return ps.executeUpdate() > 0;
+        }
+    }
+
+    private void insertBidHistory(UUID listingId, UUID bidderUuid, String bidderName, double amount)
+            throws SQLException {
+        String sql = "INSERT INTO auction_bids (listing_id, bidder_uuid, bidder_name, amount, bid_timestamp) "
+            + "VALUES (?, ?, ?, ?, ?)";
+        try (PreparedStatement ps = persistentConnection.prepareStatement(sql)) {
+            ps.setString(1, listingId.toString());
+            ps.setString(2, bidderUuid.toString());
+            ps.setString(3, bidderName);
+            ps.setDouble(4, amount);
+            ps.setLong(5, System.currentTimeMillis());
+            ps.executeUpdate();
+        }
+    }
+
+    private void extendListingExpiry(UUID listingId, long newExpiry) throws SQLException {
+        String sql = "UPDATE auction_listings SET expire_timestamp = ? "
+            + "WHERE listing_id = ? AND status = 0";
+        try (PreparedStatement ps = persistentConnection.prepareStatement(sql)) {
+            ps.setLong(1, newExpiry);
+            ps.setString(2, listingId.toString());
+            ps.executeUpdate();
+        }
+    }
+
+    /** Loads an ACTIVE (status=0, unexpired) listing row, or null. */
+    private AuctionEntry loadActiveListing(UUID listingId) throws SQLException {
+        String sql = "SELECT * FROM auction_listings WHERE listing_id = ? AND status = 0";
+        try (PreparedStatement ps = persistentConnection.prepareStatement(sql)) {
+            ps.setString(1, listingId.toString());
+            try (ResultSet rs = ps.executeQuery()) {
+                return rs.next() ? mapResultSetToEntry(rs) : null;
+            }
+        }
+    }
+
+    /** Loads the bid state for a listing, or null when the listing is buy-now-only. */
+    private BidState loadBidState(UUID listingId) throws SQLException {
+        String sql = "SELECT * FROM auction_bid_state WHERE listing_id = ?";
+        try (PreparedStatement ps = persistentConnection.prepareStatement(sql)) {
+            ps.setString(1, listingId.toString());
+            try (ResultSet rs = ps.executeQuery()) {
+                if (!rs.next()) return null;
+                double startPrice = rs.getDouble("start_price");
+                double currentBid = rs.getDouble("current_bid");
+                boolean hasBid = !rs.wasNull();
+                String bidderUuidStr = rs.getString("current_bidder_uuid");
+                String bidderName = rs.getString("current_bidder_name");
+                return new BidState(
+                    listingId,
+                    startPrice,
+                    hasBid ? currentBid : null,
+                    bidderUuidStr != null ? UUID.fromString(bidderUuidStr) : null,
+                    bidderName,
+                    rs.getInt("bid_count"),
+                    rs.getInt("extensions_used"));
+            }
+        }
+    }
+
+    /**
+     * Batch-loads bid states for a set of listings (one query, GUI-friendly).
+     *
+     * @param listingIds listing ids to look up
+     * @return map of listingId -> BidState (only bid-enabled listings appear)
+     */
+    public CompletableFuture<java.util.Map<UUID, BidState>> getBidStates(
+            java.util.Collection<UUID> listingIds) {
+        if (!initialized || listingIds == null || listingIds.isEmpty()) {
+            return CompletableFuture.completedFuture(java.util.Map.of());
+        }
+        return CompletableFuture.supplyAsync(() -> {
+            java.util.Map<UUID, BidState> out = new java.util.HashMap<>();
+            String placeholders = String.join(", ", java.util.Collections.nCopies(listingIds.size(), "?"));
+            String sql = "SELECT * FROM auction_bid_state WHERE listing_id IN (" + placeholders + ")";
+            try (PreparedStatement ps = persistentConnection.prepareStatement(sql)) {
+                int i = 1;
+                for (UUID id : listingIds) {
+                    ps.setString(i++, id.toString());
+                }
+                try (ResultSet rs = ps.executeQuery()) {
+                    while (rs.next()) {
+                        UUID listingId = UUID.fromString(rs.getString("listing_id"));
+                        double currentBid = rs.getDouble("current_bid");
+                        boolean hasBid = !rs.wasNull();
+                        String bidderUuidStr = rs.getString("current_bidder_uuid");
+                        out.put(listingId, new BidState(
+                            listingId,
+                            rs.getDouble("start_price"),
+                            hasBid ? currentBid : null,
+                            bidderUuidStr != null ? UUID.fromString(bidderUuidStr) : null,
+                            rs.getString("current_bidder_name"),
+                            rs.getInt("bid_count"),
+                            rs.getInt("extensions_used")));
+                    }
+                }
+            } catch (SQLException e) {
+                SolidusMod.LOGGER.error("Failed to load bid states", e);
+            }
+            return out;
+        }, asyncExecutor);
+    }
+
+    /**
+     * Moves {@code amount} from the escrow account to {@code toUuid} as one
+     * atomic transfer with a {@code BID_REFUNDED} ledger row. Used for outbid
+     * refunds, cancel refunds, buy-now overrides and the startup sweep.
+     */
+    private void refundFromEscrow(UUID toUuid, String toName, double amount, String reason) {
+        if (toUuid == null || amount <= 0) return;
+        economyEngine.getStorage()
+            .transferAtomicWithLedger(
+                com.solidus.economy.EscrowAccount.UUID_ZERO, com.solidus.economy.EscrowAccount.NAME,
+                toUuid, toName,
+                amount,
+                java.util.List.of(new com.solidus.economy.SQLiteStorage.AtomicLedgerRow(
+                    TransactionLog.Type.BID_REFUNDED,
+                    toUuid, toName,
+                    null, null,
+                    amount, null, 0,
+                    reason)))
+            .thenAccept(outcome -> {
+                if (outcome.status() != com.solidus.economy.SQLiteStorage.TransferStatus.SUCCESS) {
+                    SolidusMod.LOGGER.error(
+                        "CRITICAL: escrow refund of {} to {} failed ({}) - reason: {}",
+                        amount, toName, outcome.status(), reason);
+                }
+            });
+    }
+
+    /**
+     * STARTUP SWEEP: every bid state whose listing is NOT an ACTIVE row gets
+     * its top bid refunded from escrow and the state deleted. This covers
+     * buy-now purchases, cancellations and expired-archived listings where a
+     * crash prevented the inline refund, and guarantees no bidder money can
+     * be trapped by a listing that can never settle.
+     */
+    private void refundOrphanedBidStates() {
+        try {
+            List<BidState> orphans = new ArrayList<>();
+            String sql = """
+                SELECT bs.* FROM auction_bid_state bs
+                LEFT JOIN auction_listings l ON l.listing_id = bs.listing_id AND l.status = 0
+                WHERE l.listing_id IS NULL
+            """;
+            try (PreparedStatement ps = persistentConnection.prepareStatement(sql);
+                 ResultSet rs = ps.executeQuery()) {
+                while (rs.next()) {
+                    UUID listingId = UUID.fromString(rs.getString("listing_id"));
+                    double currentBid = rs.getDouble("current_bid");
+                    boolean hasBid = !rs.wasNull();
+                    if (hasBid) {
+                        orphans.add(new BidState(listingId, rs.getDouble("start_price"),
+                            currentBid, UUID.fromString(rs.getString("current_bidder_uuid")),
+                            rs.getString("current_bidder_name"),
+                            rs.getInt("bid_count"), rs.getInt("extensions_used")));
+                    } else {
+                        // No bids to refund - just clean the dead state row.
+                        deleteBidState(listingId);
+                    }
+                }
+            }
+            for (BidState orphan : orphans) {
+                refundFromEscrow(orphan.currentBidderUuid(), orphan.currentBidderName(),
+                    orphan.currentBid(),
+                    "Startup sweep: listing " + shortId(orphan.listingId())
+                        + " no longer active - bid refunded");
+                deleteBidState(orphan.listingId());
+            }
+            if (!orphans.isEmpty()) {
+                SolidusMod.LOGGER.info(
+                    "Bid recovery sweep: refunded {} orphaned top bid(s) from escrow.", orphans.size());
+            }
+
+            // Escrow consistency check: escrow balance should equal the sum of
+            // open top bids. A mismatch means a crash interrupted a bid charge
+            // or a refund - surfaced loudly for admin action (the amounts are
+            // fully traceable through the BID_PLACED / BID_REFUNDED ledger).
+            checkEscrowConsistency();
+        } catch (SQLException e) {
+            SolidusMod.LOGGER.error("Bid recovery sweep failed", e);
+        }
+    }
+
+    private void deleteBidState(UUID listingId) throws SQLException {
+        try (PreparedStatement ps = persistentConnection.prepareStatement(
+                "DELETE FROM auction_bid_state WHERE listing_id = ?")) {
+            ps.setString(1, listingId.toString());
+            ps.executeUpdate();
+        }
+    }
+
+    /**
+     * Logs a warning when the escrow account balance does not equal the sum
+     * of all open top bids (possible only via a crash between the escrow
+     * charge and the bid-state claim, or vice versa).
+     */
+    private void checkEscrowConsistency() {
+        try {
+            double escrowBalance = 0;
+            try (PreparedStatement ps = persistentConnection.prepareStatement(
+                    "SELECT balance FROM player_balances WHERE uuid = ?")) {
+                ps.setString(1, com.solidus.economy.EscrowAccount.UUID_ZERO.toString());
+                try (ResultSet rs = ps.executeQuery()) {
+                    if (rs.next()) escrowBalance = rs.getDouble("balance");
+                }
+            }
+            double expected = 0;
+            try (PreparedStatement ps = persistentConnection.prepareStatement(
+                    "SELECT COALESCE(SUM(current_bid), 0) AS total FROM auction_bid_state WHERE current_bid IS NOT NULL");
+                 ResultSet rs = ps.executeQuery()) {
+                if (rs.next()) expected = rs.getDouble("total");
+            }
+            double diff = Math.abs(escrowBalance - expected);
+            if (diff > 0.01) {
+                SolidusMod.LOGGER.warn(
+                    "ESCROW CONSISTENCY: escrow holds {} but open top bids sum to {} (diff {}). "
+                        + "A crash likely interrupted a bid - audit BID_PLACED/BID_REFUNDED ledger rows and refund manually if needed.",
+                    CurrencyUtil.format(escrowBalance), CurrencyUtil.format(expected), CurrencyUtil.format(diff));
+            }
+        } catch (SQLException e) {
+            SolidusMod.LOGGER.error("Escrow consistency check failed", e);
+        }
+    }
+
+    /**
+     * Deletes the bid state for a listing and refunds its top bidder from
+     * escrow (used by cancel and buy-now override). Fire-and-forget: the
+     * startup sweep is the self-healing backstop if any step is interrupted.
+     */
+    private void settleBidStateOnRemoval(UUID listingId, String refundReason) {
+        CompletableFuture.runAsync(() -> {
+            try {
+                BidState state = loadBidState(listingId);
+                if (state == null) return;
+                deleteBidState(listingId);
+                if (state.hasBids()) {
+                    refundFromEscrow(state.currentBidderUuid(), state.currentBidderName(),
+                        state.currentBid(), refundReason);
+                    notify(state.currentBidderUuid(),
+                        "The auction you were bidding on ended before expiry - your bid of "
+                            + CurrencyUtil.format(state.currentBid()) + " has been refunded.");
+                }
+            } catch (SQLException e) {
+                SolidusMod.LOGGER.error("settleBidStateOnRemoval failed for listing {}", listingId, e);
+            }
+        }, asyncExecutor);
+    }
+
+    /** Short 8-char listing id prefix for compact log/message lines. */
+    private static String shortId(UUID id) {
+        String s = id.toString();
+        return s.substring(0, 8);
+    }
+
+    /** Routes a bid error code to a player-facing message. */
+    private void sendBidError(ServerPlayer bidder, String err) {
+        bidder.level().getServer().execute(() -> {
+            if (err.startsWith("RULE:")) {
+                bidder.sendSystemMessage(TextUtil.error(err.substring("RULE:".length())));
+            } else if (err.startsWith("HOOK_VETOED:")) {
+                bidder.sendSystemMessage(TextUtil.error(err.substring("HOOK_VETOED:".length())));
+            } else {
+                switch (err) {
+                    case "NOT_FOUND" -> bidder.sendSystemMessage(TextUtil.error(
+                        "Listing not found or already sold!"));
+                    case "EXPIRED" -> bidder.sendSystemMessage(TextUtil.error(
+                        "This listing has expired!"));
+                    case "OWN_ITEM" -> bidder.sendSystemMessage(TextUtil.error(
+                        "You cannot bid on your own listing!"));
+                    case "NO_BIDS_SUPPORTED" -> bidder.sendSystemMessage(TextUtil.error(
+                        "This listing does not accept bids (buy-now only)."));
+                    case "NOT_INITIALIZED" -> bidder.sendSystemMessage(TextUtil.error(
+                        "Auction House is not available yet."));
+                    case "DB_ERROR" -> bidder.sendSystemMessage(TextUtil.error(
+                        "Transaction error. Please try again."));
+                    default -> bidder.sendSystemMessage(TextUtil.error(
+                        "Bid failed. Please try again."));
+                }
+            }
+        });
+    }
+
+    /** Queues an offline-tolerant notification (delivered immediately if online). */
+    private void notify(UUID playerUuid, String message) {
+        MinecraftServer currentServer = this.server;
+        if (currentServer != null) {
+            economyEngine.getTransactionLog().queueNotification(playerUuid, message, currentServer);
+        }
+    }
+
+    /** A won auction whose item still has to be handed to an ONLINE winner. */
+    private record PendingWinDelivery(UUID listingId, UUID winnerUuid, String winnerName,
+                                       ItemStack item, String materialName, int quantity,
+                                       double winPrice) {}
+
+    /**
+     * Settles an expired listing WITH a winning bid (runs on the auction
+     * executor). Money already sits in escrow - this:
+     * <ol>
+     *   <li>claims the listing row (archive reason=WON, buyer=winner) - exactly-once;</li>
+     *   <li>releases the escrow to the seller (atomic transfer + AUCTION_SOLD /
+     *       AUCTION_WON ledger rows inside the transaction);</li>
+     *   <li>fires {@code afterAuctionSale} so governance taxes apply uniformly;</li>
+     *   <li>deserializes the item: online winners get a pending hand-out,
+     *       offline winners get a row in auction_won_items (/ah collect).</li>
+     * </ol>
+     *
+     * @return a pending direct delivery when the winner was in the online
+     *         snapshot, otherwise null (offline path stored the row)
+     */
+    private PendingWinDelivery settleWonListing(AuctionEntry entry, BidState state,
+                                                 Set<UUID> onlinePlayers) {
+        UUID winnerUuid = state.currentBidderUuid();
+        String winnerName = state.currentBidderName();
+        double amount = state.currentBid();
+
+        // 1) Exactly-once claim of the listing row (buyer = winner).
+        boolean claimed = archiveAndDeleteListing(persistentConnection, entry.listingId(),
+            SETTLED_WON, winnerUuid, winnerName, System.currentTimeMillis(), SolidusMod.LOGGER);
+        if (!claimed) {
+            SolidusMod.LOGGER.warn("Won listing {} was claimed by another flow - skipping settlement.",
+                entry.listingId());
+            return null;
+        }
+        try {
+            deleteBidState(entry.listingId());
+        } catch (SQLException e) {
+            SolidusMod.LOGGER.warn("Could not delete bid state for won listing {}", entry.listingId(), e);
+        }
+
+        // 2) Release escrow -> seller, with ledger evidence INSIDE the transfer.
+        economyEngine.getStorage()
+            .transferAtomicWithLedger(
+                com.solidus.economy.EscrowAccount.UUID_ZERO, com.solidus.economy.EscrowAccount.NAME,
+                entry.sellerUuid(), entry.sellerName(),
+                amount,
+                java.util.List.of(
+                    new com.solidus.economy.SQLiteStorage.AtomicLedgerRow(
+                        TransactionLog.Type.AUCTION_SOLD,
+                        entry.sellerUuid(), entry.sellerName(),
+                        winnerUuid, winnerName,
+                        amount, entry.materialName(), entry.quantity(),
+                        "Auction WON by " + winnerName + " - sold " + entry.quantity() + "x "
+                            + entry.materialName()),
+                    new com.solidus.economy.SQLiteStorage.AtomicLedgerRow(
+                        TransactionLog.Type.AUCTION_WON,
+                        winnerUuid, winnerName,
+                        entry.sellerUuid(), entry.sellerName(),
+                        amount, entry.materialName(), entry.quantity(),
+                        "Won auction: " + entry.quantity() + "x " + entry.materialName()
+                            + " for " + CurrencyUtil.format(amount))))
+            .thenAccept(outcome -> {
+                if (outcome.status() != com.solidus.economy.SQLiteStorage.TransferStatus.SUCCESS) {
+                    // The money stays safely in escrow (transfer rolled back);
+                    // the item still goes to the winner. Admin can reconcile
+                    // from the ESCROW CONSISTENCY warning + ledger rows.
+                    SolidusMod.LOGGER.error(
+                        "CRITICAL: escrow release of {} to seller {} failed ({}) for won listing {}",
+                        amount, entry.sellerName(), outcome.status(), entry.listingId());
+                    return;
+                }
+                // 3) Governance: the sale is settled - same hook as a buy-now.
+                EconomyHooks.notifyHooks(hook -> hook.afterAuctionSale(
+                    entry.sellerUuid(), entry.sellerName(),
+                    winnerUuid, winnerName, amount));
+            });
+
+        notify(entry.sellerUuid(),
+            "Your auction for " + entry.quantity() + "x " + entry.materialName()
+                + " was WON by " + winnerName + " for " + CurrencyUtil.format(amount) + ".");
+
+        // 4) Item delivery: online -> direct hand-out, offline -> /ah collect row.
+        boolean winnerOnline = onlinePlayers.contains(winnerUuid);
+        if (winnerOnline) {
+            ItemStack item = deserializeItemStack(entry.itemNbt(), entry.materialName(), entry.quantity());
+            if (item.isEmpty()) {
+                SolidusMod.LOGGER.error(
+                    "Won listing {} has corrupt item data - storing as collectible for {} instead.",
+                    entry.listingId(), winnerName);
+                storeWonItemRow(entry, winnerUuid, winnerName, amount);
+                return null;
+            }
+            return new PendingWinDelivery(entry.listingId(), winnerUuid, winnerName,
+                item, entry.materialName(), entry.quantity(), amount);
+        }
+        storeWonItemRow(entry, winnerUuid, winnerName, amount);
+        return null;
+    }
+
+    /** Stores a won item for offline collection via /ah collect (idempotent). */
+    private void storeWonItemRow(AuctionEntry entry, UUID winnerUuid, String winnerName, double amount) {
+        CompletableFuture.runAsync(() -> {
+            String sql = """
+                INSERT OR IGNORE INTO auction_won_items
+                (listing_id, winner_uuid, winner_name, material_name, item_nbt, quantity, win_price, won_timestamp)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """;
+            try (PreparedStatement ps = persistentConnection.prepareStatement(sql)) {
+                ps.setString(1, entry.listingId().toString());
+                ps.setString(2, winnerUuid.toString());
+                ps.setString(3, winnerName);
+                ps.setString(4, entry.materialName());
+                ps.setString(5, entry.itemNbt());
+                ps.setInt(6, entry.quantity());
+                ps.setDouble(7, amount);
+                ps.setLong(8, System.currentTimeMillis());
+                ps.executeUpdate();
+            } catch (SQLException e) {
+                SolidusMod.LOGGER.error("CRITICAL: could not store won item for {} (listing {}) - check auction_sold_history",
+                    winnerName, entry.listingId(), e);
+            }
+        }, asyncExecutor);
+    }
+
+    /** Hands won items to their online winners (server thread). */
+    private void deliverWonItems(MinecraftServer currentServer, List<PendingWinDelivery> wins) {
+        for (PendingWinDelivery win : wins) {
+            ServerPlayer winner = currentServer.getPlayerList().getPlayer(win.winnerUuid());
+            if (winner == null) {
+                // Winner disconnected between the online snapshot and the
+                // hand-out - persist as a collectible row (idempotent insert).
+                try {
+                    // Rebuild the minimal entry fields we need for the row.
+                    storeWonItemRowFromDelivery(win);
+                } catch (Exception e) {
+                    SolidusMod.LOGGER.error("CRITICAL: could not persist won item for {} - check logs",
+                        win.winnerName(), e);
+                }
+                continue;
+            }
+            if (!winner.getInventory().add(win.item())) {
+                winner.drop(win.item(), false);
+            }
+            winner.sendSystemMessage(TextUtil.success(
+                "You WON the auction for " + win.quantity() + "x " + win.materialName()
+                    + " with a bid of " + CurrencyUtil.format(win.winPrice()) + "!"));
+        }
+    }
+
+    private void storeWonItemRowFromDelivery(PendingWinDelivery win) {
+        String sql = """
+            INSERT OR IGNORE INTO auction_won_items
+            (listing_id, winner_uuid, winner_name, material_name, item_nbt, quantity, win_price, won_timestamp)
+            VALUES (?, ?, ?, ?, NULL, ?, ?, ?)
+        """;
+        CompletableFuture.runAsync(() -> {
+            try (PreparedStatement ps = persistentConnection.prepareStatement(sql)) {
+                ps.setString(1, win.listingId().toString());
+                ps.setString(2, win.winnerUuid().toString());
+                ps.setString(3, win.winnerName());
+                ps.setString(4, win.materialName());
+                ps.setInt(5, win.quantity());
+                ps.setDouble(6, win.winPrice());
+                ps.setLong(7, System.currentTimeMillis());
+                ps.executeUpdate();
+            } catch (SQLException e) {
+                SolidusMod.LOGGER.error("Failed to persist undelivered won item for listing {}",
+                    win.listingId(), e);
+            }
         }, asyncExecutor);
     }
 

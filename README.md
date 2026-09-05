@@ -205,10 +205,14 @@ All modules auto-detect Solidus Core via reflection and activate automatically. 
 | `/sell all` | Sell all sellable items in inventory |
 | `/sell all <item>` | Sell all of a specific item (e.g. `ender_pearl`) |
 | `/ah` | Open auction |
-| `/ah sell <price>` | Create listing |
-| `/ah collect` | Reclaim expired items |
-| `/ah cancel <uuid>` | Cancel own listing |
+| `/ah sell <price> [startbid]` | Create listing; optional opening bid enables **bidding** |
+| `/ah bid <uuid> <amount>` | Bid on a bidding-enabled listing (or right-click it in the GUI) |
+| `/ah collect` | Reclaim expired items **and won auction items** |
+| `/ah cancel <uuid>` | Cancel own listing (top bidder auto-refunded) |
 | `/ah sort <criteria>` | Sort listings (price/newest/material) |
+| `/trade <player>` | Request a direct trade with a nearby player |
+| `/trade accept` / `deny` | Respond to a pending trade request |
+| `/trade cancel` | Cancel the trade you are in |
 | `/transactions [page]` | Transaction history (10 per page) |
 | `/transactions export [days]` | Export your own history to CSV (default 7 days) |
 | `/transactions exportall [days]` | Export the full ledger to CSV (OP 2+) |

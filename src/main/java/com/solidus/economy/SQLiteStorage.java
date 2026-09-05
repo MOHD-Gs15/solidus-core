@@ -295,7 +295,11 @@ public class SQLiteStorage {
         return CompletableFuture.supplyAsync(() -> {
             ensureInitialized();
             List<BalanceEntry> entries = new ArrayList<>();
+            // System accounts (bid escrow) are excluded from leaderboards -
+            // escrowed money belongs to a real bidder mid-auction and must
+            // never appear as a "player" on /baltop.
             String sql = "SELECT uuid, player_name, balance FROM player_balances "
+                + "WHERE uuid != " + EscrowAccount.sqlLiteral() + " "
                 + "ORDER BY balance DESC LIMIT ? OFFSET ?";
             try (PreparedStatement ps = persistentConnection.prepareStatement(sql)) {
                 ps.setInt(1, limit);
@@ -316,8 +320,10 @@ public class SQLiteStorage {
             } catch (SQLException e) {
                 LOGGER.error("Failed to get top balances from database", e);
                 // Fallback to in-memory sort if DB query fails (offset honored
-                // with skip so pages stay aligned even on the degraded path)
+                // with skip so pages stay aligned even on the degraded path).
+                // System accounts (escrow) are excluded here as well.
                 return balanceCache.entrySet().stream()
+                    .filter(entry -> !EscrowAccount.isSystemAccount(entry.getKey()))
                     .sorted((a, b) -> Double.compare(b.getValue(), a.getValue()))
                     .skip(Math.max(0, offset))
                     .limit(limit)

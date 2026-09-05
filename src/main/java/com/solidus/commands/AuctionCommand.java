@@ -25,8 +25,9 @@ import java.util.UUID;
  *
  * Usage:
  *   /ah                    - View global auction listings
- *   /ah sell <price>       - List the item in main hand for the specified price
- *   /ah collect            - Collect expired auction items
+ *   /ah sell <price> [startbid] - List the held item; optional opening bid enables bidding
+ *   /ah bid <uuid> <amount> - Bid on a bidding-enabled listing (or right-click it in the GUI)
+ *   /ah collect            - Collect expired auction items AND won auction items
  *   /ah cancel <uuid>      - Cancel your own active listing
  *   /ah sort <newest|price_low|price_high|material> - View sorted listings
  *   /ah search <term>      - Free-text search across active listings
@@ -34,6 +35,7 @@ import java.util.UUID;
  * Permissions:
  *   solidus.command.auction        - View auction house (default: all players)
  *   solidus.command.auction.sell   - List items (default: all players)
+ *   solidus.command.auction.bid    - Bid on listings (default: all players)
  *   solidus.command.auction.collect - Collect items (default: all players)
  *   solidus.command.auction.cancel  - Cancel listings (default: all players)
  *   solidus.command.auction.sort   - Sort listings (default: all players)
@@ -53,7 +55,7 @@ public class AuctionCommand {
                 auctionManager.openAuction(player);
                 return 1;
             })
-            // /ah sell <price> - List held item
+            // /ah sell <price> - List held item (buy-now only)
             .then(Commands.literal("sell")
                 .requires(PermissionChecker.require(SolidusPermissions.AUCTION_SELL, 0))
                 .then(Commands.argument("price", DoubleArgumentType.doubleArg(1.0))
@@ -63,6 +65,31 @@ public class AuctionCommand {
                         auctionManager.listItem(player, price);
                         return 1;
                     })
+                    // /ah sell <price> <startbid> - List held item WITH bidding
+                    .then(Commands.argument("startbid", DoubleArgumentType.doubleArg(1.0))
+                        .executes(context -> {
+                            ServerPlayer player = context.getSource().getPlayerOrException();
+                            double price = DoubleArgumentType.getDouble(context, "price");
+                            double startBid = DoubleArgumentType.getDouble(context, "startbid");
+                            auctionManager.listItem(player, price, startBid);
+                            return 1;
+                        })
+                    )
+                )
+            )
+            // /ah bid <listing_id> <amount> - Bid on a bidding-enabled listing
+            .then(Commands.literal("bid")
+                .requires(PermissionChecker.require(SolidusPermissions.AUCTION_BID, 0))
+                .then(Commands.argument("listing_id", UuidArgument.uuid())
+                    .then(Commands.argument("amount", DoubleArgumentType.doubleArg(1.0))
+                        .executes(context -> {
+                            ServerPlayer player = context.getSource().getPlayerOrException();
+                            UUID listingId = UuidArgument.getUuid(context, "listing_id");
+                            double amount = DoubleArgumentType.getDouble(context, "amount");
+                            auctionManager.placeBid(player, listingId, amount);
+                            return 1;
+                        })
+                    )
                 )
             )
             // /ah collect - Collect expired auction items

@@ -4,6 +4,8 @@ import com.solidus.SolidusMod;
 import com.solidus.shop.ShopScreenHandler;
 import com.solidus.sell.SellScreenHandler;
 import com.solidus.auction.AuctionScreenHandler;
+import com.solidus.trade.TradeManager;
+import com.solidus.trade.TradeScreenHandler;
 
 import net.fabricmc.fabric.api.networking.v1.ServerPlayConnectionEvents;
 
@@ -48,6 +50,7 @@ public class PacketHandler {
 
     private final com.solidus.shop.ShopManager shopManager;
     private final com.solidus.auction.AuctionManager auctionManager;
+    private final TradeManager tradeManager;
     private final RateLimiter rateLimiter;
 
     /** Per-player timestamp of the last full-resync sent for a DROPPED click. */
@@ -58,9 +61,11 @@ public class PacketHandler {
 
     public PacketHandler(com.solidus.shop.ShopManager shopManager,
                           com.solidus.auction.AuctionManager auctionManager,
+                          TradeManager tradeManager,
                           RateLimiter rateLimiter) {
         this.shopManager = shopManager;
         this.auctionManager = auctionManager;
+        this.tradeManager = tradeManager;
         this.rateLimiter = rateLimiter;
     }
 
@@ -177,6 +182,20 @@ public class PacketHandler {
             return true;
         }
 
+        if (currentMenu instanceof TradeScreenHandler tradeHandler) {
+            if (!rateLimiter.allowClick(player.getUUID())) {
+                SolidusMod.LOGGER.debug("Rate-limited click from player: {} (remaining: {}ms)",
+                    player.getName().getString(), rateLimiter.getRemainingCooldown(player.getUUID()));
+                throttledDropResync(player);
+                return true; // Consume the packet - don't pass to vanilla
+            }
+            // Route to trade click handler - clicks are handled manually (the
+            // trade window allows real item movement like the sell GUI).
+            tradeHandler.clicked(slotIndex, button, containerInput, player);
+            fullResync(player);
+            return true;
+        }
+
         // Not a Solidus GUI - pass through to vanilla handling
         return false;
     }
@@ -217,6 +236,7 @@ public class PacketHandler {
         AbstractContainerMenu currentMenu = player.containerMenu;
         return currentMenu instanceof ShopScreenHandler
             || currentMenu instanceof SellScreenHandler
-            || currentMenu instanceof AuctionScreenHandler;
+            || currentMenu instanceof AuctionScreenHandler
+            || currentMenu instanceof TradeScreenHandler;
     }
 }

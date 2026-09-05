@@ -74,6 +74,12 @@ public final class SolidusPermissions {
     /** Sort auction listings - /ah sort */
     public static final String AUCTION_SORT = "solidus.command.auction.sort";
 
+    /** Bid on an auction listing - /ah bid and the GUI right-click bid prompt */
+    public static final String AUCTION_BID = "solidus.command.auction.bid";
+
+    /** Start a direct trade request - /trade <player> */
+    public static final String TRADE = "solidus.command.trade";
+
     /** View transaction history - /transactions */
     public static final String TRANSACTIONS = "solidus.command.transactions";
 

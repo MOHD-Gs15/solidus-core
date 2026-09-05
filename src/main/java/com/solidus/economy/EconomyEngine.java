@@ -48,6 +48,13 @@ public class EconomyEngine {
         storage = new SQLiteStorage(dbPath);
         storage.initialize();
 
+        // Pre-create the bid-escrow system account with balance 0. Without
+        // this, the first atomic transfer INTO escrow would create the row as
+        // "starting balance + amount", minting phantom money that locks itself
+        // inside the system account forever. With a zero-balance row in place,
+        // escrow holds EXACTLY the sum of all open top bids at any moment.
+        storage.setBalance(EscrowAccount.UUID_ZERO, EscrowAccount.NAME, 0.0);
+
         // Initialize balance manager
         balanceManager = new BalanceManager(storage);
 

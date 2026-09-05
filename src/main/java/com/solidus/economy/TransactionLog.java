@@ -97,6 +97,16 @@ public class TransactionLog {
         AUCTION_SOLD("AUCTION_SOLD"),
         AUCTION_BOUGHT("AUCTION_BOUGHT"),
         AUCTION_EXPIRED("AUCTION_EXPIRED"),
+        /** Escrowed bid placed on an auction listing (amount deducted at bid time) */
+        BID_PLACED("BID_PLACED"),
+        /** Outbid refund - the escrowed amount returned to the previous bidder */
+        BID_REFUNDED("BID_REFUNDED"),
+        /** A bidding auction settled to the highest bidder (escrow released to seller) */
+        AUCTION_WON("AUCTION_WON"),
+        /** Direct player-to-player trade: items/money this player GAVE */
+        TRADE_SEND("TRADE_SEND"),
+        /** Direct player-to-player trade: items/money this player RECEIVED */
+        TRADE_RECEIVE("TRADE_RECEIVE"),
         PAY_SEND("PAY_SEND"),
         PAY_RECEIVE("PAY_RECEIVE"),
         DEATH_PENALTY("DEATH_PENALTY"),

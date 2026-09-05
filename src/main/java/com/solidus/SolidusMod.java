@@ -12,8 +12,11 @@ import com.solidus.commands.TransactionsCommand;
 import com.solidus.economy.BalanceManager;
 import com.solidus.economy.EconomyEngine;
 import com.solidus.economy.TransactionLog;
+import com.solidus.chat.ChatPrompts;
 import com.solidus.shop.ShopManager;
 import com.solidus.auction.AuctionManager;
+import com.solidus.trade.TradeManager;
+import com.solidus.commands.TradeCommand;
 import com.solidus.networking.PacketHandler;
 import com.solidus.networking.RateLimiter;
 
@@ -50,6 +53,8 @@ public class SolidusMod implements DedicatedServerModInitializer {
     private static AuctionManager auctionManager;
     private static PacketHandler packetHandler;
     private static RateLimiter rateLimiter;
+    private static ChatPrompts chatPrompts;
+    private static TradeManager tradeManager;
 
     /** Tick counter for periodic tasks (auction expiration check every 5 minutes) */
     private static long tickCounter = 0;
@@ -87,7 +92,14 @@ public class SolidusMod implements DedicatedServerModInitializer {
         auctionManager = new AuctionManager(economyEngine);
         auctionManager.initialize();
 
-        packetHandler = new PacketHandler(shopManager, auctionManager, rateLimiter);
+        // Chat prompt service (bid amounts, trade money input) - must exist
+        // before any GUI that can open a prompt.
+        chatPrompts = new ChatPrompts();
+
+        // Direct player-to-player trade system (/trade).
+        tradeManager = new TradeManager(economyEngine, chatPrompts);
+
+        packetHandler = new PacketHandler(shopManager, auctionManager, tradeManager, rateLimiter);
         packetHandler.register();
 
         // Register all server-side commands
@@ -99,12 +111,14 @@ public class SolidusMod implements DedicatedServerModInitializer {
             ShopCommand.register(dispatcher, shopManager);
             SellCommand.register(dispatcher, shopManager);
             AuctionCommand.register(dispatcher, auctionManager);
+            TradeCommand.register(dispatcher, tradeManager);
             TransactionsCommand.register(dispatcher, economyEngine);
         });
 
         // Register server shutdown hook for clean database closure
         ServerLifecycleEvents.SERVER_STOPPING.register(server -> {
             LOGGER.info("Solidus is shutting down...");
+            tradeManager.shutdown();
             auctionManager.shutdown();
             economyEngine.shutdown();
             rateLimiter.clear();
@@ -115,8 +129,9 @@ public class SolidusMod implements DedicatedServerModInitializer {
         // Required because MinecraftServer.getServer() is NOT available in Fabric
         ServerLifecycleEvents.SERVER_STARTED.register(server -> {
             auctionManager.setServer(server);
+            tradeManager.setServer(server);
 
-            LOGGER.info("Solidus: MinecraftServer instance injected into AuctionManager.");
+            LOGGER.info("Solidus: MinecraftServer instance injected into AuctionManager + TradeManager.");
         });
 
         // Register periodic tick handler for auction expiration checks
@@ -125,6 +140,8 @@ public class SolidusMod implements DedicatedServerModInitializer {
             if (tickCounter >= AUCTION_EXPIRY_CHECK_INTERVAL) {
                 tickCounter = 0;
                 auctionManager.processExpiredListings();
+                // Same cadence: reap idle trade sessions (items returned).
+                tradeManager.reapIdleSessions();
             }
         });
 
@@ -134,6 +151,12 @@ public class SolidusMod implements DedicatedServerModInitializer {
             if (transactionLog != null) {
                 transactionLog.deliverPendingNotifications(handler.getPlayer());
             }
+        });
+
+        // Cancel any open trade session + chat prompt when a player disconnects
+        ServerPlayConnectionEvents.DISCONNECT.register((handler, server) -> {
+            tradeManager.handleDisconnect(handler.getPlayer());
+            chatPrompts.cancelPrompt(handler.getPlayer().getUUID());
         });
 
         LOGGER.info("Solidus initialized successfully. Economy engine online.");
@@ -159,5 +182,13 @@ public class SolidusMod implements DedicatedServerModInitializer {
 
     public static RateLimiter getRateLimiter() {
         return rateLimiter;
+    }
+
+    public static ChatPrompts getChatPrompts() {
+        return chatPrompts;
+    }
+
+    public static TradeManager getTradeManager() {
+        return tradeManager;
     }
 }

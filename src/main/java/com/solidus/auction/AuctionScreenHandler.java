@@ -3,6 +3,7 @@ package com.solidus.auction;
 import com.solidus.auction.AuctionGUI.GuiSlot;
 import com.solidus.gui.DisplaySlot;
 
+import net.minecraft.ChatFormatting;
 import net.minecraft.network.chat.Component;
 import net.minecraft.server.level.ServerPlayer;
 import net.minecraft.world.entity.player.Inventory;
@@ -140,12 +141,21 @@ public class AuctionScreenHandler extends AbstractContainerMenu {
         // only a plain left PICKUP for item slots so forged/unusual gestures
         // can't initiate settlement, matching the documented interaction.
         if (guiSlot.type() == GuiSlot.Type.AUCTION_ITEM
-            && (containerInput != net.minecraft.world.inventory.ContainerInput.PICKUP || button != 0)) {
+            && (containerInput != net.minecraft.world.inventory.ContainerInput.PICKUP || button != 0)
+            && !(containerInput == net.minecraft.world.inventory.ContainerInput.PICKUP && button == 1)) {
             return;
         }
 
         switch (guiSlot.type()) {
-            case AUCTION_ITEM -> handleAuctionItemClick(guiSlot);
+            case AUCTION_ITEM -> {
+                // BIDDING: right-click opens the "type your bid in chat" prompt
+                // (standard auction-plugin UX); left-click stays Buy Now.
+                if (containerInput == net.minecraft.world.inventory.ContainerInput.PICKUP && button == 1) {
+                    handleBidPrompt(guiSlot);
+                } else {
+                    handleAuctionItemClick(guiSlot);
+                }
+            }
             case REFRESH -> handleRefresh();
             case MY_ITEMS -> handleMyItems();
             case NAVIGATION -> handleNavigation(guiSlot);
@@ -153,6 +163,50 @@ public class AuctionScreenHandler extends AbstractContainerMenu {
                 // Non-interactive - ignore
             }
         }
+    }
+
+    /**
+     * Opens the bid chat prompt for a listing. The player's next chat message
+     * is consumed as the bid amount (or "cancel" aborts). The GUI closes so
+     * the player can see the chat clearly - the standard auction-plugin flow.
+     */
+    private void handleBidPrompt(GuiSlot slot) {
+        String listingIdStr = slot.actionKey();
+        if (listingIdStr == null) return;
+
+        java.util.UUID listingId;
+        try {
+            listingId = java.util.UUID.fromString(listingIdStr);
+        } catch (IllegalArgumentException e) {
+            player.sendSystemMessage(com.solidus.util.TextUtil.error("Invalid listing ID."));
+            return;
+        }
+
+        com.solidus.chat.ChatPrompts prompts = com.solidus.SolidusMod.getChatPrompts();
+        if (prompts == null) {
+            player.sendSystemMessage(com.solidus.util.TextUtil.error(
+                "Bid prompt unavailable - use /ah bid " + listingIdStr + " <amount>"));
+            return;
+        }
+
+        player.closeContainer();
+        player.sendSystemMessage(com.solidus.util.TextUtil.styled(
+            "Type your bid amount in chat (e.g. 1500), or type 'cancel':", ChatFormatting.LIGHT_PURPLE));
+        prompts.openPrompt(player, (p, message) -> {
+            String trimmed = message.trim();
+            if (trimmed.equalsIgnoreCase("cancel") || trimmed.equalsIgnoreCase("الغاء")) {
+                p.sendSystemMessage(com.solidus.util.TextUtil.styled("Bid cancelled.", ChatFormatting.GRAY));
+                return com.solidus.chat.ChatPrompts.CONSUME;
+            }
+            try {
+                double amount = Double.parseDouble(trimmed.replace(",", ""));
+                auctionManager.placeBid(p, listingId, amount);
+            } catch (NumberFormatException e) {
+                p.sendSystemMessage(com.solidus.util.TextUtil.error(
+                    "'" + trimmed + "' is not a valid number. Bid cancelled."));
+            }
+            return com.solidus.chat.ChatPrompts.CONSUME;
+        });
     }
 
     /**

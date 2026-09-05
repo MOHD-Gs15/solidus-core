@@ -13,6 +13,7 @@ import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.item.Items;
 
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -55,9 +56,7 @@ public final class AuctionGUI {
      */
     public static void openAuction(ServerPlayer player, AuctionManager auctionManager) {
         auctionManager.getActiveListings().thenAccept(listings -> {
-            player.level().getServer().execute(() -> {
-                buildAndOpenAuctionScreen(player, auctionManager, listings, 0, false);
-            });
+            attachBidStatesAndBuild(player, auctionManager, listings, 0, false, null);
         });
     }
 
@@ -71,10 +70,7 @@ public final class AuctionGUI {
     public static void openAuctionSorted(ServerPlayer player, AuctionManager auctionManager,
                                           AuctionManager.SortOrder sortOrder) {
         auctionManager.getActiveListings(sortOrder).thenAccept(listings -> {
-            player.level().getServer().execute(() -> {
-                // Show sort indicator in header
-                buildAndOpenAuctionScreen(player, auctionManager, listings, 0, false, sortOrder);
-            });
+            attachBidStatesAndBuild(player, auctionManager, listings, 0, false, sortOrder);
         });
     }
 
@@ -83,26 +79,35 @@ public final class AuctionGUI {
      */
     public static void openMyListings(ServerPlayer player, AuctionManager auctionManager) {
         auctionManager.getListingsBySeller(player.getUUID()).thenAccept(listings -> {
-            player.level().getServer().execute(() -> {
-                buildAndOpenAuctionScreen(player, auctionManager, listings, 0, true);
-            });
+            attachBidStatesAndBuild(player, auctionManager, listings, 0, true, null);
         });
     }
 
     /**
-     * Builds and opens the auction screen with the given listings.
+     * Backward-compatible entry point used by page navigation and refresh:
+     * builds with NO bid information (bidding badges simply absent).
      */
     public static void buildAndOpenAuctionScreen(ServerPlayer player, AuctionManager auctionManager,
                                                     List<AuctionEntry> listings, int page, boolean myItems) {
-        buildAndOpenAuctionScreen(player, auctionManager, listings, page, myItems, null);
+        buildAndOpenAuctionScreen(player, auctionManager, listings, page, myItems, null, Collections.emptyMap());
     }
 
     /**
-     * Builds and opens the auction screen with the given listings and sort order.
+     * Backward-compatible entry point with sort order but no bid states.
      */
     public static void buildAndOpenAuctionScreen(ServerPlayer player, AuctionManager auctionManager,
                                                     List<AuctionEntry> listings, int page, boolean myItems,
                                                     AuctionManager.SortOrder sortOrder) {
+        buildAndOpenAuctionScreen(player, auctionManager, listings, page, myItems, sortOrder, Collections.emptyMap());
+    }
+
+    /**
+     * Builds and opens the auction screen with the given listings and bid states.
+     */
+    public static void buildAndOpenAuctionScreen(ServerPlayer player, AuctionManager auctionManager,
+                                                    List<AuctionEntry> listings, int page, boolean myItems,
+                                                    AuctionManager.SortOrder sortOrder,
+                                                    Map<UUID, BidState> bidStates) {
         List<GuiSlot> slots = new ArrayList<>();
 
         // Header: Title (show sort order if specified)
@@ -132,7 +137,7 @@ public final class AuctionGUI {
         for (int i = startIndex, pos = 0; i < endIndex && pos < slotLayout.size(); i++, pos++) {
             AuctionEntry entry = listings.get(i);
             int slot = slotLayout.get(pos);
-            ItemStack displayItem = createAuctionItemDisplay(entry);
+            ItemStack displayItem = createAuctionItemDisplay(entry, bidStates.get(entry.listingId()));
             slots.add(new GuiSlot(slot, displayItem, GuiSlot.Type.AUCTION_ITEM, entry.listingId().toString()));
         }
 
@@ -169,6 +174,30 @@ public final class AuctionGUI {
     }
 
     /**
+     * Fetches the bid states for a page of listings, then continues to the
+     * screen build on the server thread. One extra query per page - and the
+     * bidding badges/lore only appear on bid-enabled listings.
+     */
+    private static void attachBidStatesAndBuild(ServerPlayer player, AuctionManager auctionManager,
+                                                 List<AuctionEntry> listings, int page, boolean myItems,
+                                                 AuctionManager.SortOrder sortOrder) {
+        List<UUID> pageIds = new ArrayList<>();
+        int startIndex = page * AuctionGUI.itemsPerPage();
+        int endIndex = Math.min(startIndex + AuctionGUI.itemsPerPage(), listings.size());
+        for (int i = startIndex; i < endIndex; i++) {
+            pageIds.add(listings.get(i).listingId());
+        }
+        auctionManager.getBidStates(pageIds).thenAccept(bidStates ->
+            player.level().getServer().execute(() ->
+                buildAndOpenAuctionScreen(player, auctionManager, listings, page, myItems, sortOrder, bidStates)));
+    }
+
+    /** Items per page constant exposed for the bid-state page window. */
+    public static int itemsPerPage() {
+        return ITEMS_PER_PAGE;
+    }
+
+    /**
      * Slot indices available for listing displays (9..53 minus the reserved
      * navigation slots PREV/NEXT/CLOSE).
      */
@@ -183,8 +212,10 @@ public final class AuctionGUI {
 
     /**
      * Creates a display ItemStack for an auction listing.
+     *
+     * @param bidState the listing's bid state, or null for buy-now-only listings
      */
-    private static ItemStack createAuctionItemDisplay(AuctionEntry entry) {
+    private static ItemStack createAuctionItemDisplay(AuctionEntry entry, BidState bidState) {
         ItemStack display;
         try {
             net.minecraft.world.item.Item item = net.minecraft.core.registries.BuiltInRegistries.ITEM
@@ -202,7 +233,25 @@ public final class AuctionGUI {
         // Lore with auction details
         List<Component> lore = new ArrayList<>();
         lore.add(Component.literal(""));
-        lore.add(TextUtil.currency("Price: " + CurrencyUtil.format(entry.price())));
+
+        if (bidState != null) {
+            // BIDDING-ENABLED LISTING
+            lore.add(TextUtil.styledBold("BIDDING ENABLED", ChatFormatting.LIGHT_PURPLE));
+            if (bidState.hasBids()) {
+                lore.add(TextUtil.currency("Current Bid: " + CurrencyUtil.format(bidState.currentBid())));
+                lore.add(TextUtil.styled("Top Bidder: " + bidState.currentBidderName(), ChatFormatting.YELLOW));
+                lore.add(TextUtil.styled("Bids: " + bidState.bidCount(), ChatFormatting.AQUA));
+            } else {
+                lore.add(TextUtil.styled("Opening Bid: " + CurrencyUtil.format(bidState.startPrice()), ChatFormatting.AQUA));
+                lore.add(TextUtil.styled("No bids yet", ChatFormatting.GRAY));
+            }
+            lore.add(TextUtil.currency("Buy Now: " + CurrencyUtil.format(entry.price())));
+            lore.add(TextUtil.styled("Next Bid Min: " + CurrencyUtil.format(
+                com.solidus.auction.BidRules.minNextBid(bidState.startPrice(), bidState.currentBid())), ChatFormatting.GRAY));
+        } else {
+            // BUY-NOW-ONLY LISTING (classic view)
+            lore.add(TextUtil.currency("Price: " + CurrencyUtil.format(entry.price())));
+        }
         lore.add(TextUtil.styled("Seller: " + entry.sellerName(), ChatFormatting.YELLOW));
         lore.add(TextUtil.styled("Quantity: " + entry.quantity(), ChatFormatting.AQUA));
 
@@ -215,7 +264,10 @@ public final class AuctionGUI {
         }
 
         lore.add(Component.literal(""));
-        lore.add(TextUtil.styled("Left-Click to Purchase", ChatFormatting.GREEN));
+        lore.add(TextUtil.styled("Left-Click to " + (bidState != null ? "Buy Now" : "Purchase"), ChatFormatting.GREEN));
+        if (bidState != null) {
+            lore.add(TextUtil.styled("Right-Click to Bid (type amount in chat)", ChatFormatting.LIGHT_PURPLE));
+        }
 
         display.set(net.minecraft.core.component.DataComponents.LORE,
             new net.minecraft.world.item.component.ItemLore(lore));
