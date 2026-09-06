@@ -10,6 +10,45 @@ jobs:
   test:
     runs-on: ubuntu-latest
 
+    # Real service containers for the DB-scaling network tests (2.2.0+):
+    # the 27 self-skipping MySQL/MariaDB + Redis tests activate when the
+    # SOLIDUS_TEST_* variables are set, and then run against THESE services.
+    services:
+      mariadb:
+        image: mariadb:11
+        env:
+          MARIADB_ROOT_PASSWORD: rootpass
+          MARIADB_DATABASE: solidus_test
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd="healthcheck.sh --connect --innodb_initialized"
+          --health-interval=10s
+          --health-timeout=5s
+          --health-retries=10
+      redis:
+        image: redis:7
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd="redis-cli ping"
+          --health-interval=10s
+          --health-timeout=5s
+          --health-retries=10
+
+    env:
+      # Activates: MySqlStorageContractTest, MySqlTransferRaceTest (two
+      # instances, 200 concurrent transfers), MySqlOperationsIdempotencyTest,
+      # MySqlAuctionDialectTest, StorageMigratorTest (throwaway database —
+      # root is required for CREATE/DROP DATABASE).
+      SOLIDUS_TEST_MYSQL_HOST: 127.0.0.1
+      SOLIDUS_TEST_MYSQL_PORT: 3306
+      SOLIDUS_TEST_MYSQL_DATABASE: solidus_test
+      SOLIDUS_TEST_MYSQL_USER: root
+      SOLIDUS_TEST_MYSQL_PASSWORD: rootpass
+      # Activates: RedisLayerTest (L2 cache, invalidation bus, circuit breaker).
+      SOLIDUS_TEST_REDIS_URI: redis://127.0.0.1:6379/0
+
     steps:
       - uses: actions/checkout@v4
 

@@ -167,7 +167,13 @@ public class TransactionLog {
         PAY_SEND("PAY_SEND"),
         PAY_RECEIVE("PAY_RECEIVE"),
         DEATH_PENALTY("DEATH_PENALTY"),
-        DEATH_REWARD("DEATH_REWARD");
+        DEATH_REWARD("DEATH_REWARD"),
+        /** Admin/console credit to an account (2.2.2 /solidus-admin money give) */
+        ADMIN_GIVE("ADMIN_GIVE"),
+        /** Admin/console balance overwrite (2.2.2 /solidus-admin money set) */
+        ADMIN_SET("ADMIN_SET"),
+        /** Admin/console debit from an account (2.2.2 /solidus-admin money take) */
+        ADMIN_TAKE("ADMIN_TAKE");
 
         private final String code;
 

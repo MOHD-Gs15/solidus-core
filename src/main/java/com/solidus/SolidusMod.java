@@ -130,7 +130,7 @@ public class SolidusMod implements DedicatedServerModInitializer {
             AuctionCommand.register(dispatcher, auctionManager);
             TradeCommand.register(dispatcher, tradeManager);
             TransactionsCommand.register(dispatcher, economyEngine);
-            SolidusAdminCommand.register(dispatcher, economyEngine);
+            SolidusAdminCommand.register(dispatcher, economyEngine, auctionManager);
         });
 
         // Register server shutdown hook for clean database closure

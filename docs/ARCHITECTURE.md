@@ -322,7 +322,9 @@ com.solidus
 │   ├── AuctionCommand.java       // /ah sell/bid/collect/cancel/sort/search
 │   ├── TradeCommand.java         // /trade <player>|accept|deny|cancel (2.1.4+)
 │   ├── TransactionsCommand.java  // /transactions [page] [export [days] | exportall [days]]
-│   └── SolidusAdminCommand.java  // /solidus-admin storage migrate (2.2.1+, OP 4)
+│   └── SolidusAdminCommand.java  // /solidus-admin: storage migrate (2.2.1+) + console test harness (2.2.2+, OP 4)
+├── admin/                        // Console testing service (2.2.2+)
+│   └── AdminOps.java             // Player-agnostic economy ops: dummy accounts, money, pay-as, bid-as, audit, diag
 ├── economy/                      // Core economy engine
 │   ├── EconomyEngine.java        // Central coordinator (selects the storage backend)
 │   ├── StorageBackend.java       // Storage contract IF (2.1.5+, DB scaling Phase 1)

@@ -235,6 +235,14 @@ All modules auto-detect Solidus Core via reflection and activate automatically. 
 | `/transactions export [days]` | Export your own history to CSV (default 7 days) |
 | `/transactions exportall [days]` | Export the full ledger to CSV (OP 2+) |
 | `/solidus-admin storage migrate [flags]` | Copy the SQLite data set into the configured MySQL target, verify, write a report (OP 4; flags: `--force`, `--batch N`) |
+| `/solidus-admin account create <name> [balance]` | **Console testing**: materialize a dummy account (offline-mode UUID) without a player joining |
+| `/solidus-admin account balance <name>` / `account list [page]` | Inspect any account from the console |
+| `/solidus-admin money give\|set\|take <name> <amount>` | Seed/adjust dummy balances from the console (ledger: `ADMIN_GIVE`/`ADMIN_SET`/`ADMIN_TAKE`) |
+| `/solidus-admin pay-as <from> <to> <amount>` | Real atomic transfer between two accounts (same path as `/pay`, ledger `PAY_SEND`/`PAY_RECEIVE`) |
+| `/solidus-admin bid-as <bidder> <listing> <amount>` | Bid on behalf of a dummy account (real escrow pipeline) |
+| `/solidus-admin auction create <seller> <item> <count> <price> [startbid]` | List a conjured item for a dummy seller (real fee + ledger path) |
+| `/solidus-admin audit` | Invariant check: negative balances, escrow sanity, supply snapshot |
+| `/solidus-admin diag` | Active backend / Redis state / auction store mode / economy snapshot |
 
 ---
 

@@ -525,6 +525,130 @@ public class AuctionManager {
         listItemInternal(player, price, 0);
     }
 
+    /**
+     * Console/admin listing path (2.2.2): creates a listing for an account
+     * WITHOUT a live player, from an explicit ItemStack (typically conjured
+     * for a test dummy by the caller). Money paths, listing fee, governance
+     * veto and the AUCTION_LIST ledger are IDENTICAL to the player flow; the
+     * only difference is that no inventory is touched - the caller is
+     * responsible for the item's existence (admin-conjured test item).
+     *
+     * <p>The feedback consumer receives (isError, message) pairs and may be
+     * invoked from async threads; callers must marshal to their own thread.</p>
+     */
+    public void listItemAs(UUID sellerUuid, String sellerName, ItemStack item,
+                           double price, double startBid,
+                           java.util.function.BiConsumer<Boolean, String> feedback) {
+        if (item == null || item.isEmpty()) {
+            feedback.accept(true, "Item is empty - nothing to list.");
+            return;
+        }
+
+        // Validate price (identical bounds to the player path).
+        if (price < AuctionEntry.MIN_LISTING_PRICE) {
+            feedback.accept(true,
+                "Minimum listing price is " + CurrencyUtil.format(AuctionEntry.MIN_LISTING_PRICE));
+            return;
+        }
+        if (price > AuctionEntry.MAX_LISTING_PRICE) {
+            feedback.accept(true,
+                "Maximum listing price is " + CurrencyUtil.format(AuctionEntry.MAX_LISTING_PRICE));
+            return;
+        }
+        if (startBid > 0) {
+            if (startBid < AuctionEntry.MIN_LISTING_PRICE) {
+                feedback.accept(true,
+                    "Minimum starting bid is " + CurrencyUtil.format(AuctionEntry.MIN_LISTING_PRICE));
+                return;
+            }
+            if (startBid >= price) {
+                feedback.accept(true,
+                    "Starting bid must be lower than the buy-now price ("
+                        + CurrencyUtil.format(price) + ").");
+                return;
+            }
+        }
+
+        // Prevent concurrent listings for the same seller account.
+        if (!pendingListings.add(sellerUuid)) {
+            feedback.accept(true, "A listing is already in progress for this seller. Please wait.");
+            return;
+        }
+
+        // Transaction hook veto (Solidus 2.1.0+): same lifecycle as the player
+        // path - a denial here is a clean no-op, nothing has been touched yet.
+        SolidusTransactionHook.Decision hookDecision = EconomyHooks.allow(hook ->
+            hook.allowAuctionListing(sellerUuid, sellerName, price));
+        if (!hookDecision.allowed()) {
+            pendingListings.remove(sellerUuid);
+            feedback.accept(true, hookDecision.reason() != null
+                ? hookDecision.reason() : "Listing denied.");
+            return;
+        }
+
+        String materialName = TextUtil.getMaterialName(item);
+        int quantity = item.getCount();
+        String itemNbt = serializeItemStack(item);
+        double listingFee = AuctionEntry.calculateListingFee(price);
+        BalanceManager balanceManager = economyEngine.getBalanceManager();
+
+        // Fee via the offline-safe subtract (atomic check-and-deduct on the
+        // economy executor) - no ServerPlayer required.
+        balanceManager.subtractBalance(sellerUuid, sellerName, listingFee).thenAccept(newBalance -> {
+            if (newBalance < 0) {
+                // Insufficient funds or failure - no money was deducted and no
+                // item was ever taken, so this is a clean no-op.
+                pendingListings.remove(sellerUuid);
+                feedback.accept(true,
+                    "Listing fee is " + CurrencyUtil.format(listingFee) + ". Insufficient funds!");
+                return;
+            }
+
+            AuctionEntry entry = AuctionEntry.create(
+                sellerUuid, sellerName, materialName, quantity, itemNbt, price);
+
+            // Save to database; on save failure refund the fee (nothing was
+            // ever taken from an inventory, so there is no item to return).
+            saveListing(entry, startBid).thenAccept(success -> {
+                try {
+                    if (success) {
+                        economyEngine.getTransactionLog().log(
+                            TransactionLog.Type.AUCTION_LIST,
+                            sellerUuid, sellerName, null, null,
+                            listingFee, materialName, quantity,
+                            "Listed " + quantity + "x " + materialName + " for "
+                                + CurrencyUtil.format(price));
+
+                        EconomyHooks.notifyHooks(hook ->
+                            hook.afterAuctionListing(sellerUuid, sellerName, price, listingFee));
+
+                        feedback.accept(false,
+                            "Item listed on the Auction House for " + CurrencyUtil.format(price)
+                                + " (Fee: " + CurrencyUtil.format(listingFee) + ")");
+                    } else {
+                        SolidusMod.LOGGER.error(
+                            "CRITICAL: Auction listing save failed for {}! Refunding fee.", sellerName);
+                        balanceManager.addBalance(sellerUuid, sellerName, listingFee)
+                            .thenAccept(refundBalance -> {
+                                if (refundBalance < 0) {
+                                    SolidusMod.LOGGER.error(
+                                        "CATASTROPHIC: Listing fee refund also failed for {}! Amount: {}",
+                                        sellerName, listingFee);
+                                    feedback.accept(true,
+                                        "Critical error: listing fee refund failed. Please contact an admin.");
+                                } else {
+                                    feedback.accept(true,
+                                        "Failed to list item. Listing fee has been refunded.");
+                                }
+                            });
+                    }
+                } finally {
+                    pendingListings.remove(sellerUuid);
+                }
+            });
+        });
+    }
+
     private void listItemInternal(ServerPlayer player, double price, double startBid) {
         // Validate price
         if (price < AuctionEntry.MIN_LISTING_PRICE) {
@@ -1882,8 +2006,25 @@ public class AuctionManager {
      * @param amount    the bid amount
      */
     public void placeBid(ServerPlayer bidder, UUID listingId, double amount) {
-        final UUID bidderUuid = bidder.getUUID();
-        final String bidderName = bidder.getName().getString();
+        final var server = bidder.level().getServer();
+        placeBidAs(bidder.getUUID(), bidder.getName().getString(), listingId, amount,
+            (isError, message) -> server.execute(() -> bidder.sendSystemMessage(
+                isError ? TextUtil.error(message) : TextUtil.success(message))));
+    }
+
+    /**
+     * Player-agnostic bid placement (2.2.2 console/admin testing API).
+     * Runs the SAME three-phase escrow flow as {@link #placeBid} - identical
+     * validation, governance veto, atomic escrow charge, exactly-once claim,
+     * outbid refunds and anti-snipe - but addresses the bidder purely by
+     * UUID + name, so the bidder may be an offline or dummy account.
+     *
+     * <p>The feedback consumer receives (isError, message) pairs and may be
+     * invoked from async threads; callers must marshal to their own thread
+     * (the in-game path does this via {@code server.execute}).</p>
+     */
+    public void placeBidAs(UUID bidderUuid, String bidderName, UUID listingId, double amount,
+                           java.util.function.BiConsumer<Boolean, String> feedback) {
 
         // Phase 1 (auction executor): validate + snapshot
         CompletableFuture.supplyAsync(() -> {
@@ -1918,7 +2059,7 @@ public class AuctionManager {
             }
         }, asyncExecutor).thenAccept(phase1 -> {
             if (phase1 instanceof String err) {
-                sendBidError(bidder, err);
+                feedback.accept(false, bidErrorMessage(err));
                 return;
             }
             Object[] pair = (Object[]) phase1;
@@ -1939,11 +2080,10 @@ public class AuctionManager {
                             + entry.materialName() + " (listing " + shortId(listingId) + ")")))
                 .thenAccept(charge -> {
                     if (charge.status() != com.solidus.economy.SQLiteStorage.TransferStatus.SUCCESS) {
-                        bidder.level().getServer().execute(() ->
-                            bidder.sendSystemMessage(TextUtil.error(
-                                charge.status() == com.solidus.economy.SQLiteStorage.TransferStatus.INSUFFICIENT_FUNDS
-                                    ? "Insufficient funds for that bid."
-                                    : "Bid failed. Please try again.")));
+                        feedback.accept(false,
+                            charge.status() == com.solidus.economy.SQLiteStorage.TransferStatus.INSUFFICIENT_FUNDS
+                                ? "Insufficient funds for that bid."
+                                : "Bid failed. Please try again.");
                         return;
                     }
 
@@ -1996,22 +2136,19 @@ public class AuctionManager {
                             return "DB_ERROR";
                         }
                     }, asyncExecutor).thenAccept(phase3 -> {
-                        bidder.level().getServer().execute(() -> {
-                            switch (phase3) {
-                                case "CLAIMED" -> bidder.sendSystemMessage(TextUtil.success(
-                                    "Bid placed: " + CurrencyUtil.format(amount) + " on "
-                                        + entry.quantity() + "x " + entry.materialName()
-                                        + " (money held in escrow until you are outbid or win)."));
-                                case "CLAIMED_SNIPED" -> bidder.sendSystemMessage(TextUtil.success(
-                                    "Bid placed: " + CurrencyUtil.format(amount) + " - auction end extended!"));
-                                case "OUTBID_RACE" -> bidder.sendSystemMessage(TextUtil.error(
-                                    "Someone outbid you at the same moment - your money was refunded."));
-                                case "DB_ERROR" -> bidder.sendSystemMessage(TextUtil.error(
-                                    "Bid failed due to a system error - your money was refunded."));
-                                default -> bidder.sendSystemMessage(TextUtil.error(
-                                    "Bid failed. Please try again."));
-                            }
-                        });
+                        switch (phase3) {
+                            case "CLAIMED" -> feedback.accept(false,
+                                "Bid placed: " + CurrencyUtil.format(amount) + " on "
+                                    + entry.quantity() + "x " + entry.materialName()
+                                    + " (money held in escrow until you are outbid or win).");
+                            case "CLAIMED_SNIPED" -> feedback.accept(false,
+                                "Bid placed: " + CurrencyUtil.format(amount) + " - auction end extended!");
+                            case "OUTBID_RACE" -> feedback.accept(true,
+                                "Someone outbid you at the same moment - your money was refunded.");
+                            case "DB_ERROR" -> feedback.accept(true,
+                                "Bid failed due to a system error - your money was refunded.");
+                            default -> feedback.accept(true, "Bid failed. Please try again.");
+                        }
                     });
                 });
         });
@@ -2333,32 +2470,19 @@ public class AuctionManager {
         return s.substring(0, 8);
     }
 
-    /** Routes a bid error code to a player-facing message. */
-    private void sendBidError(ServerPlayer bidder, String err) {
-        bidder.level().getServer().execute(() -> {
-            if (err.startsWith("RULE:")) {
-                bidder.sendSystemMessage(TextUtil.error(err.substring("RULE:".length())));
-            } else if (err.startsWith("HOOK_VETOED:")) {
-                bidder.sendSystemMessage(TextUtil.error(err.substring("HOOK_VETOED:".length())));
-            } else {
-                switch (err) {
-                    case "NOT_FOUND" -> bidder.sendSystemMessage(TextUtil.error(
-                        "Listing not found or already sold!"));
-                    case "EXPIRED" -> bidder.sendSystemMessage(TextUtil.error(
-                        "This listing has expired!"));
-                    case "OWN_ITEM" -> bidder.sendSystemMessage(TextUtil.error(
-                        "You cannot bid on your own listing!"));
-                    case "NO_BIDS_SUPPORTED" -> bidder.sendSystemMessage(TextUtil.error(
-                        "This listing does not accept bids (buy-now only)."));
-                    case "NOT_INITIALIZED" -> bidder.sendSystemMessage(TextUtil.error(
-                        "Auction House is not available yet."));
-                    case "DB_ERROR" -> bidder.sendSystemMessage(TextUtil.error(
-                        "Transaction error. Please try again."));
-                    default -> bidder.sendSystemMessage(TextUtil.error(
-                        "Bid failed. Please try again."));
-                }
-            }
-        });
+    /** Routes a bid error code to a player-facing message string. */
+    private static String bidErrorMessage(String err) {
+        if (err.startsWith("RULE:")) return err.substring("RULE:".length());
+        if (err.startsWith("HOOK_VETOED:")) return err.substring("HOOK_VETOED:".length());
+        return switch (err) {
+            case "NOT_FOUND" -> "Listing not found or already sold!";
+            case "EXPIRED" -> "This listing has expired!";
+            case "OWN_ITEM" -> "You cannot bid on your own listing!";
+            case "NO_BIDS_SUPPORTED" -> "This listing does not accept bids (buy-now only).";
+            case "NOT_INITIALIZED" -> "Auction House is not available yet.";
+            case "DB_ERROR" -> "Transaction error. Please try again.";
+            default -> "Bid failed. Please try again.";
+        };
     }
 
     /** Queues an offline-tolerant notification (delivered immediately if online). */

@@ -242,3 +242,43 @@ The new UI offers a professional visual experience with a dark border and colore
 27 self-skipping CI-gated tests (MySQL/MariaDB + Redis service containers;
 the same files bind and run green in CI when `SOLIDUS_TEST_MYSQL_HOST` /
 `SOLIDUS_TEST_REDIS_URI` are set).
+
+---
+
+## 2.2.2 — Console test harness (playerless economy testing)
+
+**New:**
+
+- `com.solidus.admin.AdminOps` — player-agnostic admin/testing service; the
+  full economy lifecycle is now drivable from the server console or Rcon:
+  dummy account creation (vanilla offline-mode UUID derivation), money
+  give/set/take, real atomic `pay-as` transfers, `bid-as` escrow bids and
+  `auction create` listings on dummy accounts, an invariant `audit`
+  (negative-balance tail scan, escrow sanity, supply snapshot) and `diag`
+  (backend/Redis/auction-mode/economy snapshot).
+- `/solidus-admin` subcommand tree extended accordingly (OP 4 / console).
+- Ledger types `ADMIN_GIVE` / `ADMIN_SET` / `ADMIN_TAKE` (rendered as
+  `AD+` / `AD=` / `AD-` in `/transactions`); `pay-as` records the standard
+  `PAY_SEND` / `PAY_RECEIVE` rows for exact parity with player `/pay`.
+- `AuctionManager`: `placeBidAs` / `listItemAs` player-agnostic cores
+  (the `ServerPlayer` methods became thin wrappers — behavior identical);
+  `bidErrorMessage` extracted as a pure string mapper.
+- New doc: `docs/CONSOLE_TESTING.md` — command reference + scripted
+  single-server, auction-lifecycle, two-server race and outage scenarios.
+- CI: `.github/workflows/test.yml` now boots `mariadb:11` + `redis:7` service
+  containers with the `SOLIDUS_TEST_*` variables set, so the 27 previously
+  self-skipping network tests (200-transfer race, idempotency replay, MySQL
+  auction dialect, migrator against a throwaway database, Redis layer) run
+  for real on every push.
+
+**Internal:**
+
+- `SolidusAdminCommand.register` now also receives the `AuctionManager`.
+- `TransactionsCommand` type/color switches extended for the ADMIN_* types
+  (exhaustiveness compiler-enforced).
+
+**Test totals after 2.2.2:** 387 test executions — 360 passed, 0 failed,
+27 CI-gated (which now activate in GitHub Actions against real service
+containers). New suite: `AdminOpsTest` (23 cases, real SQLiteStorage harness,
+no Mockito — the inline mock maker is incompatible with the Java 25
+toolchain; a thin EconomyEngine subclass replaces it).
