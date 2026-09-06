@@ -1,7 +1,9 @@
 package com.solidus.auction;
 
 import com.solidus.economy.EconomyEngine;
+import com.solidus.economy.SQLiteStorage;
 import com.solidus.economy.StorageBackend;
+import com.solidus.economy.TransactionLog;
 
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.Assumptions;
@@ -11,7 +13,6 @@ import org.junit.jupiter.api.MethodOrderer;
 import org.junit.jupiter.api.Order;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.TestMethodOrder;
-import org.mockito.Mockito;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -21,7 +22,9 @@ import java.sql.PreparedStatement;
 import java.sql.ResultSet;
 import java.sql.Statement;
 import java.util.List;
+import java.util.Map;
 import java.util.UUID;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeUnit;
 
 import static org.junit.jupiter.api.Assertions.*;
@@ -231,7 +234,10 @@ public class MySqlAuctionDialectTest {
         assertEquals(1, result[1], "one orphan re-listed (no log match)");
         assertEquals(0, count("auction_listings WHERE status = 1"), "no SOLD rows remain");
         assertEquals(1, count("auction_listings WHERE status = 0"), "re-listed row is ACTIVE");
-        assertEquals(2, count("auction_sold_history"));
+        // Only the ARCHIVED orphan lands in history (1 row) — the re-listed
+        // one never settles (same expectation as the SQLite sibling test,
+        // AuctionSettlementHistoryTest.relistsOrphanWithoutLog).
+        assertEquals(1, count("auction_sold_history"));
     }
 
     @Test
@@ -250,13 +256,51 @@ public class MySqlAuctionDialectTest {
             ps.executeUpdate();
         }
 
-        EconomyEngine engine = Mockito.mock(EconomyEngine.class);
-        Mockito.when(engine.getStorage()).thenAnswer(inv -> {
-            StorageBackend stub = Mockito.mock(StorageBackend.class);
-            Mockito.when(stub.getBalance(Mockito.any(), Mockito.any()))
-                .thenReturn(java.util.concurrent.CompletableFuture.completedFuture(0.0));
-            return stub;
-        });
+        // Pure-Java stubs (NO Mockito anywhere in this test: the inline mock
+        // maker cannot instrument classes OR interfaces on the Java 25
+        // toolchain — same root cause as the AdminOpsTest workaround).
+        StorageBackend stubBackend = new StorageBackend() {
+            @Override public void initialize() { }
+            @Override public void shutdown() { }
+            @Override public CompletableFuture<Double> getBalance(UUID uuid, String playerName) {
+                return java.util.concurrent.CompletableFuture.completedFuture(0.0);
+            }
+            @Override public CompletableFuture<List<SQLiteStorage.BalanceEntry>> getTopBalances(int limit, int offset) {
+                return java.util.concurrent.CompletableFuture.completedFuture(List.of());
+            }
+            @Override public CompletableFuture<Integer> getBalanceEntryCount() {
+                return java.util.concurrent.CompletableFuture.completedFuture(0);
+            }
+            @Override public CompletableFuture<SQLiteStorage.EconomyStats> getEconomyStats() {
+                return java.util.concurrent.CompletableFuture.completedFuture(null);
+            }
+            @Override public CompletableFuture<Boolean> setBalance(UUID uuid, String playerName, double amount) {
+                return java.util.concurrent.CompletableFuture.completedFuture(true);
+            }
+            @Override public CompletableFuture<Double> addBalance(UUID uuid, String playerName, double amount) {
+                return java.util.concurrent.CompletableFuture.completedFuture(amount);
+            }
+            @Override public CompletableFuture<Double> subtractBalance(UUID uuid, String playerName, double amount) {
+                return java.util.concurrent.CompletableFuture.completedFuture(amount);
+            }
+            @Override public CompletableFuture<Boolean> hasBalance(UUID uuid, double amount) {
+                return java.util.concurrent.CompletableFuture.completedFuture(false);
+            }
+            @Override public CompletableFuture<SQLiteStorage.TransferOutcome> transferAtomic(
+                    UUID senderUuid, String senderName, UUID receiverUuid, String receiverName, double amount) {
+                return java.util.concurrent.CompletableFuture.completedFuture(null);
+            }
+            @Override public CompletableFuture<SQLiteStorage.TransferOutcome> transferAtomicWithLedger(
+                    UUID senderUuid, String senderName, UUID receiverUuid, String receiverName,
+                    double amount, List<SQLiteStorage.AtomicLedgerRow> ledgerRows) {
+                return java.util.concurrent.CompletableFuture.completedFuture(null);
+            }
+            @Override public TransactionLog getTransactionLog() { return null; }
+            @Override public Map<UUID, String> getPlayerNameCache() { return Map.of(); }
+        };
+        EconomyEngine engine = new EconomyEngine() {
+            @Override public StorageBackend getStorage() { return stubBackend; }
+        };
         AuctionManager manager = new AuctionManager(engine, () -> {
             try {
                 return DriverManager.getConnection(MYSQL_URL, USER, PASSWORD);

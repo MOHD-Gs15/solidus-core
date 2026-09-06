@@ -10,13 +10,16 @@ server owner, at a glance, which releases are built and tested to work together.
 | **Family (Minor)** `2.1.x → 2.2.0` | **Owner-designated architecture era** — never used for ordinary feature additions. The `2.2` family is **reserved** for the cross-server / multi-server storage era. | No — the other mods must move to the new family in lockstep. |
 | **Major** `2.x → 3.0.0` | Architectural reset of the ecosystem contract. | No — full coordinated release. |
 
-Current family: **2.2.2** — Core is on it (the multi-server storage era began:
+Current family: **2.2.3** — Core is on it (the multi-server storage era began:
 `MySqlStorage` + `DECIMAL(18,2)` exact money landed in 2.2.0; the shared
 auction market, the optional Redis layer and the cutover migrator landed in
 2.2.1; the console test harness (`/solidus-admin` accounts/money/pay-as/bid-as/
-auction/audit/diag + ADMIN_* ledger types) landed in 2.2.2). Companions built
-against the `2.1.x` API keep working — the releases are purely additive to
-`SolidusAPI`; they declare the minimum family
+auction/audit/diag + ADMIN_* ledger types) landed in 2.2.2; the first real
+CI run against live MariaDB/Redis service containers (2.2.3) flushed out and
+fixed five latent production bugs across the idempotency claim, the auction
+orphan sweep, the search escape character and the cutover migrator).
+Companions built against the `2.1.x` API keep working — the releases are
+purely additive to `SolidusAPI`; they declare the minimum family
 they were integration-tested against in their own `fabric.mod.json`.
 
 > **Owner rule (2026-09-06):** feature additions such as `/trade` and the

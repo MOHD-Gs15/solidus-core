@@ -94,9 +94,13 @@ public final class StorageMigrator {
         HikariDataSource mysql = null;
         try (Connection sqlite = DriverManager.getConnection(sqliteUrl)) {
             mysql = openTarget();
-            // Schema on the target FIRST: MySqlStorage's auto-create covers
-            // economy tables; auction DDL mirrors AuctionManager (2.2.1).
-            createAuctionSchema(mysql);
+            // Schema on the target FIRST — the FULL schema (2.2.3 fix): the
+            // migrator previously created only the five auction tables, so a
+            // cutover onto a fresh database aborted on player_balances
+            // ("table doesn't exist"), caught by the first real CI run.
+            // Economy tables mirror MySqlStorage; ledger + notifications
+            // mirror TransactionLog; auctions mirror AuctionManager (2.2.1).
+            createTargetSchema(mysql);
 
             for (TablePlan plan : TABLES) {
                 long copied = copyTable(sqlite, mysql, plan, batchSize, issues, log);
@@ -104,16 +108,20 @@ public final class StorageMigrator {
                 log.info("Migrated {}: {} row(s)", plan.table(), copied);
             }
 
-            // ── Verify ──
+            // ── Verify ── (2.2.3 fix: the shared SQLite connection must NOT
+            // be declared as a try-with-resources resource here — closing the
+            // alias closed the OUTER connection after the first verify block
+            // and every later count aborted with "database connection closed".
+            // Latent since 2.2.1 — never surfaced because the copy stage
+            // always failed first on a fresh target.)
             long sourcePlayers;
             long targetPlayers;
             double sourceSupply;
             double targetSupply;
-            try (Connection sc = sqlite;
-                 Connection tc = mysql.getConnection()) {
-                sourcePlayers = count(sc, "SELECT COUNT(*) FROM player_balances");
+            try (Connection tc = mysql.getConnection()) {
+                sourcePlayers = count(sqlite, "SELECT COUNT(*) FROM player_balances");
                 targetPlayers = count(tc, "SELECT COUNT(*) FROM player_balances");
-                sourceSupply = round2(sum(sc, "SELECT COALESCE(SUM(balance), 0) FROM player_balances"));
+                sourceSupply = round2(sum(sqlite, "SELECT COALESCE(SUM(balance), 0) FROM player_balances"));
                 targetSupply = round2(sum(tc, "SELECT COALESCE(SUM(balance), 0) FROM player_balances"));
             }
 
@@ -126,9 +134,11 @@ public final class StorageMigrator {
             for (TablePlan plan : TABLES) {
                 long s;
                 long t;
-                try (Connection sc = sqlite;
-                     Connection tc = mysql.getConnection()) {
-                    s = count(sc, "SELECT COUNT(*) FROM " + plan.table());
+                try (Connection tc = mysql.getConnection()) {
+                    if (!sourceTableExists(sqlite, plan.table())) {
+                        continue; // missing on the source was already reported by copyTable
+                    }
+                    s = count(sqlite, "SELECT COUNT(*) FROM " + plan.table());
                     t = count(tc, "SELECT COUNT(*) FROM " + plan.table());
                 }
                 if (s != t) {
@@ -173,8 +183,21 @@ public final class StorageMigrator {
         }
     }
 
-    /** Creates the five auction tables on the target (mirrors AuctionManager.MYSQL DDL). */
-    private void createAuctionSchema(HikariDataSource mysql) throws SQLException {
+    /**
+     * Creates the FULL schema on the target before any copy: economy tables
+     * (balances + operations, mirroring {@link MySqlStorage}), ledger +
+     * offline notifications (mirroring {@link TransactionLog}) and the five
+     * auction tables (mirroring {@link AuctionManager}, 2.2.1).
+     */
+    private void createTargetSchema(HikariDataSource mysql) throws SQLException {
+        try (Connection conn = mysql.getConnection()) {
+            MySqlStorage.createEconomySchema(conn);
+            try (Statement st = conn.createStatement()) {
+                for (String ddl : TransactionLog.Dialect.MYSQL.statements()) {
+                    if (ddl != null) st.execute(ddl);
+                }
+            }
+        }
         try (Connection conn = mysql.getConnection();
              Statement st = conn.createStatement()) {
             for (String ddl : AuctionManager.AuctionDialect.MYSQL.statements()) {
@@ -183,8 +206,24 @@ public final class StorageMigrator {
         }
     }
 
+    /** True when the SQLite source has the table (old/partial backups may not). */
+    private boolean sourceTableExists(Connection sqlite, String table) throws SQLException {
+        try (Statement st = sqlite.createStatement();
+             ResultSet rs = st.executeQuery(
+                 "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = '" + table + "'")) {
+            return rs.next();
+        }
+    }
+
     private long copyTable(Connection sqlite, HikariDataSource mysql, TablePlan plan,
                            int batchSize, List<String> issues, Logger log) throws SQLException {
+        // Old/partial SQLite backups may predate some tables — skip them with
+        // a loud note instead of aborting the whole cutover.
+        if (!sourceTableExists(sqlite, plan.table())) {
+            issues.add("skipped " + plan.table() + ": table does not exist on the SQLite source");
+            log.warn("Migrate: source has no {} table — skipped", plan.table());
+            return 0;
+        }
         boolean hasId = !plan.idColumn().equals("rowid");
         String selectSql = hasId
             ? "SELECT * FROM " + plan.table() + " WHERE " + plan.idColumn() + " > ? ORDER BY " + plan.idColumn() + " LIMIT ?"

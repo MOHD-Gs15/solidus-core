@@ -1145,19 +1145,25 @@ public class AuctionManager {
     /**
      * Static, connection-injected core of the search so tests can drive it
      * against a plain SQLite database without the Minecraft server.
-     * LIKE wildcards in the user term (%, _) are escaped and matched literally.
+     * LIKE wildcards in the user term (%, _) are escaped and matched literally
+     * via the {@code !} escape character — NOT backslash: MariaDB/MySQL treat
+     * {@code \} inside string literals as an escape character, so
+     * {@code ESCAPE '\'} corrupts the statement parsing there (the search
+     * silently returned an empty list on the shared-database dialect — caught
+     * by the first real CI run, 2.2.1 → 2.2.3). {@code !} is a literal
+     * character on both dialects and needs no dialect branching.
      */
     static List<AuctionEntry> searchListingsVia(Connection conn, String term, int limit) throws SQLException {
         List<AuctionEntry> entries = new ArrayList<>();
         String like = "%" + term.toLowerCase(Locale.ROOT)
-                .replace("\\", "\\\\")
-                .replace("%", "\\%")
-                .replace("_", "\\_") + "%";
+                .replace("!", "!!")
+                .replace("%", "!%")
+                .replace("_", "!_") + "%";
         String sql = """
             SELECT * FROM auction_listings
             WHERE status = 0 AND expire_timestamp > ?
-              AND (LOWER(material_name) LIKE ? ESCAPE '\\'
-                   OR LOWER(seller_name) LIKE ? ESCAPE '\\')
+              AND (LOWER(material_name) LIKE ? ESCAPE '!'
+                   OR LOWER(seller_name) LIKE ? ESCAPE '!')
             ORDER BY price ASC
             LIMIT ?""";
         try (PreparedStatement ps = conn.prepareStatement(sql)) {
@@ -3115,7 +3121,7 @@ public class AuctionManager {
             }
 
             if (matchedRowid != null && insertSoldHistory(auctionConn, entry,
-                    buyerUuid, buyerName, SETTLED_SOLD, logTimestamp, log)) {
+                    buyerUuid, buyerName, SETTLED_SOLD, logTimestamp, log, dialect)) {
                 try (PreparedStatement del = auctionConn.prepareStatement(
                         "DELETE FROM auction_listings WHERE listing_id = ? AND status = 1")) {
                     del.setString(1, entry.listingId().toString());

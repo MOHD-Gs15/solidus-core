@@ -1,77 +1,43 @@
-Fix Minecraft 26.1.x API breaking changes - build successful, 176/176 tests pass
+fix(db): 5 latent bugs flushed out by the first real CI run (2.2.3)
 
-API migrations required for Minecraft 26.1.x final release:
+The 2.2.2 push activated the 27 CI-gated tests for the first time
+(mariadb:11 + redis:7 service containers). 4 failures came back — each a
+latent 2.2.1 production bug. Reproduced locally against a portable
+MariaDB 11.8.6 (no Docker: .deb-extracted mariadbd, user datadir), fixed,
+re-verified, and during that verification a 5th latent bug surfaced.
 
-1. ResourceLocation renamed to Identifier in net.minecraft.resources
-   - All "new ResourceLocation(x)" replaced with Identifier.tryParse(x)
-   - All imports and type references updated
+Production fixes:
+- Idempotent transfer replay DOUBLE-PAID: the operations claim used
+  INSERT ... ON DUPLICATE KEY UPDATE with an affected-rows 1-vs-2 routing,
+  but MariaDB returns 0 for a no-op duplicate update (a replay sends the
+  same op_type), so replays re-executed the transfer. Claim is now
+  INSERT IGNORE (1 = fresh claim, 0 = already claimed).
+- Auction orphan sweep archived NOTHING on MySQL: insertSoldHistory was
+  called without the dialect arg -> INSERT OR IGNORE (invalid on MariaDB)
+  -> log-matched orphans were re-listed, i.e. PAID items re-entered the
+  market on a network. The dialect now flows through.
+- Auction search returned an empty list on MySQL: ESCAPE '\' corrupts
+  statement parsing on MariaDB/MySQL (backslash is a string-literal escape
+  there). Escape character is now '!' — portable on both dialects.
+- Cutover migrator failed on a fresh target DB: it created only the five
+  auction tables and relied on a MySqlStorage auto-create that never ran.
+  Now creates the FULL target schema (MySqlStorage.createEconomySchema +
+  ledger/notifications + auctions) and tolerates missing tables on old
+  SQLite backups (skipped with a report note, not an abort).
+- Migrator verify phase closed the shared SQLite connection via a
+  try-with-resources alias (latent since 2.2.1 — masked by the copy-stage
+  failure). Verify now reuses the outer connection.
 
-2. Entity.getServer() removed
-   - player.getServer() replaced with player.level().getServer()
-   - Applied across ShopManager, AuctionManager, SolidusIntegration, SellScreenHandler
+Test fixes:
+- MySqlAuctionDialectTest: pure-Java stubs replace Mockito entirely
+  (inline mock maker cannot instrument classes OR interfaces on Java 25).
+- Orphan-recovery test expectation corrected (archived history = 1, not 2;
+  a re-listed orphan never settles — matches the SQLite sibling test).
+- StorageMigratorTest: ConfigManager pointed at a temp dir; SQLite source
+  now carries all five auction tables with real rows.
 
-3. CommandSourceStack.hasPermission(int) removed
-   - New system uses PermissionLevel enum + Permission.HasCommandLevel
-   - Added private hasOpLevel() helpers in PermissionChecker
-   - Updated all 6 call sites in PermissionChecker
+Verified locally against real MariaDB 11.8.6: 387 executions —
+383 passed / 0 failed / 4 gated skips (Redis only). CI expected: 0 skips.
 
-4. Component.append() only available on MutableComponent
-   - Changed TextUtil builder methods to return MutableComponent
-   - Changed local variable declarations from Component to MutableComponent
-     where .append() is called
-
-5. BuiltInRegistries.ITEM.get() now returns Optional<Holder.Reference<Item>>
-   - Added .map(Holder::value).orElse(null) chain at all call sites
-   - Affected: ShopGUI, ShopManager, ShopScreenHandler, AuctionGUI, AuctionManager
-
-6. ItemStack.save(HolderLookup.Provider) and ItemStack.parseOptional() removed
-   - Replaced with ItemStack.CODEC.encodeStart() / ItemStack.CODEC.parse()
-   - Uses RegistryOps.create(JsonOps.INSTANCE, registryAccess) for serialization
-
-7. TagParser.parseTag(String) removed
-   - Replaced with JsonParser.parseString() + Codec-based deserialization
-
-8. Lambda effectively-final variable enforcement (Java 25 strict)
-   - SQLiteStorage: amount reassigned, introduced final roundedAmount
-   - ShopScreenHandler.openScreen: page reassigned, introduced final safePage
-   - SellScreenHandler: totalEarnings/totalItemsSold captured in final snapshots
-
-9. CommandSourceStack.getPlayer() no longer throws CommandSyntaxException
-   - Removed unnecessary try/catch in PermissionChecker.check()
-
-10. ShopGUILayout lazy initialization
-    - BORDER_PANES and ACCENT_PANES converted from static final arrays
-      to lazy-initialized volatile fields with accessor methods
-    - Prevents triggering Items.<clinit> (and full Minecraft Bootstrap)
-      when ShopGUILayout is loaded by pure-Java unit tests
-
-11. RateLimiter.removePlayer null check
-    - ConcurrentHashMap.remove(null) throws NPE in Java 25
-    - Added defensive null check
-
-12. build.gradle fix
-    - Added import for org.gradle.jvm.toolchain.JavaLanguageVersion
-    - Changed LanguageVersion.of(25) to JavaLanguageVersion.of(25)
-
-Build environment:
-- Temurin OpenJDK 25.0.3+9 (downloaded portable)
-- Gradle 9.5.1 (downloaded portable)
-- Fabric Loom 1.16.3
-- Minecraft 26.1.2 (auto-downloaded by Loom)
-
-Build result:
-- compileJava: SUCCESS
-- test: 176 tests, 0 failures
-- jar: build/libs/solidus-2.0.0.jar (14MB, includes bundled sqlite-jdbc)
-
-Test breakdown:
-- ShopGUILayoutTest: 43 tests (layout arithmetic, centering, slot classification)
-- RateLimiterTest: 24 tests (cooldown, concurrency, cleanup)
-- SolidusPermissionsTest: 11 tests (naming, OP levels)
-- CurrencyUtilTest: 30 tests (formatting, validation, rounding)
-- TextUtilTest: 17 tests (formatCurrency, sanitizeLegacyFormatting)
-- BalanceManagerTest: 17 tests (balance ops, transfers, atomicity)
-- SQLiteStorageTest: 34 tests (persistence, concurrency, cache)
-
-Added .gitignore to exclude build artifacts and IDE files.
-Added scripts/fix_26_1_api.py and fix_26_1_api_v2.py for future migration runs.
+Docs: DB_SCALING_PLAN s11 bug ledger, AGENT_NOTES s12 (Arabic),
+CHANGES 2.2.3, VERSIONING current family 2.2.3, README badge 2.2.3.

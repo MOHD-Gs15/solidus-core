@@ -282,3 +282,54 @@ the same files bind and run green in CI when `SOLIDUS_TEST_MYSQL_HOST` /
 containers). New suite: `AdminOpsTest` (23 cases, real SQLiteStorage harness,
 no Mockito — the inline mock maker is incompatible with the Java 25
 toolchain; a thin EconomyEngine subclass replaces it).
+
+---
+
+## 2.2.3 — Bug fixes flushed out by the first real CI run
+
+The 2.2.2 push activated the 27 CI-gated tests for the first time (real
+`mariadb:11` / `redis:7` service containers). Four failures came back —
+each a latent 2.2.1 production bug, plus one more found while reproducing
+them locally against a portable MariaDB 11.8.6 (no Docker required:
+.deb-extracted `mariadbd` on a user datadir).
+
+**Fixed (production):**
+
+- **Idempotent transfer replay double-paid.** The `operations` claim used
+  `INSERT … ON DUPLICATE KEY UPDATE` with an affected-rows `1 vs 2` routing;
+  MariaDB returns **0** for a no-op duplicate update (a replay sends the
+  same `op_type`), so replays re-executed the transfer. Claim is now
+  `INSERT IGNORE` (1 = fresh claim, 0 = already claimed) — unambiguous on
+  both dialects.
+- **Auction orphan sweep archived nothing on MySQL.** The sweep's archive
+  call defaulted to the SQLITE dialect → `INSERT OR IGNORE` (invalid on
+  MariaDB) → log-matched orphans were RE-LISTED (a paid item could re-enter
+  the market). The dialect now flows through.
+- **Auction search returned an empty list on MySQL.** `ESCAPE '\'` breaks
+  statement parsing on MariaDB/MySQL (backslash is a string-literal escape
+  there; SQLite takes it literally). The escape character is now `!`
+  (`!`→`!!`, `%`→`!%`, `_`→`!_`) — portable, no dialect branching.
+- **Cutover migrator failed on a fresh target DB.** Only the five auction
+  tables were created; `player_balances` did not exist. The migrator now
+  creates the FULL target schema (`MySqlStorage.createEconomySchema` +
+  ledger/notifications + auctions) and tolerates tables missing on old
+  SQLite backups (skipped with a report note, not an abort).
+- **Migrator verify phase closed the shared SQLite connection** (latent
+  since 2.2.1 — the copy stage always failed first, masking it). Verify
+  counts now reuse the outer connection.
+
+**Fixed (tests):**
+
+- `MySqlAuctionDialectTest` read-path case: pure-Java stubs replace Mockito
+  entirely (the inline mock maker cannot instrument classes OR interfaces on
+  the Java 25 toolchain).
+- Orphan-recovery test expectation corrected (archived history rows = 1, not
+  2 — a re-listed orphan never settles; matches the SQLite sibling test).
+- `StorageMigratorTest`: `ConfigManager` pointed at a temp dir (report-file
+  assertion meaningful); the SQLite source now carries all five auction
+  tables with real rows (full copy + re-run convergence coverage).
+
+**Test totals after 2.2.3:** verified locally against a real MariaDB 11.8.6 —
+387 executions: 383 passed, 0 failed, 4 CI-gated skips (Redis layer only;
+the 23 MySQL-gated tests now run green against the real server). GitHub
+Actions is expected to show **zero** gated skips (both service containers up).

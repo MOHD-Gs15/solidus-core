@@ -89,6 +89,20 @@ public class MySqlStorage implements StorageBackend {
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
         """;
 
+    /**
+     * Creates the economy schema (balances + operations idempotency table) on
+     * an open connection. Shared by {@link #initialize()} and the SQLite →
+     * MySQL migrator (2.2.3 — the migrator previously created ONLY the
+     * auction tables, so a cutover onto a FRESH database failed with
+     * "player_balances doesn't exist"; caught by the first real CI run).
+     */
+    static void createEconomySchema(Connection conn) throws SQLException {
+        try (Statement stmt = conn.createStatement()) {
+            stmt.execute(CREATE_PLAYER_BALANCES_SQL);
+            stmt.execute(CREATE_OPERATIONS_SQL);
+        }
+    }
+
     private static final String SELECT_BALANCE = "SELECT balance FROM player_balances WHERE uuid = ?";
     private static final String SELECT_BALANCE_FOR_UPDATE =
         "SELECT balance FROM player_balances WHERE uuid = ? FOR UPDATE";
@@ -165,10 +179,8 @@ public class MySqlStorage implements StorageBackend {
                     + " — economy NOT started. Fix storage.json or set type back to \"sqlite\".", e);
         }
 
-        try (Connection conn = dataSource.getConnection();
-             Statement stmt = conn.createStatement()) {
-            stmt.execute(CREATE_PLAYER_BALANCES_SQL);
-            stmt.execute(CREATE_OPERATIONS_SQL);
+        try (Connection conn = dataSource.getConnection()) {
+            createEconomySchema(conn);
         } catch (SQLException e) {
             dataSource.close();
             throw new RuntimeException("Solidus MySQL backend: schema creation failed", e);
@@ -609,13 +621,19 @@ public class MySqlStorage implements StorageBackend {
      * timeout, a reconnect, or a cross-server re-dispatch — gets the recorded
      * result back instead of moving money twice.
      *
-     * <p>Pattern (the corrected form from the hybrid-plan review §3):</p>
+     * <p>Pattern:</p>
      * <ol>
-     *   <li>Claim: {@code INSERT ... ON DUPLICATE KEY UPDATE op_type = VALUES(op_type)}
-     *       — a replay must NOT throw (a bare INSERT would abort on the
-     *       unique key exactly when idempotency matters most).</li>
+     *   <li>Claim: {@code INSERT IGNORE INTO operations ...} — a replay must
+     *       NOT throw (a bare INSERT would abort on the unique key exactly
+     *       when idempotency matters most). NOT {@code ON DUPLICATE KEY
+     *       UPDATE}: on MariaDB/MySQL a duplicate-key update that changes
+     *       nothing returns affected-rows 0 (not 2), so a replay carrying the
+     *       same op_type slipped past the "claimed elsewhere" check and
+     *       RE-EXECUTED the transfer — a double payment, caught by the first
+     *       real CI run against MariaDB (2.2.1 → 2.2.3 fix). INSERT IGNORE
+     *       has unambiguous semantics: 1 = fresh claim, 0 = row exists.</li>
      *   <li>The affected-rows value disambiguates: 1 = we own the id;
-     *       2 = someone else claimed it first.</li>
+     *       0 = someone else claimed it first (or this is a replay).</li>
      *   <li>Owners execute the transfer and record the outcome on the row;
      *       non-owners either replay a recorded outcome or refuse while the
      *       operation is still in flight.</li>
@@ -643,9 +661,8 @@ public class MySqlStorage implements StorageBackend {
             int affected;
             try (Connection conn = dataSource.getConnection();
                  PreparedStatement ps = conn.prepareStatement(
-                     "INSERT INTO operations (op_id, account_uuid, op_type, request_hash, result_state, created_at) "
-                         + "VALUES (?, ?, ?, NULL, NULL, ?) "
-                         + "ON DUPLICATE KEY UPDATE op_type = VALUES(op_type)")) {
+                     "INSERT IGNORE INTO operations (op_id, account_uuid, op_type, request_hash, result_state, created_at) "
+                         + "VALUES (?, ?, ?, NULL, NULL, ?)")) {
                 ps.setString(1, opId.toString());
                 ps.setString(2, senderUuid.toString());
                 ps.setString(3, opType == null || opType.isBlank() ? "TRANSFER" : opType);
@@ -656,8 +673,9 @@ public class MySqlStorage implements StorageBackend {
                 return new SQLiteStorage.TransferOutcome(SQLiteStorage.TransferStatus.PERSIST_ERROR, 0, 0);
             }
 
-            if (affected >= 2) {
-                // Another execution already holds this op id.
+            if (affected == 0) {
+                // INSERT IGNORE swallowed the unique key: another execution
+                // already holds this op id (or this call is a replay).
                 String recorded = readOperationResult(opId);
                 if (recorded != null) {
                     SQLiteStorage.TransferOutcome replayed = decodeOutcome(recorded);

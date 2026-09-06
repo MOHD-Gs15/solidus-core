@@ -423,8 +423,9 @@ was already fully functional without Redis; the Redis layer stays optional.
 4. **`operations` idempotency wiring** — DONE as an API primitive:
    `StorageBackend.transferAtomicWithLedger(opId, opType, …)` (default
    delegates = no behavior change) with a real MySqlStorage routing through
-   the `operations` table using the corrected ON CONFLICT pattern (claim via
-   upsert, affected-rows disambiguation, recorded-outcome replay).
+   the `operations` table (claim via `INSERT IGNORE`, affected-rows
+   disambiguation, recorded-outcome replay — the claim was corrected from
+   the ON-DUPLICATE-KEY form in 2.2.3, see the bug list below).
    No production caller passes opIds yet — the primitive exists for
    cross-server bridges; tested by `MySqlOperationsIdempotencyTest`.
 5. **SKIP LOCKED expiry sweeps** — DONE (see item 1). The DB outbox stays
@@ -439,3 +440,47 @@ was already fully functional without Redis; the Redis layer stays optional.
   startup; the escrow balance now comes from the storage API (async).
 - `extensions_used` was never incremented — the anti-snipe cap (12) never
   took effect; every extension now advances the counter.
+
+**Bug fixes flushed out by the first real CI run (2.2.2's service containers
+activating the 27 gated tests — shipped in 2.2.3):**
+
+The 2.2.1 MySQL tests had always self-skipped in the sandbox; the first run
+against a live `mariadb:11` container caught four production bugs plus one
+test-only defect, each reproduced and fixed locally against a real
+MariaDB 11.8 before re-pushing:
+
+1. **Idempotent-transfer claim re-executed replays (double payment).** The
+   claim used `INSERT … ON DUPLICATE KEY UPDATE op_type = VALUES(op_type)`
+   and routed on affected-rows `1 vs 2` — but MariaDB/MySQL return **0** for
+   a duplicate-key update that changes nothing, and a replay carries the
+   same `op_type`, so the no-op update slipped past the "claimed elsewhere"
+   branch and executed the transfer a second time. The claim is now
+   `INSERT IGNORE` (1 = fresh claim, 0 = row exists) — unambiguous on both
+   dialects. Caught by `MySqlOperationsIdempotencyTest.transferThenReplay`.
+2. **Auction orphan sweep archived nothing on MySQL.** The sweep's archive
+   call omitted the `dialect` argument → defaulted to SQLITE → generated
+   `INSERT OR IGNORE` (invalid SQL on MariaDB) → every log-matched orphan
+   fell into the re-list branch. On a real network this would re-list
+   ALREADY-PAID items. Now passes the dialect through. Caught by
+   `MySqlAuctionDialectTest.orphanRecoveryUsesInformationSchemaAndId`
+   (plus the test's own history-count expectation corrected from 2 to 1 —
+   a re-listed orphan is never archived).
+3. **Auction search silently returned an empty list on MySQL.** The LIKE
+   used `ESCAPE '\'` — SQLite treats the backslash literally, but
+   MariaDB/MySQL treat `\` inside string literals as an escape character,
+   corrupting the statement (the error was swallowed into an empty result).
+   The escape character is now `!` (literal on both dialects; the term
+   escapes `!` → `!!`, `%` → `!%`, `_` → `!_`). Caught by
+   `MySqlAuctionDialectTest.managerReadPathsAgainstMysqlDialect`.
+4. **Cutover migrator failed on a fresh target database.** The migrator
+   created only the five auction tables and relied on "MySqlStorage's
+   auto-create" that never ran — `player_balances` did not exist on a
+   brand-new target. It now creates the FULL schema (economy + ledger +
+   notifications + auctions) via `MySqlStorage.createEconomySchema`, and
+   additionally tolerates tables missing on old/partial SQLite backups
+   (skipped with a loud report note instead of aborting).
+5. **Cutover migrator verify phase aborted on a closed connection** (latent
+   since 2.2.1, never surfaced because the copy stage always failed first):
+   the verify blocks re-declared the shared SQLite connection as a
+   try-with-resources resource, closing it after the first block. The
+   counts now run against the outer connection directly.
