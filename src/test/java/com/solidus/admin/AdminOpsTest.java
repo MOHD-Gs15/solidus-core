@@ -160,7 +160,7 @@ class AdminOpsTest {
         }
 
         @Test
-        @DisplayName("explicit initial balance lands exactly and is logged ADMIN_SET")
+        @DisplayName("explicit initial balance lands exactly and is logged ADMIN_SET as the signed delta")
         void initialBalanceAppliedAndLogged() throws Exception {
             ok(admin.createAccount("SeededBot", 1234.5).get(5, TimeUnit.SECONDS));
             assertEquals(1234.5, balanceOf("SeededBot"));
@@ -169,7 +169,11 @@ class AdminOpsTest {
                 ledgerOf(AdminOps.offlineUuid("SeededBot"));
             assertEquals(1, ledger.size());
             assertEquals(TransactionLog.Type.ADMIN_SET, ledger.get(0).type());
-            assertEquals(1234.5, ledger.get(0).amount());
+            // 2.2.4 ledger semantics: ADMIN_SET carries the SIGNED supply delta
+            // (final − starting) — 1234.5 − 500.0 starting — not the final
+            // balance. The supply-integrity checker replays ledger rows as
+            // deltas, so the row must describe the actual supply change.
+            assertEquals(734.5, ledger.get(0).amount());
         }
 
         @Test

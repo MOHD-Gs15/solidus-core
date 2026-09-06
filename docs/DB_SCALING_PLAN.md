@@ -1,9 +1,10 @@
 # Solidus — Database Scaling Plan: MySQL / MariaDB / Redis
 
-> **Status: Phases 1+2 IMPLEMENTED** — Phase 1 (abstraction) shipped as 2.1.5,
-> Phase 2 (MySQL/MariaDB multi-server backend) shipped as 2.2.0. Phases 3/4
-> (Redis cache/bus + network integrity tooling) target 2.2.1 — see §11 for the
-> shipped-vs-remaining scope table. | Author: agent implementation notes
+> **Status: ALL FOUR PHASES SHIPPED** — Phase 1 (abstraction) as 2.1.5,
+> Phase 2 (MySQL/MariaDB multi-server backend) as 2.2.0, Phase 3 (shared
+> auctions + optional Redis + cutover) as 2.2.1, and Phase 4 (cross-server
+> money integrity) as **2.2.4** — see §7 and §11 for what landed and the
+> runtime knobs. | Author: agent implementation notes
 >
 > This document is the engineering plan for the third community request:
 > *"SQLite only — no MySQL/MariaDB/Redis: impossible to run on a server
@@ -297,6 +298,9 @@ account across servers), never for money correctness.
 
 ## 7. Phase 4 — Cross-Server Money Integrity
 
+> **SHIPPED as 2.2.4.** Implementation notes below; §11 item 6 is the ledger
+> entry. Original design text kept underneath for context.
+
 The invariant that makes the network actually trustworthy:
 
 > **Global supply conservation**: at any moment, `SUM(all balances) + SUM(escrow)`
@@ -315,6 +319,59 @@ Additional network flows:
    market; expiry sweeps run on every server but claims are exactly-once by
    the row guards, so no double-settlement is possible (verify with the race
    harness).
+
+**What 2.2.4 shipped (and the one honest caveat):**
+
+1. **`SupplyIntegrity` (economy package)** — the network-wide invariant
+   checker. Protocol: a single-row `solidus_supply_checkpoint` table stores
+   the (supply, ledger watermark, row count) of the last clean run; every
+   run replays the ledger window (`id > watermark`) through the metered
+   categories — `SHOP_SELL +`, `SHOP_BUY −`, `ADMIN_GIVE +`, `ADMIN_TAKE −`,
+   `ADMIN_SET ±(recorded delta)`, `DEATH_PENALTY −`, `DEATH_REWARD +` — adds
+   `starting_balance × rows_created` for the auto-create mint the ledger
+   cannot see, and compares against the observed `SUM(player_balances)`
+   (escrow row included; it IS a balance row). Drift beyond the tolerance
+   (default 0.01) warns with the full breakdown, and the checkpoint is NOT
+   advanced (sticky baseline) until an admin investigates and runs
+   `/solidus-admin integrity rebase`. The watermark is the max id the SUM
+   query itself covered (captured in the same statement), so rows committed
+   mid-check are never silently skipped.
+   **Caveat (documented, by design):** companion mods moving money through
+   the raw `SolidusAPI.addBalance/subtractBalance` methods write no ledger
+   rows — their effect appears in `unexplained`. The report names this in
+   its breakdown so a warning is a prompt to read, not an alarm.
+2. **`ADMIN_SET` ledger semantics corrected** (both admin paths): the row
+   now records the SIGNED supply delta (new − old), not the final balance.
+   Required by the replay — a "final balance" value would replay the
+   replaced balance as a burn. Prior rows are absorbed by the baseline
+   bootstrap.
+3. **Escrow consistency, periodic**: the 2.1.4 startup check
+   (`AuctionManager.checkEscrowConsistency`, public since 2.2.4) runs on the
+   same scheduled cadence and from `/solidus-admin integrity check` —
+   escrow balance must equal `SUM(auction_bid_state.current_bid)`.
+4. **Election**: `storage.json` → `"integrity": { "enabled": true,
+   "intervalMinutes": 30, "tolerance": 0.01, "elected": true }`. The
+   scheduled cycle runs only where `enabled && elected`; the default
+   (elected=true) is correct for single-server installs, and the runbook
+   sets `elected: true` on exactly ONE server of a network. The check is
+   strictly read-only — a duplicate election duplicates warnings only.
+5. **No-Redis offline delivery**: a 60-second sweep queries
+   `SELECT DISTINCT player_uuid FROM pending_notifications` on the shared
+   database and delivers (exact-row delivery + delete, reusing the JOIN
+   path) to any of those players hosted HERE — closing the "queued on A,
+   online on B, no Redis" gap that the 2.2.1 Redis events bus only
+   partially covered.
+6. **Verification**: baltop global ordering + escrow exclusion were already
+   contract-tested against BOTH backends
+   (`StorageBackendContractTest.baltopPaginationAndEscrowExclusion`) — no
+   change needed. The auction exactly-once claim gained a REAL race harness:
+   `MySqlAuctionSweepRaceTest` (CI-gated) drives the production
+   `archiveAndDeleteListing` from two concurrent connections across 10
+   rounds — exactly one winner each round and one history row each. `SupplyIntegrityTest` (6 cases, SQLite)
+   covers bootstrap / balanced replay / row-growth term / exact drift figure
+   + sticky checkpoint + rebase / tolerance boundary / net-zero transfer
+   pairs; `MySqlSupplyIntegrityTest` (2 cases) repeats the decisive ones
+   against MariaDB.
 
 ## 8. Migration & Rollout
 
@@ -484,3 +541,35 @@ MariaDB 11.8 before re-pushing:
    the verify blocks re-declared the shared SQLite connection as a
    try-with-resources resource, closing it after the first block. The
    counts now run against the outer connection directly.
+
+**Shipped in 2.2.4 (Phase 4 — cross-server money integrity, §7):**
+
+1. **`SupplyIntegrity` checker + scheduler** — DONE. Checkpoint table
+   (`solidus_supply_checkpoint`, dialect-aware DDL, lives on the SAME
+   connection source as the ledger), metered ledger replay
+   (shop/admin/death categories with signed amounts), row-growth mint term
+   (`starting_balance × rows_created`), tolerance-bounded drift warning with
+   a full breakdown, sticky checkpoint on drift, admin rebase. Scheduled on
+   the Fabric server tick where `integrity.enabled && integrity.elected`
+   (intervalMinutes, default 30, minimum 1).
+2. **`ADMIN_SET` records the signed supply delta** — DONE (both admin
+   paths: `money set` reads the old balance first; `account create` logs
+   `final − starting`). The replay requires delta-shaped rows; pre-2.2.4
+   rows are absorbed by the baseline bootstrap.
+3. **Periodic escrow consistency** — DONE. `checkEscrowConsistency` is
+   public and runs every scheduled cycle + from the admin command.
+4. **No-Redis notification sweep** — DONE. 60 s cadence,
+   `playersWithPendingNotifications()` (DISTINCT query on the shared
+   table) intersected with locally-hosted online players → existing
+   exact-row delivery. The JOIN hook and the Redis events bus stay
+   unchanged; this closes the online-on-another-server gap.
+5. **Race + contract verification** — DONE. `MySqlAuctionSweepRaceTest`
+   (production claim method, 2 connections, 10 rounds, exactly-once per
+   round, autoCommit hygiene), `MySqlSupplyIntegrityTest`
+   (bootstrap/balanced window/drift/rebase on MariaDB), `SupplyIntegrityTest`
+   (6 SQLite cases). Baltop unification needed no code — already enforced by
+   the two-backend contract harness.
+6. **Ops surface** — `/solidus-admin integrity check` (full report +
+   escrow check dispatch) and `/solidus-admin integrity rebase` (accept
+   current books after investigation). Default `storage.json` template now
+   ships the `integrity` block with commented defaults.

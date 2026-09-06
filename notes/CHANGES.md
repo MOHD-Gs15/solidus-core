@@ -333,3 +333,88 @@ them locally against a portable MariaDB 11.8.6 (no Docker required:
 387 executions: 383 passed, 0 failed, 4 CI-gated skips (Redis layer only;
 the 23 MySQL-gated tests now run green against the real server). GitHub
 Actions is expected to show **zero** gated skips (both service containers up).
+
+---
+
+## 2.2.4 — Phase 4: cross-server money integrity (DB scaling plan §7)
+
+The final phase of the storage plan turns the 2.1.4 startup escrow check
+into a scheduled, network-wide invariant auditor, closes the last no-Redis
+notification gap, and verifies the auction exactly-once claim under a real
+concurrent race.
+
+**New: `SupplyIntegrity` checker**
+
+- Single-row checkpoint (`solidus_supply_checkpoint`, dialect-aware DDL, on
+  the ledger's own connection source) stores the last clean run's (supply,
+  ledger watermark, row count).
+- Every run replays the ledger window through the METERED categories —
+  `SHOP_SELL +`, `SHOP_BUY −`, `ADMIN_GIVE +`, `ADMIN_TAKE −`,
+  `ADMIN_SET ±delta`, `DEATH_PENALTY −`, `DEATH_REWARD +` — adds
+  `starting_balance × rows_created` for the auto-create mint, and compares
+  against the observed `SUM(player_balances)` (escrow row included).
+- Drift beyond tolerance (default 0.01) warns with the full breakdown and
+  does NOT advance the checkpoint (sticky baseline). After investigation,
+  `/solidus-admin integrity rebase` accepts the current books.
+- Known unmetered sources are documented in the report itself (companion
+  `SolidusAPI` add/subtract calls, `setBalance` on a missing row) — a
+  warning is a prompt to read the breakdown, not an alarm.
+- The watermark is the max ledger id the SUM query actually covered
+  (captured in the same statement) — rows committed mid-check are never
+  silently skipped.
+- Election for the scheduler is a config flag (`integrity.elected`,
+  default true = correct for single servers; networks set it on exactly
+  one server). The check is strictly read-only.
+
+**Ledger semantics correction (required by the replay):**
+
+- `ADMIN_SET` rows now record the SIGNED supply delta (new − old) instead
+  of the final balance, on both admin paths (`money set` now reads the old
+  balance first; `account create` logs `final − starting`). A final-balance
+  value would replay the replaced balance as a burn. Prior rows are
+  absorbed by the baseline bootstrap; `TransactionsCommand` display is
+  unchanged (ADMIN_SET renders amount-neutral).
+
+**Notification delivery (no-Redis path):**
+
+- New 60-second sweep: `SELECT DISTINCT player_uuid FROM
+  pending_notifications` on the shared database, intersected with locally
+  hosted online players, delivered via the existing exact-row path.
+  Closes the "queued on server A, player online on server B, Redis off"
+  gap. The JOIN hook and the 2.2.1 Redis events bus are unchanged.
+
+**Escrow consistency made periodic:**
+
+- `AuctionManager.checkEscrowConsistency` is public and runs on the same
+  scheduled cadence (and from `/solidus-admin integrity check`).
+
+**Auction settlement race verification:**
+
+- `MySqlAuctionSweepRaceTest` (CI-gated): the production
+  `archiveAndDeleteListing` claim driven from TWO concurrent connections
+  across 10 rounds — exactly one winner per round and exactly one history
+  row per listing, with autoCommit restored on both connections. Double settlement on a network is now race-proven
+  impossible, not just argued.
+
+**Ops surface:**
+
+- `/solidus-admin integrity check` — full supply report + escrow dispatch.
+- `/solidus-admin integrity rebase` — accept current books as baseline.
+- Default `storage.json` template ships the `integrity` block with
+  commented defaults (`enabled/intervalMinutes/tolerance/elected`).
+
+**Compat notes (owner rules honored):**
+
+- `SolidusAdminCommand.register` gained a `SupplyIntegrity` parameter
+  (internal wiring — not part of the companion API).
+- `TransactionLog.withConnection`/`SqlWork` are now public (additive);
+  new additive members: `TransactionLog.getConnectionSource`,
+  `TransactionLog.playersWithPendingNotifications`,
+  `EconomyEngine.integritySettings`, `StorageConfig.integrity()` +
+  `IntegritySettings` record, `AdminOps` 4-arg constructor (3-arg kept).
+
+**Test totals after 2.2.4:** 397 test executions (10 new: 6 SQLite
+`SupplyIntegrityTest` + 4 CI-gated MySQL; the gated pool grows from 27 to
+31 — 27 MySQL + 4 Redis). Verified locally against a real MariaDB 11.8.6:
+397 executed, 0 failed, 4 skips (Redis only — no local Redis); GitHub
+Actions is expected to run all 397 with zero gated skips.

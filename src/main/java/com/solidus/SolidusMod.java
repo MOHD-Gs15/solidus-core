@@ -14,6 +14,8 @@ import com.solidus.economy.BalanceManager;
 import com.solidus.economy.EconomyEngine;
 import com.solidus.economy.MySqlStorage;
 import com.solidus.economy.RedisLayer;
+import com.solidus.economy.SupplyIntegrity;
+import com.solidus.economy.StorageConfig;
 import com.solidus.economy.TransactionLog;
 import com.solidus.chat.ChatPrompts;
 import com.solidus.shop.ShopManager;
@@ -33,6 +35,13 @@ import net.minecraft.server.MinecraftServer;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+
+import java.util.List;
+import java.util.UUID;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ThreadFactory;
+import java.util.concurrent.atomic.AtomicInteger;
 
 /**
  * Solidus - Advanced Server-Side Economy & Commerce Engine
@@ -66,6 +75,15 @@ public class SolidusMod implements DedicatedServerModInitializer {
     /** Tick counter for periodic tasks (auction expiration check every 5 minutes) */
     private static long tickCounter = 0;
     private static final int AUCTION_EXPIRY_CHECK_INTERVAL = 6000; // 5 minutes (6000 ticks)
+
+    /** Supply-integrity service (2.2.4, DB scaling plan §7) — null until wired. */
+    private static volatile SupplyIntegrity supplyIntegrity;
+    /** Single-thread executor for the integrity check (never blocks the tick). */
+    private static volatile ExecutorService integrityExecutor;
+    /** Ticks since the last 60s notification sweep (2.2.4). */
+    private static long notificationSweepCounter = 0;
+    /** Ticks accumulated toward the next integrity cycle (2.2.4). */
+    private static long integrityTickCounter = 0;
 
     @Override
     public void onInitializeServer() {
@@ -113,6 +131,13 @@ public class SolidusMod implements DedicatedServerModInitializer {
         // before any GUI that can open a prompt.
         chatPrompts = new ChatPrompts();
 
+        // ── Supply integrity service (2.2.4, DB scaling plan §7): audits
+        // supply conservation + escrow consistency on a schedule. Reads its
+        // ledger windows through the SAME connection source the ledger uses
+        // (shared file / shared pool), so the audit is consistent with the
+        // money it inspects.
+        startSupplyIntegrity(economyEngine);
+
         // Direct player-to-player trade system (/trade).
         tradeManager = new TradeManager(economyEngine, chatPrompts);
 
@@ -130,7 +155,7 @@ public class SolidusMod implements DedicatedServerModInitializer {
             AuctionCommand.register(dispatcher, auctionManager);
             TradeCommand.register(dispatcher, tradeManager);
             TransactionsCommand.register(dispatcher, economyEngine);
-            SolidusAdminCommand.register(dispatcher, economyEngine, auctionManager);
+            SolidusAdminCommand.register(dispatcher, economyEngine, auctionManager, supplyIntegrity);
         });
 
         // Register server shutdown hook for clean database closure
@@ -140,6 +165,7 @@ public class SolidusMod implements DedicatedServerModInitializer {
             auctionManager.shutdown();
             economyEngine.shutdown();
             closeRedisLayer();
+            shutdownSupplyIntegrity();
             rateLimiter.clear();
             LOGGER.info("Solidus shutdown complete. All data saved.");
         });
@@ -164,6 +190,28 @@ public class SolidusMod implements DedicatedServerModInitializer {
                 auctionManager.processExpiredListings();
                 // Same cadence: reap idle trade sessions (items returned).
                 tradeManager.reapIdleSessions();
+            }
+
+            // ── 2.2.4: network-aware notification sweep (60s). Closes the
+            // no-Redis delivery gap: a notification queued anywhere on the
+            // network reaches a player hosted HERE within one sweep, even
+            // without the Redis events bus (JOIN delivery still covers logins).
+            notificationSweepCounter++;
+            if (notificationSweepCounter >= 1200) { // 60s × 20 tps
+                notificationSweepCounter = 0;
+                sweepPendingNotifications();
+            }
+
+            // ── 2.2.4: scheduled supply-integrity cycle (elected servers only).
+            StorageConfig.IntegritySettings integrity =
+                economyEngine != null ? economyEngine.integritySettings() : null;
+            if (integrity != null && integrity.enabled() && integrity.elected()) {
+                integrityTickCounter++;
+                long intervalTicks = Math.max(1, integrity.intervalMinutes()) * 1200L;
+                if (integrityTickCounter >= intervalTicks) {
+                    integrityTickCounter = 0;
+                    runIntegrityCycle();
+                }
             }
         });
 
@@ -256,6 +304,109 @@ public class SolidusMod implements DedicatedServerModInitializer {
                 LOGGER.warn("Redis layer close error (ignored): {}", e.getMessage());
             }
         }
+    }
+
+    // -- Supply integrity (2.2.4, DB scaling plan §7) --------
+
+    /**
+     * Builds the supply-integrity checker against the ACTIVE storage's
+     * transaction-log connection source. A failure here is logged and the
+     * server continues without the checker — integrity reporting must never
+     * take the economy down.
+     */
+    private static void startSupplyIntegrity(EconomyEngine engine) {
+        try {
+            TransactionLog log = engine.getTransactionLog();
+            if (log == null) {
+                LOGGER.warn("Solidus supply integrity: no transaction log — checker disabled.");
+                return;
+            }
+            ThreadFactory threadFactory = new ThreadFactory() {
+                private final AtomicInteger index = new AtomicInteger();
+
+                @Override
+                public Thread newThread(Runnable r) {
+                    Thread thread = new Thread(r, "Solidus-Integrity-" + index.incrementAndGet());
+                    thread.setDaemon(true);
+                    return thread;
+                }
+            };
+            ExecutorService executor = Executors.newSingleThreadExecutor(threadFactory);
+            integrityExecutor = executor;
+            StorageConfig.IntegritySettings settings = engine.integritySettings();
+            supplyIntegrity = new SupplyIntegrity(
+                log,
+                engine.isMysqlMode() ? TransactionLog.Dialect.MYSQL : TransactionLog.Dialect.SQLITE,
+                executor,
+                settings.tolerance());
+            LOGGER.info("Solidus supply integrity checker armed (interval {} min, tolerance {}, elected: {}).",
+                settings.intervalMinutes(), settings.tolerance(), settings.elected());
+        } catch (Exception e) {
+            LOGGER.error("Solidus supply integrity failed to start — continuing without it.", e);
+            supplyIntegrity = null;
+        }
+    }
+
+    private static void shutdownSupplyIntegrity() {
+        supplyIntegrity = null;
+        ExecutorService executor = integrityExecutor;
+        integrityExecutor = null;
+        if (executor != null) {
+            executor.shutdownNow();
+        }
+    }
+
+    /** One scheduled integrity cycle: escrow consistency + supply replay. */
+    private static void runIntegrityCycle() {
+        AuctionManager auctions = auctionManager;
+        if (auctions != null) {
+            auctions.checkEscrowConsistency();
+        }
+        SupplyIntegrity integrity = supplyIntegrity;
+        if (integrity == null) {
+            return;
+        }
+        integrity.runOnce().thenAccept(report -> {
+            if (report.bootstrapped()) {
+                return; // baseline establishment is already logged inside runOnce
+            }
+            if (report.withinTolerance()) {
+                LOGGER.info("Supply integrity: OK (unexplained {} — within tolerance).",
+                    report.unexplained());
+            } else {
+                LOGGER.warn("Supply integrity report:\n{}", report.summary());
+            }
+        });
+    }
+
+    /**
+     * The no-Redis network delivery sweep (2.2.4): players holding pending
+     * notifications anywhere on the shared database who are hosted HERE get
+     * their rows delivered now (exact-row delivery + delete).
+     */
+    private static void sweepPendingNotifications() {
+        TransactionLog txLog = economyEngine != null ? economyEngine.getTransactionLog() : null;
+        MinecraftServer server = activeServer;
+        if (txLog == null || server == null) {
+            return;
+        }
+        txLog.playersWithPendingNotifications().thenAccept(ids -> {
+            if (ids.isEmpty()) {
+                return;
+            }
+            MinecraftServer current = activeServer;
+            if (current == null) {
+                return;
+            }
+            current.execute(() -> {
+                for (UUID playerUuid : ids) {
+                    var online = current.getPlayerList().getPlayer(playerUuid);
+                    if (online != null) {
+                        txLog.deliverPendingNotifications(online);
+                    }
+                }
+            });
+        });
     }
 
     public static ShopManager getShopManager() {

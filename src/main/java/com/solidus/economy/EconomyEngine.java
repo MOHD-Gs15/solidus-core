@@ -122,6 +122,16 @@ public class EconomyEngine {
     }
 
     /**
+     * The supply-integrity block of {@code storage.json} (2.2.4). Never null —
+     * defaults apply when the block is missing.
+     */
+    public StorageConfig.IntegritySettings integritySettings() {
+        return storageConfig != null
+            ? storageConfig.integrity()
+            : StorageConfig.IntegritySettings.defaults();
+    }
+
+    /**
      * Gets the balance manager for performing economy operations.
      * @throws IllegalStateException if called before initialization
      */

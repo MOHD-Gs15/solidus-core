@@ -219,7 +219,12 @@ public class TransactionLog {
         Connection open() throws SQLException;
     }
 
-    interface SqlWork<T> {
+    /**
+     * One unit of SQL work on a log connection (2.2.4: public — the
+     * supply-integrity checker runs its checkpoint/windowed reads through
+     * the SAME connection source as the ledger it audits).
+     */
+    public interface SqlWork<T> {
         T run(Connection conn) throws SQLException;
     }
 
@@ -256,11 +261,11 @@ public class TransactionLog {
     }
 
     /**
-     * Runs one log operation on a connection. In the persistent flavor the
-     * connection is shared and MUST NOT be closed; in the pooled flavor the
-     * connection is closed (returned to the pool) when the work completes.
+     * Runs one operation on the log's connection (2.2.4: public for the
+     * supply-integrity checker). Pooled flavor borrows + returns; persistent
+     * flavor reuses the shared connection.
      */
-    private <T> T withConnection(SqlWork<T> work) throws SQLException {
+    public <T> T withConnection(SqlWork<T> work) throws SQLException {
         Connection conn = connectionSource.open();
         if (!closeConnections) {
             return work.run(conn);
@@ -721,6 +726,50 @@ public class TransactionLog {
      */
     public void setNotificationBroadcaster(java.util.function.BiConsumer<UUID, String> broadcaster) {
         this.notificationBroadcaster = broadcaster;
+    }
+
+    /**
+     * The connection source this log runs on (2.2.4). In SQLite mode it is
+     * the shared economy file; in MySQL mode it is the shared database pool —
+     * the supply-integrity checker uses it for its checkpoint table and
+     * windowed ledger reads so every integrity artifact lives on the SAME
+     * database as the money it audits.
+     */
+    public ConnectionSource getConnectionSource() {
+        return connectionSource;
+    }
+
+    /**
+     * Distinct players that currently hold pending notifications (2.2.4).
+     * The network-aware delivery sweep (DB scaling plan §7, the no-Redis
+     * fallback) intersects this set with the players hosted on THIS server
+     * and delivers to the intersection — a notification queued anywhere on
+     * the network reaches an online player within one sweep interval even
+     * when the Redis events bus is disabled.
+     */
+    public CompletableFuture<List<UUID>> playersWithPendingNotifications() {
+        return CompletableFuture.supplyAsync(() -> {
+            String sql = "SELECT DISTINCT player_uuid FROM pending_notifications";
+            try {
+                return withConnection(conn -> {
+                    List<UUID> ids = new ArrayList<>();
+                    try (PreparedStatement ps = conn.prepareStatement(sql);
+                         ResultSet rs = ps.executeQuery()) {
+                        while (rs.next()) {
+                            try {
+                                ids.add(UUID.fromString(rs.getString(1)));
+                            } catch (IllegalArgumentException ignored) {
+                                // skip malformed row — never kill the sweep
+                            }
+                        }
+                    }
+                    return ids;
+                });
+            } catch (SQLException e) {
+                LOGGER.error("Failed to list players with pending notifications: {}", e.getMessage());
+                return List.of();
+            }
+        }, asyncExecutor);
     }
 
     /**

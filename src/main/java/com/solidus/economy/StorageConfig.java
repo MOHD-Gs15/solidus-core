@@ -86,17 +86,45 @@ public final class StorageConfig {
         }
     }
 
+    /**
+     * Supply-integrity scheduler settings (2.2.4, DB scaling plan §7).
+     *
+     * <p>{@code elected} is the network election: the scheduled checker runs
+     * only where it is true. The default (true) is correct for every
+     * single-server install; on a MySQL network the runbook sets
+     * {@code "elected": true} on exactly ONE server's storage.json — the
+     * check is read-only, so a misconfiguration only duplicates warnings,
+     * never affects money.</p>
+     */
+    public record IntegritySettings(
+            boolean enabled,
+            int intervalMinutes,
+            double tolerance,
+            boolean elected) {
+
+        public static IntegritySettings defaults() {
+            return new IntegritySettings(true, 30, 0.01, true);
+        }
+    }
+
     private static final String FILE_NAME = "storage.json";
     private static final String PASSWORD_ENV = "SOLIDUS_DB_PASSWORD";
 
     private final Type type;
     private final MySqlSettings mysql;
     private final RedisSettings redis;
+    private final IntegritySettings integrity;
 
     private StorageConfig(Type type, MySqlSettings mysql, RedisSettings redis) {
+        this(type, mysql, redis, IntegritySettings.defaults());
+    }
+
+    private StorageConfig(Type type, MySqlSettings mysql, RedisSettings redis,
+                          IntegritySettings integrity) {
         this.type = type;
         this.mysql = mysql;
         this.redis = redis;
+        this.integrity = integrity != null ? integrity : IntegritySettings.defaults();
     }
 
     public Type type() {
@@ -111,6 +139,11 @@ public final class StorageConfig {
         return redis;
     }
 
+    /** The supply-integrity scheduler block (2.2.4). Never null. */
+    public IntegritySettings integrity() {
+        return integrity;
+    }
+
     /**
      * Loads {@code storage.json} from the Solidus config directory, creating
      * the default (SQLite) file on first run. Unknown/missing types fall back
@@ -122,6 +155,7 @@ public final class StorageConfig {
         if (json == null) {
             return new StorageConfig(Type.SQLITE, null, RedisSettings.disabled());
         }
+        IntegritySettings integrity = parseIntegrity(json);
 
         String rawType = json.has("type") && json.get("type").isJsonPrimitive()
                 ? json.get("type").getAsString().trim().toLowerCase(java.util.Locale.ROOT)
@@ -135,15 +169,38 @@ public final class StorageConfig {
                 // Invalid mysql block — never leave a server without economy.
                 SolidusMod.LOGGER.error(
                     "storage.json: 'mysql' block is incomplete — falling back to SQLite.");
-                return new StorageConfig(Type.SQLITE, null, parseRedis(json));
+                return new StorageConfig(Type.SQLITE, null, parseRedis(json), integrity);
             }
-            return new StorageConfig(Type.MYSQL, mysql, parseRedis(json));
+            return new StorageConfig(Type.MYSQL, mysql, parseRedis(json), integrity);
         }
         if (!"sqlite".equals(rawType)) {
             SolidusMod.LOGGER.warn(
                 "storage.json: unknown type '{}' — falling back to SQLite.", rawType);
         }
-        return new StorageConfig(Type.SQLITE, null, parseRedis(json));
+        return new StorageConfig(Type.SQLITE, null, parseRedis(json), integrity);
+    }
+
+    /** Parses the optional integrity block; missing/malformed means defaults. */
+    private static IntegritySettings parseIntegrity(JsonObject root) {
+        IntegritySettings def = IntegritySettings.defaults();
+        if (!root.has("integrity") || !root.get("integrity").isJsonObject()) {
+            return def;
+        }
+        JsonObject b = root.getAsJsonObject("integrity");
+        boolean enabled = boolOr(b, "enabled", def.enabled());
+        int minutes = Math.max(1, intOr(b, "intervalMinutes", def.intervalMinutes()));
+        // Tolerance may arrive as a JSON number or a quoted string; a malformed
+        // value keeps the default — it must never disable the check.
+        double tolerance = def.tolerance();
+        if (b.has("tolerance") && b.get("tolerance").isJsonPrimitive()) {
+            try {
+                tolerance = b.get("tolerance").getAsDouble();
+            } catch (NumberFormatException | ClassCastException ignored) {
+                // keep default
+            }
+        }
+        boolean elected = boolOr(b, "elected", def.elected());
+        return new IntegritySettings(enabled, minutes, Math.max(0.0, tolerance), elected);
     }
 
     /** Parses the optional redis block; missing/malformed means disabled. */

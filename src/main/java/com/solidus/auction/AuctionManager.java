@@ -2409,10 +2409,15 @@ public class AuctionManager {
 
     /**
      * Logs a warning when the escrow account balance does not equal the sum
-     * of all open top bids (possible only via a crash between the escrow
-     * charge and the bid-state claim, or vice versa).
+     * of all open top bids (possible only via a crash between the bid charge
+     * and the bid-state claim, or vice versa).
+     *
+     * <p>2.2.4 (DB scaling plan §7): public so the supply-integrity scheduler
+     * and {@code /solidus-admin integrity check} run it on a cadence — the
+     * 2.1.4 startup check is now network-wide and periodic, not just
+     * startup-only.</p>
      */
-    private void checkEscrowConsistency() {
+    public void checkEscrowConsistency() {
         final double expected;
         try {
             expected = withAuction(conn -> {

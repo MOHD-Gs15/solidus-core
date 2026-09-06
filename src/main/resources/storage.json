@@ -16,5 +16,12 @@
     "uri": "redis://127.0.0.1:6379/0",
     "passwordEnv": "SOLIDUS_REDIS_PASSWORD",
     "balanceTtlSeconds": 30
+  },
+  "integrity": {
+    "enabled": true,
+    "_integrity_comment": "Supply-integrity scheduler (2.2.4): periodically re-audits that SUM(all balances) equals the ledger-replayed expectation (shop faucets/sinks + admin ops + new-row starting mints) and that the escrow account equals the open top bids. Warnings are read-only and never touch money. On a multi-server network set 'elected': true on EXACTLY ONE server (default true is correct for single-server installs; a duplicate election only duplicates warnings).",
+    "intervalMinutes": 30,
+    "tolerance": 0.01,
+    "elected": true
   }
 }

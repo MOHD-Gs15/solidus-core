@@ -6,6 +6,7 @@ import com.solidus.economy.EconomyEngine;
 import com.solidus.economy.EscrowAccount;
 import com.solidus.economy.SQLiteStorage;
 import com.solidus.economy.StorageBackend;
+import com.solidus.economy.SupplyIntegrity;
 import com.solidus.economy.TransactionLog;
 import com.solidus.util.CurrencyUtil;
 
@@ -73,6 +74,8 @@ public final class AdminOps {
     private final EconomyEngine engine;
     private final AuctionManager auctions;
     private final ItemResolver itemResolver;
+    /** Supply-integrity service (2.2.4) — null in legacy unit-test wiring. */
+    private final SupplyIntegrity integrity;
 
     /**
      * Resolves an item id string ("minecraft:diamond") into a stack of the
@@ -92,9 +95,16 @@ public final class AdminOps {
     public record AccountRef(UUID uuid, String name) {}
 
     public AdminOps(EconomyEngine engine, AuctionManager auctions, ItemResolver itemResolver) {
+        this(engine, auctions, itemResolver, null);
+    }
+
+    /** Full wiring (2.2.4): includes the supply-integrity service. */
+    public AdminOps(EconomyEngine engine, AuctionManager auctions, ItemResolver itemResolver,
+                    SupplyIntegrity integrity) {
         this.engine = engine;
         this.auctions = auctions;
         this.itemResolver = itemResolver;
+        this.integrity = integrity;
     }
 
     // -- Identity helpers ----------------------------------
@@ -180,9 +190,15 @@ public final class AdminOps {
                 if (!ok) {
                     return new OpResult(false, "Account row created but the initial balance was rejected.");
                 }
+                // 2.2.4: ADMIN_SET carries the SIGNED supply delta (final − old),
+                // not the final balance — the supply-integrity checker replays
+                // ledger rows as deltas, and a "final balance" value double-counts
+                // the replaced balance as a burn.
+                double delta = CurrencyUtil.round(rounded - starting);
                 engine.getTransactionLog().log(TransactionLog.Type.ADMIN_SET,
-                    uuid, name, null, null, rounded, null, 0,
-                    "Initial balance for test account '" + name + "'");
+                    uuid, name, null, null, delta, null, 0,
+                    "Initial balance for test account '" + name + "' (delta "
+                        + CurrencyUtil.format(delta) + ")");
                 return new OpResult(true,
                     "Account '" + name + "' created (uuid " + uuid + ", balance "
                         + CurrencyUtil.format(rounded) + ").");
@@ -277,14 +293,23 @@ public final class AdminOps {
                     return CompletableFuture.completedFuture(new OpResult(false,
                         "Balance out of range [0, " + CurrencyUtil.format(CurrencyUtil.MAX_BALANCE) + "]."));
                 }
-                return storage.setBalance(ref.uuid(), ref.name(), rounded).thenApply(ok -> {
-                    if (!ok) {
-                        return new OpResult(false, "Set failed (invalid amount or persistence error).");
-                    }
-                    logAdmin(TransactionLog.Type.ADMIN_SET, issuer, ref, rounded);
-                    return new OpResult(true,
-                        "Set " + ref.name() + " to " + CurrencyUtil.format(rounded) + ".");
-                });
+                // 2.2.4: read the old balance first so the ADMIN_SET ledger row
+                // can carry the SIGNED supply delta (new − old). The row used to
+                // record the FINAL balance, which the supply-integrity checker
+                // would replay as a full burn of the old balance.
+                return storage.getBalance(ref.uuid(), ref.name())
+                    .thenCompose(oldBalance -> storage.setBalance(ref.uuid(), ref.name(), rounded)
+                        .thenApply(ok -> {
+                            if (!ok) {
+                                return new OpResult(false, "Set failed (invalid amount or persistence error).");
+                            }
+                            double delta = CurrencyUtil.round(rounded - oldBalance);
+                            logAdmin(TransactionLog.Type.ADMIN_SET, issuer, ref, delta);
+                            return new OpResult(true,
+                                "Set " + ref.name() + " to " + CurrencyUtil.format(rounded)
+                                    + " (was " + CurrencyUtil.format(oldBalance)
+                                    + ", delta " + (delta >= 0 ? "+" : "") + CurrencyUtil.format(delta) + ").");
+                        }));
             }
             case TAKE -> {
                 if (!CurrencyUtil.isValidAmount(rounded)) {
@@ -475,6 +500,51 @@ public final class AdminOps {
                         report.add("Audit complete.");
                         return report;
                     }))));
+    }
+
+    // -- Supply integrity (2.2.4, DB scaling plan §7) --------
+
+    /**
+     * Runs the supply-integrity check NOW and also fires the escrow
+     * consistency check. Returns the report lines for the command layer.
+     * When the integrity service was not wired (legacy unit-test ctor), the
+     * escrow check still runs and the report says so.
+     */
+    public CompletableFuture<List<String>> integrityCheck() {
+        List<String> lines = new ArrayList<>();
+        if (auctions != null) {
+            // Async fire-and-forget: it logs its own warning on drift, and a
+            // transient in-flight bid can false-flag — the supply report below
+            // is the precise artifact.
+            auctions.checkEscrowConsistency();
+            lines.add("Escrow consistency check: dispatched (see log for warnings).");
+        }
+        if (integrity == null) {
+            lines.add("Supply integrity service not wired in this context.");
+            return CompletableFuture.completedFuture(lines);
+        }
+        return integrity.runOnce().thenApply(report -> {
+            for (String line : report.summary().split("\n")) {
+                lines.add(line);
+            }
+            return lines;
+        });
+    }
+
+    /**
+     * Accepts the CURRENT books as the new supply baseline (admin action
+     * after investigating a drift report).
+     */
+    public CompletableFuture<OpResult> integrityRebase() {
+        if (integrity == null) {
+            return CompletableFuture.completedFuture(new OpResult(false,
+                "Supply integrity service not wired in this context."));
+        }
+        return integrity.rebaseline().thenApply(ok -> ok
+            ? new OpResult(true,
+                "Supply baseline cleared — the next integrity check re-establishes it "
+                    + "from the current books.")
+            : new OpResult(false, "Rebase failed (see log)."));
     }
 
     /**

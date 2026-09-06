@@ -8,6 +8,7 @@ import com.solidus.economy.EconomyEngine;
 import com.solidus.economy.SQLiteStorage;
 import com.solidus.economy.StorageConfig;
 import com.solidus.economy.StorageMigrator;
+import com.solidus.economy.SupplyIntegrity;
 import com.solidus.util.ConfigManager;
 import com.solidus.util.TextUtil;
 
@@ -65,8 +66,10 @@ public class SolidusAdminCommand {
 
     public static void register(CommandDispatcher<CommandSourceStack> dispatcher,
                                 EconomyEngine economyEngine,
-                                AuctionManager auctionManager) {
-        AdminOps admin = new AdminOps(economyEngine, auctionManager, SolidusAdminCommand::resolveItem);
+                                AuctionManager auctionManager,
+                                SupplyIntegrity supplyIntegrity) {
+        AdminOps admin = new AdminOps(economyEngine, auctionManager, SolidusAdminCommand::resolveItem,
+            supplyIntegrity);
 
         LiteralArgumentBuilder<CommandSourceStack> root = Commands.literal("solidus-admin")
             .requires(PermissionChecker.require(SolidusPermissions.ADMIN, 4));
@@ -223,6 +226,13 @@ public class SolidusAdminCommand {
             .executes(context -> reportLines(context.getSource(), admin.audit())));
         root.then(Commands.literal("diag")
             .executes(context -> reportLines(context.getSource(), admin.diag())));
+
+        // -- Supply integrity (2.2.4, DB scaling plan §7) ----------
+        root.then(Commands.literal("integrity")
+            .then(Commands.literal("check")
+                .executes(context -> reportLines(context.getSource(), admin.integrityCheck())))
+            .then(Commands.literal("rebase")
+                .executes(context -> report(context.getSource(), admin.integrityRebase()))));
 
         dispatcher.register(root);
     }
