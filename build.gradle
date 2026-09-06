@@ -130,8 +130,8 @@ dependencies {
     // Lettuce: async Redis client (L2 balance cache + pub/sub invalidation
     // and network event bus). Entirely OPTIONAL — disabled by default in
     // storage.json; a MySQL-only network needs none of it.
-    implementation "io.lettuce:lettuce-core:6.5.5.RELEASE"
-    include "io.lettuce:lettuce-core:6.5.5.RELEASE"
+    implementation "io.lettuce:lettuce-core:7.7.0.RELEASE"
+    include "io.lettuce:lettuce-core:7.7.0.RELEASE"
 
     // ── Testing ──────────────────────────────────────────
     testImplementation "org.junit.jupiter:junit-jupiter:5.10.2"
