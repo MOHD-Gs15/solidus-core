@@ -564,5 +564,9 @@ RedisUriRedactionTest (10: تحرير ×6 + سماحية ×2 + رفض بدءٍ �
       نُفّذت فعلاً ضد الخادم (cleanTest test، تحقق XML لكل فئة بوّابية).
 - [x] بناء `solidus-2.2.5.jar` — fabric.mod.json يوسّع 2.2.5، spotbugsMain
       + spotbugsTest ناجحان.
-- [ ] مراقبة CI بعد الدفع: (تُملأ بعد الدفع — Tests + CodeQL على mariadb:11
-      + redis:7).
+- [x] مراقبة CI بعد الدفع: **مكتملة — أخضر بالكامل، صفر تخطٍ**. على 7b70300:
+      Tests (run 34396778643) = success، CodeQL (run 34396778558) = success،
+      سجل مهمة الاختبار (job 102618345237): 870 PASSED / 0 FAILED /
+      0 SKIPPED (= 435 × مهمتا :test و:testWithCoverage) — ولأول مرة حتى
+      اختبارات Redis الأربعة نُفّذت في CI (حاوية redis:7 الفعلية)، فلا أي
+      تخطٍ إطلاقاً. **قائمة قبول 2.2.5 مغلقة بالكامل.**
