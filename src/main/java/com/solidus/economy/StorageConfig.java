@@ -20,7 +20,7 @@ import com.solidus.util.ConfigManager;
  *     "host": "127.0.0.1", "port": 3306, "database": "solidus",
  *     "user": "solidus", "password": "CHANGE_ME",
  *     "pool": { "maxSize": 10, "connectionTimeoutMs": 5000 },
- *     "useSsl": false
+ *     "useSsl": true
  *   }
  * }
  * }</pre>
@@ -45,7 +45,7 @@ import com.solidus.util.ConfigManager;
  *     "host": "127.0.0.1", "port": 3306, "database": "solidus",
  *     "user": "solidus", "password": "CHANGE_ME",
  *     "pool": { "maxSize": 10, "connectionTimeoutMs": 5000 },
- *     "useSsl": false
+ *     "useSsl": true
  *   },
  *   "redis": {
  *     "enabled": false, "uri": "redis://127.0.0.1:6379/0",
@@ -233,7 +233,13 @@ public final class StorageConfig {
         String password = stringOr(m, "password", "");
         int maxSize = intOr(m, "pool", "maxSize", 10);
         int connTimeout = intOr(m, "pool", "connectionTimeoutMs", 5000);
-        boolean useSsl = boolOr(m, "useSsl", false);
+        // SECURITY (audit SOL-002, CWE-319): the SECURE choice is the silent
+        // default. This is a multi-server feature first — a shared database
+        // across a network carries every balance and ledger row, so the
+        // missing-key default must be encryption ON. Localhost installs that
+        // genuinely run without TLS set "useSsl": false explicitly (the
+        // shipped template now does the opposite of before: enables it).
+        boolean useSsl = boolOr(m, "useSsl", true);
 
         if (database == null || database.isBlank()) {
             return null;

@@ -108,4 +108,31 @@ public class StorageConfigTest {
         assertEquals(10, config.mysql().maxPoolSize());
         assertEquals(5000, config.mysql().connectionTimeoutMs());
     }
+
+    @Test
+    @DisplayName("SECURITY SOL-002: a missing useSsl key defaults to TRUE (encryption on)")
+    void useSslDefaultsToTrue() throws Exception {
+        writeStorageJson("""
+            { "type": "mysql",
+              "mysql": { "host": "db.example.net", "database": "d",
+                         "user": "u", "password": "p" } }
+            """);
+        initConfigDir();
+        // The secure choice is the silent default: a shared database reached
+        // over a network must not silently fall back to a cleartext link
+        // just because the operator never heard of useSsl.
+        assertTrue(StorageConfig.load().mysql().useSsl());
+    }
+
+    @Test
+    @DisplayName("an explicit useSsl=false is still honored (loopback installs)")
+    void explicitFalseHonored() throws Exception {
+        writeStorageJson("""
+            { "type": "mysql",
+              "mysql": { "host": "127.0.0.1", "database": "d",
+                         "user": "u", "password": "p", "useSsl": false } }
+            """);
+        initConfigDir();
+        assertFalse(StorageConfig.load().mysql().useSsl());
+    }
 }

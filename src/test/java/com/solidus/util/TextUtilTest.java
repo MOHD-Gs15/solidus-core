@@ -187,4 +187,139 @@ class TextUtilTest {
             assertEquals("\u00A7ztext", TextUtil.sanitizeLegacyFormatting("\u00A7ztext"));
         }
     }
+
+    // -- sanitizePlayerName (audit SOL-004) ------------------
+
+    @Nested
+    @DisplayName("sanitizePlayerName()")
+    class SanitizePlayerNameTest {
+
+        @Test
+        @DisplayName("never returns null")
+        void neverReturnsNull() {
+            assertNotNull(TextUtil.sanitizePlayerName(null));
+            assertEquals("", TextUtil.sanitizePlayerName(null));
+        }
+
+        @Test
+        @DisplayName("empty string passes through as empty")
+        void handlesEmpty() {
+            assertEquals("", TextUtil.sanitizePlayerName(""));
+        }
+
+        @Test
+        @DisplayName("clean names pass through unchanged")
+        void cleanNameUnchanged() {
+            assertEquals("Steve", TextUtil.sanitizePlayerName("Steve"));
+            assertEquals("Alex_123", TextUtil.sanitizePlayerName("Alex_123"));
+        }
+
+        @Test
+        @DisplayName("strips legacy formatting codes (SOL-004: lore injection)")
+        void stripsLegacyCodes() {
+            assertEquals("Hostile", TextUtil.sanitizePlayerName("\u00A7cHostile"));
+            assertEquals("Gold", TextUtil.sanitizePlayerName("\u00A76\u00A7lGold"));
+        }
+
+        @Test
+        @DisplayName("drops CR/LF/TAB so a hostile name cannot break the ledger line")
+        void dropsLineBreaks() {
+            assertEquals("Steve", TextUtil.sanitizePlayerName("Ste\nve"));
+            assertEquals("Steve", TextUtil.sanitizePlayerName("Ste\rve"));
+            assertEquals("AB", TextUtil.sanitizePlayerName("A\tB"));
+        }
+
+        @Test
+        @DisplayName("log-forgery attempt collapses to a single line")
+        void logForgeryCollapses() {
+            String hostile = "Bob\n[SERVER] Your balance was set to 0";
+            String safe = TextUtil.sanitizePlayerName(hostile);
+            assertFalse(safe.contains("\n"));
+            assertFalse(safe.contains("\r"));
+            assertEquals("Bob[SERVER] Your balance was set to 0", safe);
+        }
+
+        @Test
+        @DisplayName("drops C0 control characters and DEL")
+        void dropsControlChars() {
+            assertEquals("AB", TextUtil.sanitizePlayerName("A\u0000B"));
+            assertEquals("AB", TextUtil.sanitizePlayerName("A\u001BB"));
+            assertEquals("AB", TextUtil.sanitizePlayerName("A\u007FB"));
+        }
+
+        @Test
+        @DisplayName("trims surrounding whitespace")
+        void trims() {
+            assertEquals("Steve", TextUtil.sanitizePlayerName("  Steve  "));
+        }
+
+        @Test
+        @DisplayName("clamps to the VARCHAR(64) ledger width")
+        void clampsTo64() {
+            String hostile = "x".repeat(100);
+            assertEquals(64, TextUtil.sanitizePlayerName(hostile).length());
+            assertEquals(64, TextUtil.MAX_NAME_LENGTH);
+        }
+
+        @Test
+        @DisplayName("a name exactly at the cap is untouched")
+        void atCapUnchanged() {
+            String ok = "y".repeat(64);
+            assertEquals(ok, TextUtil.sanitizePlayerName(ok));
+        }
+
+        @Test
+        @DisplayName("printable non-ASCII characters are preserved")
+        void preservesPrintableUnicode() {
+            assertEquals("Österreich", TextUtil.sanitizePlayerName("Österreich"));
+        }
+    }
+
+    // -- sanitizeForLog (audit SOL-005, CWE-117) -------------
+
+    @Nested
+    @DisplayName("sanitizeForLog()")
+    class SanitizeForLogTest {
+
+        @Test
+        @DisplayName("never returns null; empty passes through")
+        void nullAndEmpty() {
+            assertEquals("", TextUtil.sanitizeForLog(null));
+            assertEquals("", TextUtil.sanitizeForLog(""));
+        }
+
+        @Test
+        @DisplayName("plain text is untouched")
+        void plainUntouched() {
+            assertEquals("hello world", TextUtil.sanitizeForLog("hello world"));
+            assertEquals("SHOP_BUY", TextUtil.sanitizeForLog("SHOP_BUY"));
+        }
+
+        @Test
+        @DisplayName("escapes newline instead of dropping (forensics preserved)")
+        void escapesNewline() {
+            assertEquals("a\\nb", TextUtil.sanitizeForLog("a\nb"));
+            assertEquals("a\\rb", TextUtil.sanitizeForLog("a\rb"));
+            assertEquals("a\\tb", TextUtil.sanitizeForLog("a\tb"));
+        }
+
+        @Test
+        @DisplayName("a tampered ledger row cannot forge a second log line")
+        void ledgerRowCannotForgeLines() {
+            String tampered = "X\n[INFO] Solidus: granted 999999999 to Attacker";
+            String safe = TextUtil.sanitizeForLog(tampered);
+            assertFalse(safe.contains("\n"), "raw LF must not survive");
+            assertFalse(safe.contains("\r"), "raw CR must not survive");
+            assertTrue(safe.contains("\\n"), "the escape must preserve the evidence");
+            // One physical line: the escape sequence, not the character.
+            assertEquals("X\\n[INFO] Solidus: granted 999999999 to Attacker", safe);
+        }
+
+        @Test
+        @DisplayName("drops other control characters entirely")
+        void dropsOtherControls() {
+            assertEquals("ab", TextUtil.sanitizeForLog("a\u0000b"));
+            assertEquals("ab", TextUtil.sanitizeForLog("a\u007Fb"));
+        }
+    }
 }

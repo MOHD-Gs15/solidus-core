@@ -298,8 +298,11 @@ public class TransactionsCommand {
         }
 
         // Target player
+        // SECURITY (audit SOL-004): names are DB-sourced here - display them
+        // through the name sanitizer (control chars + legacy codes stripped).
         if (entry.targetName() != null && !entry.targetName().isEmpty()) {
-            msg = msg.append(TextUtil.styled(entry.targetName() + " ", ChatFormatting.WHITE));
+            msg = msg.append(TextUtil.styled(
+                TextUtil.sanitizePlayerName(entry.targetName()) + " ", ChatFormatting.WHITE));
         }
 
         // Item info

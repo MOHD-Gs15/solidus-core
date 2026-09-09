@@ -1,6 +1,7 @@
 package com.solidus.economy;
 
 import com.solidus.util.CurrencyUtil;
+import com.solidus.util.TextUtil;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -755,10 +756,10 @@ public class SQLiteStorage implements StorageBackend {
             balanceCache.put(senderUuid, senderNew);
             balanceCache.put(receiverUuid, receiverNew);
             if (senderName != null && !senderName.isEmpty()) {
-                playerNameCache.put(senderUuid, senderName);
+                playerNameCache.put(senderUuid, TextUtil.sanitizePlayerName(senderName));
             }
             if (receiverName != null && !receiverName.isEmpty()) {
-                playerNameCache.put(receiverUuid, receiverName);
+                playerNameCache.put(receiverUuid, TextUtil.sanitizePlayerName(receiverName));
             }
             return new TransferOutcome(TransferStatus.SUCCESS, senderNew, receiverNew);
         } catch (SQLException e) {
@@ -803,7 +804,8 @@ public class SQLiteStorage implements StorageBackend {
         """;
         try (PreparedStatement ps = persistentConnection.prepareStatement(upsertSql)) {
             ps.setString(1, uuid.toString());
-            ps.setString(2, playerName);
+            // SECURITY (audit SOL-004): clamp/control-char-strip before storage.
+            ps.setString(2, TextUtil.sanitizePlayerName(playerName));
             ps.setDouble(3, balance);
             ps.setLong(4, System.currentTimeMillis());
             ps.executeUpdate();
@@ -856,6 +858,9 @@ public class SQLiteStorage implements StorageBackend {
         if (playerName != null && !playerName.isEmpty()) {
             playerNameCache.put(uuid, playerName);
         }
+        // SECURITY (audit SOL-004): sanitize at the storage boundary - clamped
+        // to the 64-char ledger width, control chars and legacy codes stripped.
+        final String safeName = TextUtil.sanitizePlayerName(playerName);
 
         String upsertSql = """
             INSERT INTO player_balances (uuid, player_name, balance, last_updated)
@@ -867,7 +872,7 @@ public class SQLiteStorage implements StorageBackend {
         """;
         try (PreparedStatement ps = persistentConnection.prepareStatement(upsertSql)) {
             ps.setString(1, uuid.toString());
-            ps.setString(2, playerName);
+            ps.setString(2, safeName);
             ps.setDouble(3, balance);
             ps.setLong(4, System.currentTimeMillis());
             ps.executeUpdate();
@@ -900,7 +905,8 @@ public class SQLiteStorage implements StorageBackend {
         """;
         try (PreparedStatement ps = persistentConnection.prepareStatement(upsertSql)) {
             ps.setString(1, uuid.toString());
-            ps.setString(2, playerName);
+            // SECURITY (audit SOL-004): clamp/control-char-strip before storage.
+            ps.setString(2, TextUtil.sanitizePlayerName(playerName));
             ps.setDouble(3, balance);
             ps.setLong(4, System.currentTimeMillis());
             ps.executeUpdate();

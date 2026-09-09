@@ -95,15 +95,65 @@ public final class RedisLayer implements AutoCloseable {
     }
 
     /**
+     * SECURITY (audit SOL-001, CWE-532): masks any credentials embedded in a
+     * Redis URI before it can reach a log file or crash report. A URI like
+     * {@code redis://:MyStrongPass@10.0.0.5:6379/0} becomes
+     * {@code redis://***@10.0.0.5:6379/0}. The recommended path stays the
+     * {@code passwordEnv} variable (never part of the URI at all); this
+     * redaction is the safety net for operators who follow the common Redis
+     * convention of inlining credentials in the URI.
+     *
+     * <p>Package-private static so tests can verify the redaction directly.</p>
+     */
+    static String redactUri(String uri) {
+        if (uri == null || uri.isEmpty()) return String.valueOf(uri);
+        // Everything between "//" and the FIRST "@" is userinfo — user,
+        // password, or both. Replace the whole block. RFC 3986 forbids a raw
+        // '@' inside userinfo (it must be percent-encoded as %40), so the
+        // first '@' after "//" is always the userinfo/host delimiter — and
+        // unlike a [^@/]+ class, this still redacts operators who embed a raw
+        // '/' in their password (invalid syntax, but exactly the mistake this
+        // safety net exists for).
+        return uri.replaceAll("(?<=//)[^@]+@", "***@");
+    }
+
+    /**
+     * SECURITY (audit SOL-003): only the clear-text {@code redis://} and the
+     * TLS-encrypted {@code rediss://} schemes are accepted. Lettuce enables
+     * TLS with certificate verification against the JVM trust store for any
+     * {@code rediss://} URI, so cross-network deployments have a supported,
+     * verified encryption path — documented in the storage.json template and
+     * docs/DB_SCALING_PLAN.md.</p>
+     *
+     * <p>Package-private static so tests can verify the allowlist directly.</p>
+     */
+    static boolean isSupportedScheme(String uri) {
+        String lower = uri.toLowerCase(java.util.Locale.ROOT);
+        return lower.startsWith("redis://") || lower.startsWith("rediss://");
+    }
+
+    /**
      * Starts the layer. Throws (fail-closed, like MySqlStorage) when the URI
      * is malformed or the server is unreachable — the caller then continues
      * without Redis instead of running half-wired.
+     *
+     * <p>SECURITY (audit SOL-001): every message that embeds the configured
+     * URI is redacted through {@link #redactUri(String)} — no credential ever
+     * reaches the logs. SECURITY (audit SOL-003): non-redis schemes are
+     * rejected up front instead of being handed to Lettuce unverified.</p>
      *
      * @return a connected layer, or null when {@code settings.enabled} is false
      */
     public static RedisLayer start(StorageConfig.RedisSettings settings) {
         if (settings == null || !settings.enabled()) {
             return null;
+        }
+        if (!isSupportedScheme(settings.uri())) {
+            throw new RuntimeException(
+                "Solidus Redis layer: unsupported uri scheme ('"
+                    + redactUri(settings.uri()) + "') — only redis:// and rediss:// are supported. "
+                    + "Use rediss:// for TLS-encrypted connections. Economy NOT degraded; "
+                    + "fix storage.json or set redis.enabled=false");
         }
         RedisURI uri;
         try {
@@ -115,7 +165,7 @@ public final class RedisLayer implements AutoCloseable {
             }
         } catch (RuntimeException e) {
             throw new RuntimeException(
-                "Solidus Redis layer: invalid uri '" + settings.uri() + "' — economy NOT degraded, "
+                "Solidus Redis layer: invalid uri '" + redactUri(settings.uri()) + "' — economy NOT degraded, "
                     + "fix storage.json or set redis.enabled=false", e);
         }
 
@@ -128,7 +178,7 @@ public final class RedisLayer implements AutoCloseable {
         } catch (RuntimeException e) {
             client.shutdown();
             throw new RuntimeException(
-                "Solidus Redis layer: cannot reach " + settings.uri()
+                "Solidus Redis layer: cannot reach " + redactUri(settings.uri())
                     + " — continuing WITHOUT Redis (MySQL-only mode). Fix storage.json if Redis was intended.",
                 e);
         }
@@ -141,8 +191,9 @@ public final class RedisLayer implements AutoCloseable {
             }
         });
         pubsub.sync().subscribe(CHANNEL_BALANCE_INVALIDATION, CHANNEL_EVENTS);
-        LOGGER.info("Solidus Redis layer connected to {} (L2 balance cache TTL {}s, pub/sub on {} + {})",
-            settings.uri(), settings.balanceTtlSeconds(), CHANNEL_BALANCE_INVALIDATION, CHANNEL_EVENTS);
+        LOGGER.info("Solidus Redis layer connected to {} (tls={}, L2 balance cache TTL {}s, pub/sub on {} + {})",
+            redactUri(settings.uri()), uri.isSsl(), settings.balanceTtlSeconds(),
+            CHANNEL_BALANCE_INVALIDATION, CHANNEL_EVENTS);
         return layer;
     }
 

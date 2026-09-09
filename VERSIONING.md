@@ -10,7 +10,7 @@ server owner, at a glance, which releases are built and tested to work together.
 | **Family (Minor)** `2.1.x → 2.2.0` | **Owner-designated architecture era** — never used for ordinary feature additions. The `2.2` family is **reserved** for the cross-server / multi-server storage era. | No — the other mods must move to the new family in lockstep. |
 | **Major** `2.x → 3.0.0` | Architectural reset of the ecosystem contract. | No — full coordinated release. |
 
-Current family: **2.2.4** — Core is on it (the multi-server storage era began:
+Current family: **2.2.5** — Core is on it (the multi-server storage era began:
 `MySqlStorage` + `DECIMAL(18,2)` exact money landed in 2.2.0; the shared
 auction market, the optional Redis layer and the cutover migrator landed in
 2.2.1; the console test harness (`/solidus-admin` accounts/money/pay-as/bid-as/
@@ -20,7 +20,12 @@ fixed five latent production bugs across the idempotency claim, the auction
 orphan sweep, the search escape character and the cutover migrator; Phase 4
 (2.2.4) closed the plan with the scheduled network-wide supply-integrity
 checker, periodic escrow consistency, the no-Redis notification sweep, the
-auction sweep race harness, and the ADMIN_SET signed-delta ledger correction).
+auction sweep race harness, and the ADMIN_SET signed-delta ledger correction;
+2.2.5 hardened the whole storage/auction surface against the security-audit
+findings SOL-001…SOL-006 — Redis URI credential redaction + scheme allowlist,
+TLS-by-default MySQL connections with a loud cleartext warning off loopback,
+player-name sanitization at every ledger/auction boundary, log-forgery-proof
+logging, and a 128 KB cap on auction item payloads).
 Companions built against the `2.1.x` API keep working — the releases are
 purely additive to `SolidusAPI`; they declare the minimum family
 they were integration-tested against in their own `fabric.mod.json`.

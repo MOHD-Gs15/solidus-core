@@ -1,6 +1,7 @@
 package com.solidus.economy;
 
 import com.solidus.util.CurrencyUtil;
+import com.solidus.util.TextUtil;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -191,7 +192,10 @@ public class TransactionLog {
             }
             // Unknown transaction type - log a warning instead of silently
             // falling back to PAY_SEND which would corrupt transaction semantics
-            LOGGER.warn("Unknown transaction type code: '{}'. Defaulting to SHOP_BUY.", code);
+            // SECURITY (audit SOL-005, CWE-117): the code comes from a stored
+            // ledger row - escape CR/LF so a tampered row cannot forge log lines.
+            LOGGER.warn("Unknown transaction type code: '{}'. Defaulting to SHOP_BUY.",
+                TextUtil.sanitizeForLog(code));
             return SHOP_BUY; // safe fallback - SHOP_BUY is the most generic type
         }
     }
@@ -371,9 +375,15 @@ public class TransactionLog {
             ps.setLong(1, now);
             ps.setString(2, type.code());
             ps.setString(3, playerUuid.toString());
-            ps.setString(4, playerName);
+            // SECURITY (audit SOL-004): names can arrive from offline-mode
+            // proxies through API callers. Sanitize HERE — at the single choke
+            // point every ledger write passes — so no row can exceed the
+            // VARCHAR(64) width (which would break all subsequent MySQL
+            // inserts) or carry CRLF / legacy formatting codes into exports,
+            // auction lore, and chat displays.
+            ps.setString(4, TextUtil.sanitizePlayerName(playerName));
             ps.setString(5, targetUuid != null ? targetUuid.toString() : null);
-            ps.setString(6, targetName);
+            ps.setString(6, targetName == null ? null : TextUtil.sanitizePlayerName(targetName));
             ps.setDouble(7, amount);
             ps.setString(8, itemMaterial);
             ps.setInt(9, itemQuantity);
@@ -381,7 +391,8 @@ public class TransactionLog {
             ps.executeUpdate();
             return true;
         } catch (SQLException e) {
-            LOGGER.error("Failed to log transaction: {} for player: {}", type, playerName, e);
+            LOGGER.error("Failed to log transaction: {} for player: {}", type,
+                TextUtil.sanitizeForLog(playerName), e);
             return false;
         }
     }

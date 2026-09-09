@@ -173,6 +173,87 @@ public final class TextUtil {
     }
 
     /**
+     * Maximum length for a stored/displayed player name (audit SOL-004).
+     * Matches the MySQL {@code player_name VARCHAR(64)} / ledger column width.
+     * Vanilla online-mode names are max 16 chars; the cap only bites for
+     * hostile names arriving via permissive offline-mode proxies.
+     */
+    public static final int MAX_NAME_LENGTH = 64;
+
+    /**
+     * SECURITY (audit SOL-004): sanitizes a player-sourced name BEFORE it is
+     * written to storage or rendered into GUI lore / chat components.
+     *
+     * <p>Online-mode servers implicitly guarantee {@code [A-Za-z0-9_]{1,16}},
+     * but this mod explicitly supports offline-mode and permissive proxies
+     * (documented in PayCommand). A hostile name arriving through such a
+     * proxy previously could: exceed the 64-char column width (breaking every
+     * subsequent ledger insert on MySQL), carry CRLF sequences that pollute
+     * logs and CSV exports, or embed legacy formatting codes into lore.</p>
+     *
+     * <p>The sanitizer strips legacy {@code §} codes, removes ALL control
+     * characters (C0 range, DEL, and therefore newlines/tabs), trims, and
+     * clamps the result to {@link #MAX_NAME_LENGTH}. It never returns null
+     * (empty string for null input) so callers can pass results straight to
+     * {@code setString}.</p>
+     *
+     * @param input raw name as it arrived from the session/DB/proxy
+     * @return a safe single-line name, at most 64 characters
+     */
+    public static String sanitizePlayerName(String input) {
+        if (input == null || input.isEmpty()) return "";
+        String cleaned = sanitizeLegacyFormatting(input);
+        StringBuilder sb = new StringBuilder(cleaned.length());
+        for (int i = 0; i < cleaned.length(); i++) {
+            char c = cleaned.charAt(i);
+            // Keep printable characters only: drops \n \r \t and every other
+            // C0 control + DEL (7F). Names never need control characters.
+            if (c >= 0x20 && c != 0x7F) {
+                sb.append(c);
+            }
+        }
+        String result = sb.toString().trim();
+        if (result.length() > MAX_NAME_LENGTH) {
+            result = result.substring(0, MAX_NAME_LENGTH);
+        }
+        return result;
+    }
+
+    /**
+     * SECURITY (audit SOL-005, CWE-117): makes a string safe for single-line
+     * log output. Strings logged by the economy often originate from database
+     * rows (transaction type codes, stored player names) — a tampered row
+     * must not be able to forge log lines via embedded CR/LF sequences.
+     *
+     * <p>Unlike {@link #sanitizePlayerName} this ESCAPES the newlines instead
+     * of dropping them ({@code \n} becomes the two-character sequence
+     * {@code \n}), preserving forensic evidence while guaranteeing one log
+     * entry stays one line. Control characters other than CR/LF/TAB are
+     * removed entirely.</p>
+     *
+     * @param input raw value about to be passed to a LOGGER call
+     * @return a single-line-safe representation, never null
+     */
+    public static String sanitizeForLog(String input) {
+        if (input == null || input.isEmpty()) return "";
+        StringBuilder sb = new StringBuilder(input.length());
+        for (int i = 0; i < input.length(); i++) {
+            char c = input.charAt(i);
+            if (c == '\n') {
+                sb.append('\\').append('n');
+            } else if (c == '\r') {
+                sb.append('\\').append('r');
+            } else if (c == '\t') {
+                sb.append('\\').append('t');
+            } else if (c >= 0x20 && c != 0x7F) {
+                sb.append(c);
+            }
+            // other control chars: dropped
+        }
+        return sb.toString();
+    }
+
+    /**
      * Extracts the registry path name from an ItemStack for reliable
      * material matching. This avoids issues with getItem().toString()
      * which may include namespace prefixes or vary by mapping.

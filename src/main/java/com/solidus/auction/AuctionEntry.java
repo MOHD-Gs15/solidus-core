@@ -1,5 +1,7 @@
 package com.solidus.auction;
 
+import com.solidus.util.TextUtil;
+
 import java.util.UUID;
 
 /**
@@ -88,10 +90,14 @@ public record AuctionEntry(
                                        String materialName, int quantity,
                                        String itemNbt, double price) {
         long now = System.currentTimeMillis();
+        // SECURITY (audit SOL-004): single choke point for NEW listings (both
+        // the player path and the API/admin path) - seller names are clamped
+        // to the VARCHAR(64) width and stripped of control/legacy codes before
+        // they reach auction_listings rows and the GUI lore.
         return new AuctionEntry(
             UUID.randomUUID(),
             sellerUuid,
-            sellerName,
+            TextUtil.sanitizePlayerName(sellerName),
             materialName,
             quantity,
             itemNbt,

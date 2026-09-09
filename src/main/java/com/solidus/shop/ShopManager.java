@@ -424,8 +424,10 @@ public class ShopManager {
             // disconnect, permanently blocking further purchases.
             player.level().getServer().execute(() -> {
                 pendingBuys.remove(playerId);
+                // SECURITY (audit SOL-005): escape CR/LF in names that can be
+                // session-sourced on offline-mode proxies before logging.
                 SolidusMod.LOGGER.error("Buy deduction future failed for {} - lock released.",
-                    player.getName().getString(), ex);
+                    TextUtil.sanitizeForLog(player.getName().getString()), ex);
             });
             return null;
         });
@@ -516,7 +518,7 @@ public class ShopManager {
                         // Balance add failed - give the items back so nothing is lost.
                         // The actual removed stacks (NBT included) are restored.
                         SolidusMod.LOGGER.error("Sell balance add failed for {}! Restoring {}x {}.",
-                            player.getName().getString(), removedCount, material);
+                            TextUtil.sanitizeForLog(player.getName().getString()), removedCount, material);
                         restoreRemovedStacks(player, removedStacks);
                         player.sendSystemMessage(TextUtil.error(
                             "Transaction error. Your items have been returned. Please try again."));
@@ -555,8 +557,9 @@ public class ShopManager {
             // until disconnect AND the removed items were never restored.
             player.level().getServer().execute(() -> {
                 pendingSells.remove(playerId);
+                // SECURITY (audit SOL-005): escape CR/LF before logging.
                 SolidusMod.LOGGER.error("Sell payout future failed for {} - restoring {}x {}.",
-                    player.getName().getString(), removedCount, material, ex);
+                    TextUtil.sanitizeForLog(player.getName().getString()), removedCount, material, ex);
                 restoreRemovedStacks(player, removedStacks);
                 player.sendSystemMessage(TextUtil.error(
                     "Transaction error. Your items have been returned. Please try again."));

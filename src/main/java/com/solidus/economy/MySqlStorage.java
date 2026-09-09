@@ -1,6 +1,7 @@
 package com.solidus.economy;
 
 import com.solidus.util.CurrencyUtil;
+import com.solidus.util.TextUtil;
 import com.zaxxer.hikari.HikariConfig;
 import com.zaxxer.hikari.HikariDataSource;
 
@@ -179,6 +180,19 @@ public class MySqlStorage implements StorageBackend {
                     + " — economy NOT started. Fix storage.json or set type back to \"sqlite\".", e);
         }
 
+        // SECURITY (audit SOL-002, CWE-319): a shared-database mode reached
+        // over the network WITHOUT TLS is exactly the deployment this warning
+        // exists for — balances, names and the whole ledger cross the wire in
+        // cleartext and an on-path attacker can even rewrite query results.
+        // Loopback deployments keep their silence (risk is negligible there).
+        if (!settings.useSsl() && !isLoopbackHost(settings.host())) {
+            LOGGER.warn("SECURITY: MySQL connection to '{}' uses useSsl=false over a NON-local "
+                    + "network — balances and the transaction ledger cross this link in cleartext. "
+                    + "Enable \"useSsl\": true in storage.json (with a verifiable certificate or "
+                    + "serverSslCert) unless this host is isolated on a trusted private network.",
+                settings.host());
+        }
+
         try (Connection conn = dataSource.getConnection()) {
             createEconomySchema(conn);
         } catch (SQLException e) {
@@ -207,6 +221,18 @@ public class MySqlStorage implements StorageBackend {
             // add serverSslCert themselves (documented in docs/sql/mysql/).
         }
         return url;
+    }
+
+    /**
+     * True when the configured host is local-loopback (localhost / 127.x / ::1).
+     * Used to keep the cleartext-connection warning (SOL-002) quiet for the
+     * safe single-machine topology and loud for everything else.
+     * Package-private static so tests can verify the classification directly.
+     */
+    static boolean isLoopbackHost(String host) {
+        if (host == null) return false;
+        String h = host.trim().toLowerCase(java.util.Locale.ROOT);
+        return h.equals("localhost") || h.equals("::1") || h.startsWith("127.");
     }
 
     private void preloadCaches() {
@@ -394,14 +420,17 @@ public class MySqlStorage implements StorageBackend {
             try (Connection conn = dataSource.getConnection()) {
                 try (PreparedStatement ps = conn.prepareStatement(UPSERT_BALANCE)) {
                     ps.setString(1, uuid.toString());
-                    ps.setString(2, playerName == null ? "" : playerName);
+                    // SECURITY (audit SOL-004): clamp to the VARCHAR(64) width;
+                    // an oversized name would otherwise break every subsequent
+                    // upsert with a column-width exception.
+                    ps.setString(2, TextUtil.sanitizePlayerName(playerName));
                     ps.setBigDecimal(3, Money.of(roundedAmount).toDecimal());
                     ps.setLong(4, System.currentTimeMillis());
                     ps.executeUpdate();
                 }
                 balanceFallbackCache.put(uuid, roundedAmount);
                 if (playerName != null && !playerName.isEmpty()) {
-                    playerNameCache.put(uuid, playerName);
+                    playerNameCache.put(uuid, TextUtil.sanitizePlayerName(playerName));
                 }
                 invalidateBalancesRedis(uuid);
                 return true;
@@ -581,10 +610,10 @@ public class MySqlStorage implements StorageBackend {
                     balanceFallbackCache.put(receiverUuid, receiverNew.toDouble());
                     invalidateBalancesRedis(senderUuid, receiverUuid);
                     if (senderName != null && !senderName.isEmpty()) {
-                        playerNameCache.put(senderUuid, senderName);
+                        playerNameCache.put(senderUuid, TextUtil.sanitizePlayerName(senderName));
                     }
                     if (receiverName != null && !receiverName.isEmpty()) {
-                        playerNameCache.put(receiverUuid, receiverName);
+                        playerNameCache.put(receiverUuid, TextUtil.sanitizePlayerName(receiverName));
                     }
                     return new SQLiteStorage.TransferOutcome(SQLiteStorage.TransferStatus.SUCCESS,
                         senderNew.toDouble(), receiverNew.toDouble());
@@ -798,7 +827,8 @@ public class MySqlStorage implements StorageBackend {
     private void insertNewPlayerRow(Connection conn, UUID uuid, String playerName) throws SQLException {
         try (PreparedStatement ps = conn.prepareStatement(INSERT_IGNORE_BALANCE)) {
             ps.setString(1, uuid.toString());
-            ps.setString(2, playerName == null ? "" : playerName);
+            // SECURITY (audit SOL-004): sanitize before the VARCHAR(64) column.
+            ps.setString(2, TextUtil.sanitizePlayerName(playerName));
             ps.setBigDecimal(3, Money.of(CurrencyUtil.getStartingBalance()).toDecimal());
             ps.setLong(4, System.currentTimeMillis());
             ps.executeUpdate();
@@ -828,7 +858,8 @@ public class MySqlStorage implements StorageBackend {
         }
         try (PreparedStatement ps = conn.prepareStatement(sql)) {
             ps.setBigDecimal(1, newBalance.toDecimal());
-            ps.setString(2, playerName);
+            // SECURITY (audit SOL-004): sanitize before the VARCHAR(64) column.
+            ps.setString(2, TextUtil.sanitizePlayerName(playerName));
             ps.setLong(3, System.currentTimeMillis());
             ps.setString(4, uuid.toString());
             if (expectedCurrent >= 0) {
@@ -882,11 +913,12 @@ public class MySqlStorage implements StorageBackend {
         asyncExecutor.execute(() -> {
             try (Connection conn = dataSource.getConnection();
                  PreparedStatement ps = conn.prepareStatement(UPDATE_NAME)) {
-                ps.setString(1, playerName);
+                // SECURITY (audit SOL-004): sanitize before the VARCHAR(64) column.
+                ps.setString(1, TextUtil.sanitizePlayerName(playerName));
                 ps.setLong(2, System.currentTimeMillis());
                 ps.setString(3, uuid.toString());
                 ps.executeUpdate();
-                playerNameCache.put(uuid, playerName);
+                playerNameCache.put(uuid, TextUtil.sanitizePlayerName(playerName));
             } catch (SQLException e) {
                 LOGGER.warn("Name refresh skipped for {}: {}", uuid, e.getMessage());
             }

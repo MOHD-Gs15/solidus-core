@@ -239,7 +239,10 @@ public final class AuctionGUI {
             lore.add(TextUtil.styledBold("BIDDING ENABLED", ChatFormatting.LIGHT_PURPLE));
             if (bidState.hasBids()) {
                 lore.add(TextUtil.currency("Current Bid: " + CurrencyUtil.format(bidState.currentBid())));
-                lore.add(TextUtil.styled("Top Bidder: " + bidState.currentBidderName(), ChatFormatting.YELLOW));
+                // SECURITY (audit SOL-004): stored names are DB-sourced - display
+                // them through the name sanitizer (control chars + legacy codes).
+                lore.add(TextUtil.styled("Top Bidder: "
+                    + TextUtil.sanitizePlayerName(bidState.currentBidderName()), ChatFormatting.YELLOW));
                 lore.add(TextUtil.styled("Bids: " + bidState.bidCount(), ChatFormatting.AQUA));
             } else {
                 lore.add(TextUtil.styled("Opening Bid: " + CurrencyUtil.format(bidState.startPrice()), ChatFormatting.AQUA));
@@ -252,7 +255,7 @@ public final class AuctionGUI {
             // BUY-NOW-ONLY LISTING (classic view)
             lore.add(TextUtil.currency("Price: " + CurrencyUtil.format(entry.price())));
         }
-        lore.add(TextUtil.styled("Seller: " + entry.sellerName(), ChatFormatting.YELLOW));
+        lore.add(TextUtil.styled("Seller: " + TextUtil.sanitizePlayerName(entry.sellerName()), ChatFormatting.YELLOW));
         lore.add(TextUtil.styled("Quantity: " + entry.quantity(), ChatFormatting.AQUA));
 
         // Time remaining

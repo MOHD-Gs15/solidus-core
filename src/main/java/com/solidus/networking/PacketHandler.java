@@ -6,6 +6,7 @@ import com.solidus.sell.SellScreenHandler;
 import com.solidus.auction.AuctionScreenHandler;
 import com.solidus.trade.TradeManager;
 import com.solidus.trade.TradeScreenHandler;
+import com.solidus.util.TextUtil;
 
 import net.fabricmc.fabric.api.networking.v1.ServerPlayConnectionEvents;
 
@@ -99,9 +100,10 @@ public class PacketHandler {
             // is a harmless no-op - no double-payout / dupe risk.
             ServerPlayer disconnectedPlayer = handler.getPlayer();
             if (disconnectedPlayer.containerMenu instanceof SellScreenHandler sellHandler) {
+                // SECURITY (audit SOL-005): escape CR/LF before logging (CWE-117).
                 SolidusMod.LOGGER.info(
                     "Player {} disconnected with the sell GUI open - processing placed items now.",
-                    disconnectedPlayer.getName().getString());
+                    TextUtil.sanitizeForLog(disconnectedPlayer.getName().getString()));
                 sellHandler.removed(disconnectedPlayer);
             }
 

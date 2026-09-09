@@ -589,6 +589,15 @@ public class AuctionManager {
         String materialName = TextUtil.getMaterialName(item);
         int quantity = item.getCount();
         String itemNbt = serializeItemStack(item);
+        // SECURITY (audit SOL-006): reject oversized item payloads BEFORE any
+        // fee is charged or anything is stored (pendingListings released so
+        // the seller can immediately list something else).
+        if (exceedsNbtCap(itemNbt)) {
+            pendingListings.remove(sellerUuid);
+            feedback.accept(true, "This item's data is too large to list "
+                + "(limit " + (MAX_ITEM_NBT_CHARS / 1024) + " KB).");
+            return;
+        }
         double listingFee = AuctionEntry.calculateListingFee(price);
         BalanceManager balanceManager = economyEngine.getBalanceManager();
 
@@ -696,6 +705,14 @@ public class AuctionManager {
         String materialName = TextUtil.getMaterialName(heldItem);
         int quantity = heldItem.getCount();
         String itemNbt = serializeItemStack(heldItem);
+        // SECURITY (audit SOL-006): reject oversized item payloads BEFORE the
+        // item leaves the hand (nothing has been touched yet).
+        if (exceedsNbtCap(itemNbt)) {
+            pendingListings.remove(playerId);
+            player.sendSystemMessage(TextUtil.error("This item's data is too large to list "
+                + "(limit " + (MAX_ITEM_NBT_CHARS / 1024) + " KB)."));
+            return;
+        }
         int selectedSlot = player.getInventory().getSelectedSlot();
         final ItemStack capturedStack = heldItem.copy();
 
@@ -1630,6 +1647,25 @@ public class AuctionManager {
         return TextUtil.getMaterialName(stack);
     }
 
+    /**
+     * SECURITY (audit SOL-006, CWE-400): serialized item payloads larger than
+     * this are rejected at LIST time. The MEDIUMTEXT column itself would hold
+     * megabytes, but unbounded NBT (nested shulkers, stuffed written books,
+     * component-heavy gear) inflates the auction table, slows the periodic
+     * {@code SELECT *} startup sweep, and bloats every container broadcast.
+     * 128 KB of JSON is generous headroom above any legitimate item (a fully
+     * written book serializes to ~12 KB) yet caps the abuse ceiling.
+     */
+    static final int MAX_ITEM_NBT_CHARS = 131_072;
+
+    /** True when a serialized item payload exceeds the listing size cap.
+     *  Package-private static so tests can verify the boundary directly. */
+    static boolean exceedsNbtCap(String itemNbt) {
+        // A bare material-name fallback string is always fine; only encoded
+        // payloads can realistically grow large.
+        return itemNbt != null && itemNbt.length() > MAX_ITEM_NBT_CHARS;
+    }
+
     private ItemStack deserializeItemStack(String itemNbt, String materialName, int quantity) {
         try {
             // Try to deserialize from NBT (JSON-encoded)
@@ -2178,7 +2214,8 @@ public class AuctionManager {
             try (PreparedStatement ps = conn.prepareStatement(sql)) {
                 ps.setDouble(1, amount);
                 ps.setString(2, bidderUuid.toString());
-                ps.setString(3, bidderName);
+                // SECURITY (audit SOL-004): bidder names feed the GUI lore.
+                ps.setString(3, TextUtil.sanitizePlayerName(bidderName));
                 ps.setString(4, listingId.toString());
                 ps.setDouble(5, amount);
                 return ps.executeUpdate() > 0;
@@ -2194,7 +2231,8 @@ public class AuctionManager {
             try (PreparedStatement ps = conn.prepareStatement(sql)) {
                 ps.setString(1, listingId.toString());
                 ps.setString(2, bidderUuid.toString());
-                ps.setString(3, bidderName);
+                // SECURITY (audit SOL-004): sanitize before the VARCHAR(64) column.
+                ps.setString(3, TextUtil.sanitizePlayerName(bidderName));
                 ps.setDouble(4, amount);
                 ps.setLong(5, System.currentTimeMillis());
                 ps.executeUpdate();
@@ -2863,7 +2901,8 @@ public class AuctionManager {
             ps.setInt(5, entry.quantity());
             ps.setDouble(6, entry.price());
             ps.setString(7, buyerUuid != null ? buyerUuid.toString() : null);
-            ps.setString(8, buyerName);
+            // SECURITY (audit SOL-004): sanitize before the VARCHAR(64) column.
+            ps.setString(8, TextUtil.sanitizePlayerName(buyerName));
             ps.setLong(9, entry.listedTimestamp());
             ps.setLong(10, settledTimestamp);
             ps.setString(11, reason);

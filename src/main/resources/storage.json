@@ -8,11 +8,12 @@
     "user": "solidus",
     "password": "CHANGE_ME",
     "pool": { "maxSize": 10, "connectionTimeoutMs": 5000 },
-    "useSsl": false
+    "useSsl": true,
+    "_ssl_comment": "SECURITY (2.2.5): useSsl defaults to TRUE - encryption is the safe default for the multi-server mode this backend exists for. Only set it to false when the database truly runs on the same machine (host 127.0.0.1/localhost); a cleartext connection to any other host is loudly warned in the log. With useSsl=true the server certificate must verify against the JVM trust store, or point 'serverSslCert' (JDBC URL parameter, see docs/sql/mysql/) at your self-signed certificate."
   },
   "redis": {
     "enabled": false,
-    "_redis_comment": "OPTIONAL coordination layer (2.2.1): L2 balance cache + pub/sub invalidation + instant network-wide notifications. Never the source of truth - the shared database stays authoritative, and a Redis outage degrades to plain database reads. The redis password may be overridden with the SOLIDUS_REDIS_PASSWORD environment variable (passwordEnv names that variable).",
+    "_redis_comment": "OPTIONAL coordination layer (2.2.1): L2 balance cache + pub/sub invalidation + instant network-wide notifications. Never the source of truth - the shared database stays authoritative, and a Redis outage degrades to plain database reads. The redis password may be overridden with the SOLIDUS_REDIS_PASSWORD environment variable (passwordEnv names that variable). SECURITY (2.2.5): only redis:// and rediss:// schemes are accepted; use rediss:// for TLS-encrypted connections (certificate verified against the JVM trust store) when Redis is reached over a network, and prefer passwordEnv over embedding credentials in the uri (any credentials in the uri are redacted from logs).",
     "uri": "redis://127.0.0.1:6379/0",
     "passwordEnv": "SOLIDUS_REDIS_PASSWORD",
     "balanceTtlSeconds": 30
