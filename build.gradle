@@ -121,9 +121,9 @@ dependencies {
     // Both are shaded into the mod JAR so server operators never manage
     // classpath dependencies. SQLite remains the DEFAULT backend; MySQL is
     // opt-in via config/solidus/storage.json.
-    implementation "com.zaxxer:HikariCP:7.0.2"
+    implementation "com.zaxxer:HikariCP:7.1.0"
     implementation "org.mariadb.jdbc:mariadb-java-client:3.5.10"
-    include "com.zaxxer:HikariCP:7.0.2"
+    include "com.zaxxer:HikariCP:7.1.0"
     include "org.mariadb.jdbc:mariadb-java-client:3.5.10"
 
     // ── Optional Redis layer (DB scaling plan Phase 3, 2.2.1) ──
