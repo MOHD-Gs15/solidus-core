@@ -1,437 +1,142 @@
-# Solidus Economy — Server-Side Minecraft Fabric Mod
+<h1 align="center">Solidus</h1>
 
-[![Solidus Family](https://img.shields.io/badge/Solidus_Family-2.2.5-8B5CF6.svg)](VERSIONING.md)
-[![Platform](https://img.shields.io/badge/Platform-Fabric-blue.svg)](https://fabricmc.net/)
-[![Minecraft](https://img.shields.io/badge/Minecraft-26.1.x-green.svg)](https://www.minecraft.net/)
-[![Java](https://img.shields.io/badge/Java-25-orange.svg)](https://adoptium.net/)
-[![Server-Side](https://img.shields.io/badge/Server_Side-Only-brightgreen.svg)](https://fabricmc.net/)
-[![License](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
-[![Economy](https://img.shields.io/badge/Type-Economy_Mod-8B5CF6.svg)]()
+<p align="center"><strong>The complete server-side economy &amp; commerce engine for Minecraft servers</strong><br>
+Balances, transfers, a server shop, an auction house, and secure player-to-player trading — in one mod.</p>
 
-**Server-side economy engine for Minecraft Fabric — virtual currency, server shop, auction house, and crash-resilient persistence. No client mods required.**
+<p align="center">
+  <a href="https://github.com/MOHD-Gs15/solidus-core/actions/workflows/test.yml"><img src="https://github.com/MOHD-Gs15/solidus-core/actions/workflows/test.yml/badge.svg" alt="Tests"></a>
+  <a href="https://github.com/MOHD-Gs15/solidus-core/actions/workflows/codeql.yml"><img src="https://github.com/MOHD-Gs15/solidus-core/actions/workflows/codeql.yml/badge.svg" alt="CodeQL"></a>
+  <img src="https://img.shields.io/badge/version-2.2.5-blue" alt="Version 2.2.5">
+  <img src="https://img.shields.io/badge/Minecraft-26.1.2-brightgreen" alt="Minecraft 26.1.2">
+  <img src="https://img.shields.io/badge/Java-25-orange" alt="Java 25">
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-green" alt="MIT License"></a>
+  <a href="https://github.com/MOHD-Gs15"><img src="https://img.shields.io/badge/mod%20by-MOHD--Gs-6f42c1" alt="Mod by MOHD-Gs"></a>
+</p>
 
-Stable economies · Vanilla compatibility · Zero client installation · Minecraft 26.1.x Ready
+**Solidus** is a server-side economy mod for Minecraft (Fabric, MC 26.1.2). Players never install anything — they join with the vanilla client and immediately get a persistent wallet in the server's own currency, the **Solidus (S$)**, plus a graphical server shop, an in-game auction house with bidding, fast inventory selling, and a double-confirmation trade screen. Everything is stored in a real database (SQLite out of the box, MySQL/MariaDB for server networks) and every single credit and debit is written to an auditable transaction ledger. Free and open source under the MIT license.
 
-[Economy](#-economy) · [Server Shop](#-server-shop-shop) · [Auction House](#-auction-house-ah) · [Sell System](#-sell-system-sell) · [API](#-inter-mod-api) · [Quick Start](#-quick-start) · [Ecosystem](#-solidus-ecosystem)
+## Why server owners pick Solidus
 
----
-
-<!-- Schema.org Structured Data for Search Engines
-{
-  "@context": "https://schema.org",
-  "@type": "SoftwareApplication",
-  "name": "Solidus Economy",
-  "applicationCategory": "GameModification",
-  "operatingSystem": "Minecraft 26.1.x",
-  "programmingLanguage": "Java 25",
-  "runtimePlatform": "Fabric Loader 0.19.4+",
-  "license": "MIT",
-  "description": "Server-side economy engine for Minecraft Fabric with virtual currency, GUI shop, auction house, and crash-resilient persistence. No client mods required.",
-  "author": { "@type": "Person", "name": "MOHD-Gs15", "url": "https://github.com/MOHD-Gs15" },
-  "url": "https://github.com/MOHD-Gs15/solidus-core",
-  "offers": { "@type": "Offer", "price": "0", "priceCurrency": "USD" }
-}
--->
-
-## Why Solidus?
-
-Solidus is a complete **server-side economy and commerce engine** for Minecraft Fabric. It is designed from the ground up for long-term survival servers that need a stable, inflation-resistant virtual economy — without requiring client mods, resource packs, custom assets, or plugin stacks.
-
-Every transaction is persisted through crashes using async SQLite with WAL journaling. Every shop price is hot-reloadable without restarting the server. Every API call is thread-safe and available through reflection — zero compile-time dependency for third-party integration.
-
-### Highlights
-
-* **Fully server-side architecture** — works with any vanilla client, zero client installation
-* **Built-in virtual economy** with async persistence via SQLite (WAL mode, `CompletableFuture`-based)
-* **GUI-based server shop** — 11 categories, 185 configured items, hot-reload pricing
-* **Player-driven auction house** — buy-now listings plus optional **bidding** with money escrow, anti-snipe protection, and self-healing refunds
-* **Direct player-to-player trade** (`/trade`) — a dual-preview window for items AND money that executes only when both players are ready
-* **Hot-reload configuration** — change prices, categories, and settings without restart
-* **Inter-mod API** (`SolidusAPI`) — reflection-based, zero compile-time dependency for third-party mods
-* **Crash-resilient data storage** — WAL journaling ensures no data loss on server crash
-* **Shulker box support** — all sell commands scan and process items inside shulker boxes
-
----
-
-## Solidus Ecosystem
-
-Solidus Core is the foundation of the **Solidus Economy Ecosystem** — a suite of server-side Fabric mods that work together to create a complete, balanced economy for Minecraft servers.
-
-| Module | License | Description |
-|--------|---------|-------------|
-| **solidus-core** | **MIT** | **Economy engine, server shop, auction house** (this repo) |
-| [solidus-analytics](https://github.com/MOHD-Gs15/solidus-analytics) | Proprietary | Economy intelligence dashboard, inflation tracking, fraud detection, live web dashboard (AES-256-GCM encrypted) |
-| [Solidus-Enforcer](https://github.com/MOHD-Gs15/Solidus-Enforcer) | MIT | Bounty hunting, hunter license system, alliance rewards, autonomous anti-monopoly bounties |
-| [Solidus-Governance](https://github.com/MOHD-Gs15/Solidus-Governance) | Proprietary | Economy administration, progressive taxation, immutable audit logging, point-in-time rollback recovery |
-| [solidus-territory](https://github.com/MOHD-Gs15/solidus-territory) | MIT | Polygon-based land claiming, rent system, territory trading, visual particle borders |
-
-Each module integrates with Solidus Core through **reflection-based bridges** — zero compile dependency, automatic activation when Core is present, graceful degradation when absent.
-
----
+- **Zero client install** — pure server-side; players join with the unmodified game.
+- **Works in one minute** — drop it in `mods`, start the server, done. SQLite storage needs no setup at all.
+- **Network-ready** — point it at MySQL/MariaDB and every server in your network shares one wallet balance, with an optional Redis layer for caching and instant cross-server notifications.
+- **Bank-grade honesty** — a periodic auditor re-checks that the sum of all balances matches the ledger, so money can never silently appear or disappear.
+- **Player-friendly UIs** — the shop, auction house, and selling all work through click-through chest GUIs, not command memorization.
 
 ## Features
 
-### Economy
+- **Persistent wallets** — every player has a balance that survives restarts, crashes, and offline time.
+- **Instant payments** — one `/pay` command, including transfers to players who are currently offline.
+- **Server shop** — a browsable in-game shop GUI with instant search (`/shop search <word>`).
+- **Quick selling** — sell everything sellable in your inventory with one command, or drag-and-drop through a GUI.
+- **Auction house** — list items with a buy-now price and a starting bid; bids are held in a mandatory escrow account until the auction settles; sortable listings.
+- **Player-to-player trading** — a dual-side trade window where both parties confirm, so nothing changes hands without consent.
+- **Leaderboard** — `/baltop` shows the richest players, paginated.
+- **Full transaction ledger** — every player can review and export their own history; admins get export-everything tooling.
+- **Real storage engine** — SQLite by default; MySQL/MariaDB for multi-server networks with a one-command data migration.
+- **Money-supply integrity checks** — periodic verification that total balances equal the ledger replay, plus data-tamper protection and optional TLS for database connections.
+- **Powerful admin toolkit** — grant/set/take balances, create accounts, act as a player, migrate storage, and audit the whole economy from one command tree.
 
-A lightweight virtual economy designed for multiplayer survival servers. All operations are persisted asynchronously through SQLite with WAL journaling — the server thread never blocks on disk I/O, and data survives crashes.
+## Installation
 
-* Configurable starting balance
-* Secure player transfers (`/pay`) — online and offline, validated server-side
-* Global wealth leaderboard (`/baltop`)
-* Full transaction history (`/transactions`) with pagination + CSV export
-* Offline notifications on login — players see missed payments
-* Currency symbol: `S$` (configurable)
+1. Install [Fabric Loader](https://fabricmc.net/use/) on your server (Minecraft 26.1.2).
+2. Drop [Fabric API](https://modrinth.com/mod/fabric-api) into your `mods` folder.
+3. Drop `solidus-2.2.5.jar` into `mods`.
+4. Start the server — the economy is live immediately on local SQLite storage.
 
-### Server Shop (`/shop`)
-
-Virtual shop interface powered entirely by the server. Uses vanilla container packets — no client mod or resource pack needed. Players see a GUI with categorized items, buy with one click, and items appear directly in their inventory.
-
-* 11 categories with 185 configured items
-* Stack trading support — buy in bulk
-* Item search (`/shop search <query>`) — partial name matching
-* Hot-reload configuration — edit `shop.json` and run `/shop reload` (OP 2+) without restart
-* Display-only GUI protection — no item movement exploits (server validates every click)
-* Per-item buy and sell pricing — fully operator-controlled in `shop.json`
-
-### Auction House (`/ah`)
-
-Marketplace for player-to-player trading. Players list items from their inventory, other players browse, bid, or buy. The server handles listing, bidding, expiration, refunds, and notifications — all server-side.
-
-* Item listing directly from inventory (`/ah sell <price>`)
-* **Optional bidding** (`/ah sell <price> <startbid>`) — bid money is held in a system escrow account the moment a bid is placed, refunded instantly on outbid/cancel/buy-now, and released to the seller when the auction expires with a winner
-* **Anti-snipe protection** — a bid in the last 10 minutes extends the auction by 5 minutes (capped at 12 extensions)
-* Won items are delivered immediately if the winner is online, or wait in `/ah collect` if offline
-* Listing expiration with automatic item return to seller
-* Reclaim expired and won items (`/ah collect`)
-* Cancel own listings (`/ah cancel <uuid>`) — the top bidder is refunded automatically
-* Sort listings (`/ah sort <newest|price_low|price_high|material>`) and free-text search (`/ah search <term>`)
-* Listing fee support — configurable to add money sinks
-* Offline seller notifications — players see sold items when they log in
-
-See [docs/FEATURES_TRADE_BIDDING.md](docs/FEATURES_TRADE_BIDDING.md) for the full bidding reference.
-
-### Direct Trade (`/trade`)
-
-A mutual-preview trade window between two nearby players — items AND money on both sides — that executes only when **both** players press READY. This replaces the old `/pay`-then-drop-items flow that enabled half-payment scams.
-
-* `/trade <player>` sends a request (both players within 10 blocks, 30-second TTL, 5-second cooldown)
-* 54-slot window: your offer on the left 3 columns, your partner's live offer mirrored on the right
-* Offer items (real inventory interaction) and money (click the gold ingot, type the amount in chat)
-* Any change to either offer un-readies BOTH sides — a last-second bait-and-switch is impossible
-* Offered items are held by the session the moment they are placed; every cancel path (ESC, close, disconnect, idle timeout, `/trade cancel`) returns them to their owners
-* Money legs run through the same atomic transfer as `/pay`, so governance hooks and limits apply
-
-See [docs/FEATURES_TRADE_BIDDING.md](docs/FEATURES_TRADE_BIDDING.md) for the full trade reference.
-
-### Sell System (`/sell`)
-
-Sell items directly from your inventory or through a visual GUI. Supports shulker box scanning, partial name matching, and configurable per-material pricing.
-
-* **`/sell gui`** — Opens a virtual chest interface where you place items to sell. Sellable items are processed and paid for; unsellable items are returned to your inventory (or dropped on the ground if inventory is full).
-* **`/sell all`** — Instantly sells every sellable item in your inventory.
-* **`/sell all <item>`** — Sells all instances of a specific item (e.g., `/sell all ender_pearl`). Supports both underscores and spaces, and partial name matching.
-
-#### Shulker Box Support
-
-All sell commands fully support shulker boxes:
-
-* Items inside shulker boxes are scanned and sold just like regular inventory items.
-* When using `/sell gui`, placing a shulker box in the sell window will sell all sellable contents inside it. Unsellable items stay inside the shulker box, and the shulker box is returned to your inventory.
-* When using `/sell all` or `/sell all <item>`, matching items inside shulker boxes are sold as well. The shulker box is updated in place with only the remaining unsellable items.
-* If all items inside a shulker box are sold and the shulker box itself is sellable (listed in the shop), it will also be sold automatically.
-
-### Economy Price Control
-
-There is no automatic "farm detection" or percentage-reduction mechanism in the code. Price control is fully manual and fully operator-owned: every material's buy and sell price is set explicitly per material in `shop.json` (keys `buy-price` / `sell-price`), and prices can be lowered on farmed resources at any time and applied live via `/shop reload`. Setting the sell price of iron ingots below the buy price — or to `null` to make an item unsellable — is the supported way to counter inflation from automated farms. Sell prices are charged/paid exactly as configured; the server applies no hidden multipliers.
-
-### Inter-Mod API
-
-Solidus provides a public API (`SolidusAPI`) for other Fabric mods to integrate with the economy system. The API uses **Java MethodHandle reflection** — meaning zero compile-time dependency. Third-party mods can call Solidus methods without importing Solidus classes at compile time. If Solidus Core is not installed on the server, the reflection calls simply return empty results rather than crashing.
-
-See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for full API reference, method signatures, and integration examples.
-
-### Transaction Hooks (new in 2.1.0)
-
-Solidus 2.1.0 adds a **transaction hook system** (`SolidusTransactionHook`) that lets companion mods intercept economy traffic at every money-movement point — the mechanism Solidus Governance uses to enforce daily limits, trading locks, frozen accounts, and transaction taxes:
-
-| Flow | Veto hook (before) | Notification hook (after) |
-|------|--------------------|---------------------------|
-| `/pay` + API transfers | `allowTransfer` | `afterTransfer` |
-| Auction listing | `allowAuctionListing` | `afterAuctionListing` |
-| Auction purchase | `allowAuctionPurchase` | `afterAuctionSale` |
-| Shop purchase | `allowShopPurchase` | `afterShopPurchase` |
-| Shop sell (GUI · `/sell all` · Sell GUI) | `allowShopSell` | `afterShopSell` |
-
-A veto denial aborts the transaction cleanly — balances untouched, items stay in hand, and the denial reason is shown to the player. Notifications fire only after the transaction has fully settled. Registration goes through `SolidusAPI.registerTransactionHook(hook)` (reflection-friendly; duplicate hook names are ignored), and the dispatch is **fail-open**: a hook that throws is logged and skipped for that transaction, so one misbehaving mod can never wedge the economy.
-
----
-
-## Quick Start
-
-### Installation
-
-> **Requirements:** Minecraft 26.1.x · Java 25 · Fabric Loader 0.19.4+ · Fabric API 0.155.2+
-
-1. Install [Fabric Loader](https://fabricmc.net/use/) on your server
-2. Install [Fabric API](https://modrinth.com/mod/fabric-api) on the server
-3. Download the latest Solidus release from [Releases](https://github.com/MOHD-Gs15/solidus-core/releases)
-4. Place both `.jar` files into your server's `mods/` folder
-5. Start the server
-6. Configure `config/solidus/shop.json` to customize your economy
-
-**No client installation required.** Players join with standard Minecraft clients and everything works.
-
-### First-Time Setup
-
-```
-/balance                                 ← Check your starting balance (default: 500 S$)
-/pay PlayerName 100                      ← Send money to another player
-/shop                                    ← Open the server shop GUI
-/sell all                                ← Sell all sellable items in your inventory
-/ah sell 500                             ← List an item on the auction house
-/baltop                                  ← See the wealth leaderboard (10 per page)
-/baltop 2                                ← Jump to leaderboard page 2
-```
-
-### Adding Ecosystem Modules
-
-Once Solidus Core is running, you can add any combination of ecosystem modules:
-
-| Module | What It Adds | Installation |
-|--------|-------------|-------------|
-| [solidus-analytics](https://github.com/MOHD-Gs15/solidus-analytics) | Live economy dashboard, inflation tracking, fraud detection | Drop JAR in `mods/` |
-| [Solidus-Enforcer](https://github.com/MOHD-Gs15/Solidus-Enforcer) | Bounty hunting, hunter licenses, anti-monopoly system | Drop JAR in `mods/` |
-| [Solidus-Governance](https://github.com/MOHD-Gs15/Solidus-Governance) | Taxation, audit logging, rollback recovery | Drop JAR in `mods/` |
-| [solidus-territory](https://github.com/MOHD-Gs15/solidus-territory) | Polygon land claiming, rent, territory trading | Drop JAR in `mods/` |
-
-All modules auto-detect Solidus Core via reflection and activate automatically. No additional configuration needed for basic integration.
-
----
+> Server-side only: players connect with the vanilla client and need zero downloads.
 
 ## Commands
 
-| Command | Description |
-| --- | --- |
-| `/balance` | Show balance |
-| `/pay <player> <amount>` | Transfer to online player |
-| `/pay offline <player> <amount>` | Transfer to offline player |
-| `/baltop [page]` | Wealth leaderboard, 10 per page (ranks continue across pages) |
-| `/shop` | Open shop |
-| `/shop search <query>` | Search shop items |
-| `/sell gui` | Open sell GUI (place items to sell) |
-| `/sell all` | Sell all sellable items in inventory |
-| `/sell all <item>` | Sell all of a specific item (e.g. `ender_pearl`) |
-| `/ah` | Open auction |
-| `/ah sell <price> [startbid]` | Create listing; optional opening bid enables **bidding** |
-| `/ah bid <uuid> <amount>` | Bid on a bidding-enabled listing (or right-click it in the GUI) |
-| `/ah collect` | Reclaim expired items **and won auction items** |
-| `/ah cancel <uuid>` | Cancel own listing (top bidder auto-refunded) |
-| `/ah sort <criteria>` | Sort listings (newest/price_low/price_high/material) |
-| `/ah search <term>` | Free-text search across active listings (cheapest first) |
-| `/trade <player>` | Request a direct trade with a nearby player |
-| `/trade accept` / `deny` | Respond to a pending trade request |
-| `/trade cancel` | Cancel the trade you are in |
-| `/transactions [page]` | Transaction history (10 per page) |
-| `/transactions export [days]` | Export your own history to CSV (default 7 days) |
-| `/transactions exportall [days]` | Export the full ledger to CSV (OP 2+) |
-| `/solidus-admin storage migrate [flags]` | Copy the SQLite data set into the configured MySQL target, verify, write a report (OP 4; flags: `--force`, `--batch N`) |
-| `/solidus-admin account create <name> [balance]` | **Console testing**: materialize a dummy account (offline-mode UUID) without a player joining |
-| `/solidus-admin account balance <name>` / `account list [page]` | Inspect any account from the console |
-| `/solidus-admin money give\|set\|take <name> <amount>` | Seed/adjust dummy balances from the console (ledger: `ADMIN_GIVE`/`ADMIN_SET`/`ADMIN_TAKE`) |
-| `/solidus-admin pay-as <from> <to> <amount>` | Real atomic transfer between two accounts (same path as `/pay`, ledger `PAY_SEND`/`PAY_RECEIVE`) |
-| `/solidus-admin bid-as <bidder> <listing> <amount>` | Bid on behalf of a dummy account (real escrow pipeline) |
-| `/solidus-admin auction create <seller> <item> <count> <price> [startbid]` | List a conjured item for a dummy seller (real fee + ledger path) |
-| `/solidus-admin audit` | Invariant check: negative balances, escrow sanity, supply snapshot |
-| `/solidus-admin diag` | Active backend / Redis state / auction store mode / economy snapshot |
+### Player commands
 
----
+| Command | What it does |
+|---------|--------------|
+| `/balance` · `/bal` | Show your balance |
+| `/pay <player> <amount>` | Send money to an online player |
+| `/pay offline <name> <amount>` | Send money to an offline player |
+| `/baltop [page]` | Richest-players leaderboard |
+| `/transactions [days]` | Your transaction history (default: last 7 days) |
+| `/transactions export` | Export your history to a file |
+| `/shop` | Open the server shop |
+| `/shop search <word>` | Search the shop by item name |
+| `/sell gui` | Open the drag-and-drop selling interface |
+| `/sell all [item]` | Sell every sellable item (or one specific item type) |
+| `/ah` | Browse the auction house |
+| `/ah sell <price> <start-bid>` | List an item (buy-now price + starting bid) |
+| `/ah bid <id> <amount>` | Bid on a listing |
+| `/ah collect` | Collect your purchases and auction earnings |
+| `/ah cancel <id>` | Cancel a listing you own |
+| `/ah sort newest\|price_low\|price_high\|material` | Sort the listings |
+| `/trade <player>` | Invite a player to trade |
+| `/trade accept\|deny\|cancel` | Accept / decline / cancel a trade |
 
-## Configuration
+### Admin commands (operator permission)
 
-Solidus generates configuration automatically on first run. All configuration supports **hot reload** — edit the file and run the reload command without restarting your server.
+| Command | What it does |
+|---------|--------------|
+| `/solidus-admin money give\|set\|take <player> <amount>` | Grant, set, or withdraw a balance |
+| `/solidus-admin account create\|balance\|list` | Create and inspect accounts |
+| `/solidus-admin pay-as <from> <to> <amount>` | Transfer on behalf of a player |
+| `/solidus-admin bid-as <player> <id> <amount>` | Bid on behalf of a player |
+| `/solidus-admin auction create <seller> <item> <count> <price> <start-bid>` | Create an admin auction |
+| `/solidus-admin storage migrate` | Migrate all data from SQLite to MySQL with zero loss |
+| `/solidus-admin integrity check\|rebase` | Verify money-supply integrity / rebase the ledger baseline |
+| `/solidus-admin audit` | Quick economy audit report |
+| `/solidus-admin diag` | System diagnostics |
 
-**Location:** `config/solidus/shop.json`
+Permissions use the `solidus.command.*` keys for players and `solidus.command.admin` for administration — the full catalog is documented in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
-**Example:**
+## Quick configuration
 
-```json
-{
-  "startingBalance": 500,
-  "currency": "S$",
-  "listingFee": 2
-}
-```
+After the first start you'll find `config/solidus/storage.json`. The keys that matter most:
 
-Supports:
+| Key | Default | Purpose |
+|-----|---------|---------|
+| `type` | `sqlite` | `sqlite` for a single server; `mysql` (or `mariadb`) for a network with one shared balance |
+| `mysql.host / port / database / user` | — | Connection details for the network database |
+| `mysql.useSsl` | `true` | TLS for the database connection (keep it on unless the DB is on the same host) |
+| `redis.enabled` | `false` | Optional accelerator: balance cache + instant cross-server notifications |
+| `integrity.enabled` | `true` | Automatic periodic audit that all balances still match the ledger |
 
-* Categories and per-item pricing (buy and sell prices per material)
-* Optional top-level economy keys: `startingBalance`, `currency`, `listingFee` (whole percent)
-* Text formatting and currency symbol customization
-* Hot reload without restart — edit `shop.json` and run `/shop reload` (OP 2+)
+- Keep secrets out of the config file: use the `SOLIDUS_DB_PASSWORD` environment variable for the database and `SOLIDUS_REDIS_PASSWORD` for Redis.
+- Moving to MySQL? Run `/solidus-admin storage migrate` once and everything transfers automatically.
 
----
+## For advanced users
 
-## Compatibility
+**Architecture.** The engine (`EconomyEngine`) separates the money layer from the storage layer (`StorageBackend`), and every financial operation is atomic and safe under multi-server concurrency: the transaction ledger uses row-level optimistic locking, and every auction bid passes through a mandatory escrow account. The optional Redis layer is never the source of truth — it is an L2 cache with Pub/Sub invalidation, and losing it never takes the economy down.
 
-| Component | Requirement | Notes |
-| --- | --- | --- |
-| Minecraft | 26.1.x | Uses Mojang Official Mappings (no Yarn needed since 26.1) |
-| Loader | Fabric 0.19.2+ | Server-side only |
-| Fabric API | 0.149.0+ | Required |
-| Java | 25 | Required |
-| Client | Any (vanilla or modded) | No client installation needed |
-| Database | SQLite (bundled) | WAL journaling for crash resilience |
-| Side | Server only | Zero client-side dependencies |
+**Money-supply integrity.** A periodic auditor compares the sum of all balances against a full ledger replay (all income sources, sinks, and admin operations) and verifies that the escrow total equals the sum of open winning bids. On a network, elect exactly one server with `integrity.elected: true`.
 
----
+**Versioning.** The ecosystem follows a documented family contract in [VERSIONING.md](VERSIONING.md): any `2.2.x` Solidus release works with any `2.1.x` release of the companion mods (Analytics / Governance / Enforcer).
 
-## Architecture
+**Currency.** The internal unit is the Solidus, symbol `S$`, formatted `1,250.5 S$`; rounding rules are specified in [docs/MONEY_ROUNDING.md](docs/MONEY_ROUNDING.md).
 
-```
-com.solidus/
-├── SolidusMod.java              — Entry point, lifecycle, tick scheduler
-├── api/
-│   ├── SolidusAPI.java          — Public API (reflection-safe, thread-safe)
-│   ├── SolidusTransactionHook.java — Veto + notification hook interface
-│   ├── EconomyHooks.java        — Hook registry & dispatch (fail-open)
-│   ├── SolidusIntegration.java  — Reference integration example
-│   ├── SolidusPermissions.java  — Permission node constants
-│   ├── PermissionChecker.java   — LuckPerms + OP-level checking
-│   └── PermissionConfig.java    — permissions.json loader/generator
-├── economy/
-│   ├── EconomyEngine.java       — Lifecycle coordinator (storage + balances)
-│   ├── SQLiteStorage.java       — SQLite + WAL + single-thread executor + cache
-│   ├── BalanceManager.java      — Validated balance/transfer API
-│   ├── TransactionLog.java      — Ledger, CSV export, offline notifications
-│   └── EscrowAccount.java       — Bid-escrow system account (sentinel UUID)
-├── auction/
-│   ├── AuctionManager.java      — Listings, purchase, expiry, bidding, recovery
-│   ├── AuctionEntry.java        — Immutable listing record
-│   ├── ListingStatus.java       — ACTIVE/SOLD/EXPIRED enum
-│   ├── BidRules.java            — Pure bid validation + anti-snipe rules
-│   ├── BidState.java            — Per-listing bid state snapshot
-│   ├── AuctionGUI.java          — Browse/search/buy/bid interface
-│   ├── AuctionScreenHandler.java — Click routing (buy / bid prompt)
-│   └── AuctionDummyContainer.java — Display-only container
-├── trade/
-│   ├── TradeManager.java        — Requests, sessions, execution, reaping
-│   ├── TradeSession.java        — Player-agnostic session state machine
-│   ├── TradeContainer.java      — 54-slot session container (item escrow)
-│   ├── TradeGUI.java            — Window layout + display builders
-│   └── TradeScreenHandler.java  — Manual cursor movement + click safety
-├── chat/
-│   └── ChatPrompts.java         — "Type amount in chat" prompt service
-├── commands/
-│   ├── BalanceCommand.java      — /balance, /bal
-│   ├── PayCommand.java          — /pay, /pay offline
-│   ├── BaltopCommand.java       — /baltop
-│   ├── ShopCommand.java         — /shop, /shop search, /shop reload
-│   ├── SellCommand.java         — /sell gui, /sell all [item]
-│   ├── AuctionCommand.java      — /ah sell/bid/collect/cancel/sort/search
-│   ├── TradeCommand.java        — /trade <player>|accept|deny|cancel
-│   └── TransactionsCommand.java — /transactions, export, exportall
-├── shop/
-│   ├── ShopManager.java         — Config parsing + buy/sell transactions
-│   ├── ShopGUI.java             — Virtual chest builder (bordered layout)
-│   ├── ShopGUILayout.java       — Pure-Java centering layout engine
-│   ├── ShopScreenHandler.java   — Click rewriting handler
-│   └── ShopDummyContainer.java  — Display-only container
-├── sell/
-│   ├── SellGUI.java             — Sell window builder
-│   ├── SellScreenHandler.java   — Full cursor item movement (825 lines)
-│   └── SellContainer.java       — Real container (stores player items)
-├── gui/
-│   └── DisplaySlot.java         — Display-only Slot (no place/pickup/set)
-├── mixin/
-│   └── ServerPlayerEntityMixin.java — Click packet interception + resync
-├── networking/
-│   ├── PacketHandler.java       — Click routing gateway + full resyncs
-│   └── RateLimiter.java         — 150ms click / 1s pay cooldowns
-└── util/
-    ├── ConfigManager.java       — File I/O, JSON loading, JAR resource copying
-    ├── CurrencyUtil.java        — Currency constants, formatting, validation
-    └── TextUtil.java            — Component utilities, material names
-```
+**Testing.** The suite spans 38 test classes (435 tests per run). CI executes it twice per push — plain and under coverage (870 green executions) — against real `mariadb:11` and `redis:7` service containers, so the MySQL and Redis paths are exercised on every commit. Build locally with JDK 25: `./gradlew build` (artifact lands in `build/libs/`).
 
-### Key Design Decisions
+## Documentation
 
-1. **Async SQLite with WAL journaling** — All database operations run on a dedicated single-thread `ExecutorService` for serial consistency. Returns use `CompletableFuture` so the server thread never blocks. WAL mode ensures crash resilience — no committed transaction is lost even on hard shutdown.
+| Document | Contents |
+|----------|----------|
+| [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | System architecture, permissions catalog, and storage layers in detail |
+| [docs/DB_SCALING_PLAN.md](docs/DB_SCALING_PLAN.md) | Scaling the database: SQLite → MySQL → Redis |
+| [docs/FEATURES_TRADE_BIDDING.md](docs/FEATURES_TRADE_BIDDING.md) | Step-by-step mechanics of trading and escrow bidding |
+| [docs/MONEY_ROUNDING.md](docs/MONEY_ROUNDING.md) | Rounding rules and currency representation |
+| [docs/CONSOLE_TESTING.md](docs/CONSOLE_TESTING.md) | Testing the economy from the server console |
+| [docs/sql/mysql/001_init.sql](docs/sql/mysql/001_init.sql) | Ready-to-run MySQL schema script |
+| [VERSIONING.md](VERSIONING.md) | Version policy and family compatibility |
+| [notes/CHANGES.md](notes/CHANGES.md) | Changelog |
 
-2. **Reflection-based API** — `SolidusAPI` exposes economy operations through `MethodHandle` reflection. Third-party mods call these methods without any compile-time dependency on Solidus. If Solidus is absent, calls return empty/default values rather than throwing `NoClassDefFoundError`.
+## The Solidus family
 
-3. **Server-side GUI via vanilla packets** — Shop, auction, sell, and trade interfaces use vanilla container/window packets. No custom client mod, no resource pack, no custom network channel. Works on any client — vanilla, Fabric, Forge (via protocol translation).
+| Mod | What it adds | Repository |
+|-----|--------------|------------|
+| **Solidus Core** (this repo) | The economy engine itself | [MOHD-Gs15/solidus-core](https://github.com/MOHD-Gs15/solidus-core) |
+| **Solidus Analytics** | Economy monitoring, web dashboard, fraud detection | [MOHD-Gs15/solidus-analytics](https://github.com/MOHD-Gs15/solidus-analytics) |
+| **Solidus Governance** | Taxes, limits, policies, audits, backups, recovery | [MOHD-Gs15/Solidus-Governance](https://github.com/MOHD-Gs15/Solidus-Governance) |
+| **Solidus Enforcer** | Bounties, hunter licenses, anti-exploit enforcement | [MOHD-Gs15/Solidus-Enforcer](https://github.com/MOHD-Gs15/Solidus-Enforcer) |
 
-4. **Hot-reload configuration** — Operators adjust prices, add categories, or modify items in `shop.json` and apply them live with `/shop reload` (OP 2+), without restarting the server. This enables live economy tuning in response to market conditions.
+## License & credits
 
----
-
-## FAQ
-
-### Does this require client mods?
-
-**No.** Players join using standard Minecraft clients. The shop and auction house GUIs are rendered using vanilla container packets — no client mod, resource pack, or custom asset needed.
-
-### Works with proxy networks (BungeeCord, Velocity)?
-
-**Yes.** Solidus runs on backend servers behind proxies. Economy data is per-server (stored in local SQLite).
-
-### Supports offline mode?
-
-**Yes**, but online-mode servers are recommended for security. UUID resolution works in both modes.
-
-### Can prices be changed live without restart?
-
-**Yes.** Configuration supports hot reload — edit `shop.json` and reload without restarting the server. This is critical for active servers where restarts cause player disruption.
-
-### Does Solidus integrate with other mods?
-
-**Yes.** Solidus provides a stable public API (`SolidusAPI`) for other Fabric mods. Integration works via `MethodHandle` reflection with zero compile-time dependency. Third-party mods can check balances, process transfers, and hook into economy events. See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for full API reference.
-
-### How does Solidus protect against inflation from automated farms?
-
-There is no automatic farm detection — price control is manual and operator-owned. Server operators set each material's buy and sell price explicitly in `shop.json` (and can lower the sell price of farmed items such as iron ingots, or make them unsellable entirely). Edits apply live via `/shop reload` without a restart, which is the supported way to counter farm-driven inflation.
-
-### What happens to economy data if the server crashes?
-
-All transactions are persisted through SQLite with WAL (Write-Ahead Logging) journaling. WAL mode guarantees that no committed transaction is lost — even during a hard crash or power failure. Data integrity is maintained at the database level, not the application level.
-
-### Is Solidus Core free?
-
-**Yes.** Solidus Core is licensed under the MIT License — fully open-source, no premium tier, no feature gating. Some ecosystem modules (Analytics, Governance) offer premium features with a license key, but Core itself is completely free.
-
----
-
-## Download
-
-| Platform | Link |
-| --- | --- |
-| GitHub Releases | [Latest Release](https://github.com/MOHD-Gs15/solidus-core/releases) |
-| Modrinth | [MOHD_Gs on Modrinth](https://modrinth.com/user/MOHD_Gs) |
-
----
-
-## Contributing
-
-Contributions are welcome.
-
-* Report issues via [GitHub Issues](https://github.com/MOHD-Gs15/solidus-core/issues)
-* Suggest features or improvements
-* Submit pull requests
-
-See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for technical details, API reference, and contribution guidelines.
-
----
-
-## License
-
-This project is licensed under the **MIT License** — see [LICENSE](LICENSE) for details. All features are 100% free and open-source with no premium tier or feature gating.
-
----
-
-## Keywords
-
-`minecraft economy mod` · `minecraft fabric mod` · `minecraft server economy` · `minecraft virtual currency` · `minecraft auction house` · `minecraft server shop` · `fabric economy plugin` · `minecraft survival economy` · `server-side minecraft mod` · `minecraft commerce engine` · `solidus economy` · `minecraft inflation protection`
-
----
-
-Built by [MOHD-Gs15](https://github.com/MOHD-Gs15) · [Email](mailto:mohdmxmxm@gmail.com) · Discord: **mohd_gs** · Part of the [Solidus Economy Ecosystem](https://github.com/MOHD-Gs15)
+- **Mod by [MOHD-Gs](https://github.com/MOHD-Gs15)** — profile on [Modrinth](https://modrinth.com/user/MOHD_Gs).
+- Licensed under the [MIT License](LICENSE) — free to use, modify, and ship with your server.
