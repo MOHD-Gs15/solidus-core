@@ -367,6 +367,65 @@ public class BalanceManager {
     }
 
     /**
+     * Internal settlement transfer — IDENTICAL atomicity to
+     * {@link #transferOffline} but WITHOUT the transaction-hook lifecycle:
+     * neither the {@code allowTransfer} veto nor the {@code afterTransfer}
+     * notification fires.
+     *
+     * <p>AUDIT FIX 2.2.6 (TRD-03): the trade money legs and, critically, the
+     * ROLLBACK of a half-settled trade used to run through
+     * {@code transferOffline}. A governance hook could veto the ROLLBACK of
+     * an already-committed leg (e.g. the partner hit a daily transfer cap
+     * mid-trade, or an admin froze the account in the window between the two
+     * legs) — the rollback then failed, the trade aborted, items were
+     * returned to both owners, but the first money leg stayed committed with
+     * the partner: the sender's money was given away for nothing. The same
+     * path also fired {@code afterTransfer} up to three times for one logical
+     * trade (leg 1, leg 2, rollback), triple-counting daily limits and taxes
+     * in companion mods.</p>
+     *
+     * <p>Internal legs (trade settlement, trade rollback) are consensual,
+     * escrow-backed movements between two players who both pressed READY —
+     * they must execute (and roll back) unconditionally, exactly like
+     * {@link #settleAuctionPurchase} already does for auction payments.</p>
+     *
+     * @param senderUuid   The sender's UUID
+     * @param senderName   The sender's name
+     * @param receiverUuid The receiver's UUID
+     * @param receiverName The receiver's name
+     * @param amount       The amount to transfer
+     * @return CompletableFuture with TransferResult indicating outcome
+     */
+    public CompletableFuture<TransferResult> transferInternal(
+            UUID senderUuid, String senderName,
+            UUID receiverUuid, String receiverName,
+            double amount) {
+        if (amount <= 0) {
+            return CompletableFuture.completedFuture(
+                new TransferResult(false, "Amount must be positive.", 0, 0));
+        }
+        if (!CurrencyUtil.isValidAmount(amount)) {
+            return CompletableFuture.completedFuture(
+                new TransferResult(false, "Amount exceeds maximum transfer limit.", 0, 0));
+        }
+        if (senderUuid.equals(receiverUuid)) {
+            return CompletableFuture.completedFuture(
+                new TransferResult(false, "Sender and receiver are the same account.", 0, 0));
+        }
+        return storage.transferAtomic(senderUuid, senderName, receiverUuid, receiverName, amount)
+            .thenApply(outcome -> switch (outcome.status()) {
+                case SUCCESS -> new TransferResult(true, "Transfer successful.",
+                    outcome.senderNewBalance(), outcome.receiverNewBalance());
+                case INSUFFICIENT_FUNDS ->
+                    new TransferResult(false, "Insufficient funds.", 0, 0);
+                case RECEIVER_OVERFLOW ->
+                    new TransferResult(false, "Transfer failed: receiver balance limit exceeded.", 0, 0);
+                case PERSIST_ERROR ->
+                    new TransferResult(false, "Transfer failed. Please try again.", 0, 0);
+            });
+    }
+
+    /**
      * Gets the top N balances for leaderboard display (first page of
      * {@link #getTopBalances(int, int)}).
      *

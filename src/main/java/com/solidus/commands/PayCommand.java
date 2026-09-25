@@ -137,24 +137,48 @@ public class PayCommand {
             return;
         }
 
+        // AUDIT FIX 2.2.6 (L-4a): normalize the amount at the command boundary.
+        // The transfer moves CurrencyUtil.round(amount) while the old success
+        // message formatted the RAW amount — "/pay <name> 10.005" displayed
+        // "10.01 S$" (HALF_UP display) but moved 10.00 (round-to-even of the
+        // binary double). One rounding at entry keeps message, ledger and
+        // movement identical.
+        amount = CurrencyUtil.round(amount);
+        if (amount < CurrencyUtil.MIN_TRANSACTION) {
+            sender.sendSystemMessage(TextUtil.error(
+                "Amount is too small - minimum is " + CurrencyUtil.format(CurrencyUtil.MIN_TRANSACTION)));
+            return;
+        }
+        final double amt = amount;
+
         // Pre-validation: prevent self-transfer
         if (sender.getUUID().equals(receiver.getUUID())) {
             sender.sendSystemMessage(TextUtil.error("You cannot pay yourself!"));
             return;
         }
 
-        // Perform atomic transfer
-        balanceManager.transfer(sender, receiver, amount).thenAccept(result -> {
+        // Perform atomic transfer. whenComplete-style safety (AUDIT FIX
+        // 2.2.6, L-4b): a DB error used to complete the future exceptionally,
+        // skipping thenAccept entirely — the player got NO feedback at all
+        // (money safe thanks to the atomic transfer, but a silent failure).
+        balanceManager.transfer(sender, receiver, amount).whenComplete((result, error) -> {
             // Schedule notification on the server thread
             var server = sender.level().getServer();
             if (server == null) return;
 
             server.execute(() -> {
+                if (error != null) {
+                    SolidusMod.LOGGER.error("/pay transfer future failed for {}",
+                        TextUtil.sanitizeForLog(sender.getName().getString()), error);
+                    sender.sendSystemMessage(TextUtil.error(
+                        "Payment failed due to a system error. Nothing was transferred - please try again."));
+                    return;
+                }
                 if (result.success()) {
                     // Notify sender
                     sender.sendSystemMessage(
                         TextUtil.success("You paid " + receiver.getName().getString() + " ")
-                            .append(TextUtil.currency(CurrencyUtil.format(amount)))
+                            .append(TextUtil.currency(CurrencyUtil.format(amt)))
                             .append(TextUtil.plain(". "))
                             .append(TextUtil.styled("New balance: ", net.minecraft.ChatFormatting.GRAY))
                             .append(TextUtil.currency(CurrencyUtil.format(result.senderNewBalance())))
@@ -162,7 +186,7 @@ public class PayCommand {
 
                     // Notify receiver
                     receiver.sendSystemMessage(
-                        TextUtil.success("You received " + CurrencyUtil.format(amount) + " from ")
+                        TextUtil.success("You received " + CurrencyUtil.format(amt) + " from ")
                             .append(TextUtil.styled(sender.getName().getString(), net.minecraft.ChatFormatting.YELLOW))
                             .append(TextUtil.plain(". "))
                             .append(TextUtil.styled("New balance: ", net.minecraft.ChatFormatting.GRAY))
@@ -173,13 +197,13 @@ public class PayCommand {
                     transactionLog.log(TransactionLog.Type.PAY_SEND,
                         sender.getUUID(), sender.getName().getString(),
                         receiver.getUUID(), receiver.getName().getString(),
-                        amount, null, 0,
+                        amt, null, 0,
                         "Paid " + receiver.getName().getString());
 
                     transactionLog.log(TransactionLog.Type.PAY_RECEIVE,
                         receiver.getUUID(), receiver.getName().getString(),
                         sender.getUUID(), sender.getName().getString(),
-                        amount, null, 0,
+                        amt, null, 0,
                         "Received from " + sender.getName().getString());
                 } else {
                     // Transfer failed
@@ -217,6 +241,16 @@ public class PayCommand {
                 "Amount exceeds maximum transfer limit of " + CurrencyUtil.format(CurrencyUtil.MAX_TRANSACTION)));
             return;
         }
+
+        // AUDIT FIX 2.2.6 (L-4a): same command-boundary normalization as the
+        // online path — message, ledger and moved amount stay identical.
+        amount = CurrencyUtil.round(amount);
+        if (amount < CurrencyUtil.MIN_TRANSACTION) {
+            sender.sendSystemMessage(TextUtil.error(
+                "Amount is too small - minimum is " + CurrencyUtil.format(CurrencyUtil.MIN_TRANSACTION)));
+            return;
+        }
+        final double amt = amount;
 
         // Look up target UUID from the name cache.
         // Audit 2.1.3 (two fixes):
@@ -281,12 +315,21 @@ public class PayCommand {
         balanceManager.transferOffline(
             sender.getUUID(), sender.getName().getString(),
             receiverUuid, receiverCanonicalName,
-            amount
-        ).thenAccept(result -> {
+            amt
+        ).whenComplete((result, error) -> {
             var server = sender.level().getServer();
             if (server == null) return;
 
             server.execute(() -> {
+                if (error != null) {
+                    // AUDIT FIX 2.2.6 (L-4b): silent-failure parity with the
+                    // online path — the player MUST get feedback.
+                    SolidusMod.LOGGER.error("/pay offline transfer future failed for {}",
+                        TextUtil.sanitizeForLog(sender.getName().getString()), error);
+                    sender.sendSystemMessage(TextUtil.error(
+                        "Payment failed due to a system error. Nothing was transferred - please try again."));
+                    return;
+                }
                 if (!result.success()) {
                     sender.sendSystemMessage(TextUtil.error(result.message()));
                     return;
@@ -299,7 +342,7 @@ public class PayCommand {
                 // Notify sender
                 sender.sendSystemMessage(
                     TextUtil.success("You paid " + receiverCanonicalName + " (offline) ")
-                        .append(TextUtil.currency(CurrencyUtil.format(amount)))
+                        .append(TextUtil.currency(CurrencyUtil.format(amt)))
                         .append(TextUtil.plain(". "))
                         .append(TextUtil.styled("New balance: ", net.minecraft.ChatFormatting.GRAY))
                         .append(TextUtil.currency(CurrencyUtil.format(newSenderBalance)))
@@ -307,7 +350,7 @@ public class PayCommand {
 
                 // Queue notification for offline player
                 transactionLog.queueNotification(receiverUuid,
-                    "You received " + CurrencyUtil.format(amount) + " from " +
+                    "You received " + CurrencyUtil.format(amt) + " from " +
                         sender.getName().getString() + " while you were offline.",
                     server);
 
@@ -315,13 +358,13 @@ public class PayCommand {
                 transactionLog.log(TransactionLog.Type.PAY_SEND,
                     sender.getUUID(), sender.getName().getString(),
                     receiverUuid, receiverCanonicalName,
-                    amount, null, 0,
+                    amt, null, 0,
                     "Paid " + receiverCanonicalName + " (offline)");
 
                 transactionLog.log(TransactionLog.Type.PAY_RECEIVE,
                     receiverUuid, receiverCanonicalName,
                     sender.getUUID(), sender.getName().getString(),
-                    amount, null, 0,
+                    amt, null, 0,
                     "Received from " + sender.getName().getString() + " (offline)");
             });
         });

@@ -62,12 +62,22 @@ public class EconomyEngine {
             SolidusMod.LOGGER.info("Storage backend: SQLite (single-server mode)");
         }
 
-        // Pre-create the bid-escrow system account with balance 0. Without
-        // this, the first atomic transfer INTO escrow would create the row as
-        // "starting balance + amount", minting phantom money that locks itself
-        // inside the system account forever. With a zero-balance row in place,
-        // escrow holds EXACTLY the sum of all open top bids at any moment.
-        storage.setBalance(EscrowAccount.UUID_ZERO, EscrowAccount.NAME, 0.0);
+        // Pre-create the bid-escrow system account with balance 0 ONLY when
+        // the row does not exist yet. Without the row, the first atomic
+        // transfer INTO escrow would create it as "starting balance + amount",
+        // minting phantom money that locks itself inside the system account
+        // forever. With a zero-balance row in place, escrow holds EXACTLY the
+        // sum of all open top bids at any moment.
+        //
+        // AUDIT FIX 2.2.6 (ESC-01): this used to be an unconditional
+        // setBalance(..., 0.0) — an UPSERT that ZEROED the escrow account on
+        // EVERY restart, destroying the escrowed bid money of all open
+        // auctions at boot. ensureAccount is a true insert-if-missing: an
+        // existing escrow row (holding real bidder money) is left untouched.
+        boolean escrowCreated = storage.ensureAccount(EscrowAccount.UUID_ZERO, EscrowAccount.NAME, 0.0);
+        if (escrowCreated) {
+            SolidusMod.LOGGER.info("Bid-escrow system account pre-created with balance 0.");
+        }
 
         // Initialize balance manager
         balanceManager = new BalanceManager(storage);

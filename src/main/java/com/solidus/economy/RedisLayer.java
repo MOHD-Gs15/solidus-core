@@ -353,11 +353,34 @@ public final class RedisLayer implements AutoCloseable {
         }
     }
 
-    /** Runs one Redis call with a hard timeout so a stalled server cannot hang a caller. */
+    /**
+     * Runs one Redis call with a hard timeout so a stalled server cannot hang
+     * a caller.
+     *
+     * <p>AUDIT FIX 2.2.6 (HNG-01): the call now runs on a tiny DEDICATED
+     * daemon executor instead of the shared JDK common ForkJoinPool — a
+     * stalled Redis used to pile up blocked commonPool threads (starving
+     * parallel streams and other JDK machinery), and the timed-out task was
+     * never cancelled. On timeout the future is cancelled and the breaker
+     * counts the failure; the caller sees the bounded delay only.</p>
+     */
     private <T> T guarded(java.util.function.Supplier<T> call) throws Exception {
-        var future = java.util.concurrent.CompletableFuture.supplyAsync(call);
-        return future.get(CALL_TIMEOUT_MS, TimeUnit.MILLISECONDS);
+        var future = java.util.concurrent.CompletableFuture.supplyAsync(call, GUARD_EXECUTOR);
+        try {
+            return future.get(CALL_TIMEOUT_MS, TimeUnit.MILLISECONDS);
+        } catch (java.util.concurrent.TimeoutException te) {
+            future.cancel(true);
+            throw te;
+        }
     }
+
+    /** Dedicated executor for guarded Redis calls (HNG-01). */
+    private static final java.util.concurrent.ExecutorService GUARD_EXECUTOR =
+        java.util.concurrent.Executors.newSingleThreadExecutor(r -> {
+            Thread t = new Thread(r, "Solidus-Redis-Guard");
+            t.setDaemon(true);
+            return t;
+        });
 
     @Override
     public void close() {

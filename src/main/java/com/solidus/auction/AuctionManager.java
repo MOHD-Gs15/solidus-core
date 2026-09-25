@@ -881,12 +881,22 @@ public class AuctionManager {
                         ? hookDecision.reason() : "Transaction denied.");
                 }
 
-                // Mark as SOLD IMMEDIATELY (single-threaded executor guarantees
-                // no other thread can interfere - this IS the atomic operation)
-                String updateSql = "UPDATE auction_listings SET status = 1 WHERE listing_id = ?";
+                // Mark as SOLD IMMEDIATELY — but only by CLAIMING the row.
+                // AUDIT FIX 2.2.6 (ASC-02): the old UPDATE had no
+                // "AND status = 0" guard and its affected-rows value was
+                // ignored. On the shared MySQL market two servers could both
+                // SELECT the same ACTIVE row, both "mark it sold" (the second
+                // UPDATE harmlessly re-wrote status=1), and both proceed to
+                // settle — delivering the item to TWO buyers and paying the
+                // seller TWICE. The conditional claim + affected-rows check
+                // makes the purchase exactly-once network-wide, matching the
+                // guard every other mutation in this file already carries.
+                String updateSql = "UPDATE auction_listings SET status = 1 WHERE listing_id = ? AND status = 0";
                 try (PreparedStatement ps = conn.prepareStatement(updateSql)) {
                     ps.setString(1, listingId.toString());
-                    ps.executeUpdate();
+                    if (ps.executeUpdate() == 0) {
+                        return "SOLD_OUT";
+                    }
                 }
 
                 return entry;
@@ -2132,23 +2142,32 @@ public class AuctionManager {
                     // Phase 3 (auction executor): conditional claim
                     CompletableFuture.supplyAsync(() -> {
                         try {
-                            boolean claimed = claimTopBid(listingId, amount, bidderUuid, bidderName);
-                            if (!claimed) {
+                            // AUDIT FIX 2.2.6 (ESC-02): claim AND read the
+                            // actually-displaced bid in one atomic step. The
+                            // phase-1 `state` snapshot may be many executor
+                            // hops old by now (the escrow charge ran on the
+                            // economy executor); refunding from it could pay
+                            // the SAME previous bidder twice while another
+                            // bidder's money stayed trapped in escrow.
+                            ClaimResult claim = claimTopBidWithDisplaced(
+                                listingId, amount, bidderUuid, bidderName);
+                            if (!claim.claimed()) {
                                 // Outbid during our async hop - refund ourselves.
                                 refundFromEscrow(bidderUuid, bidderName, amount,
                                     "Outbid during bid placement (listing " + shortId(listingId) + ")");
                                 return "OUTBID_RACE";
                             }
 
-                            // Refund the PREVIOUS top bidder from escrow.
-                            if (state.hasBids()) {
-                                refundFromEscrow(state.currentBidderUuid(), state.currentBidderName(),
-                                    state.currentBid(),
+                            // Refund the bidder THIS claim actually displaced.
+                            DisplacedBid displaced = claim.displaced();
+                            if (displaced != null) {
+                                refundFromEscrow(displaced.bidderUuid(), displaced.bidderName(),
+                                    displaced.amount(),
                                     "Outbid on " + entry.quantity() + "x " + entry.materialName()
                                         + " (listing " + shortId(listingId) + ")");
-                                notify(state.currentBidderUuid(),
+                                notify(displaced.bidderUuid(),
                                     "You were outbid on " + entry.quantity() + "x " + entry.materialName()
-                                        + " - your bid of " + CurrencyUtil.format(state.currentBid())
+                                        + " - your bid of " + CurrencyUtil.format(displaced.amount())
                                         + " has been refunded.");
                             }
 
@@ -2197,6 +2216,149 @@ public class AuctionManager {
     }
 
     /**
+     * The top bid actually displaced by a successful claim — who must be
+     * refunded from escrow, and how much (AUDIT FIX 2.2.6, ESC-02).
+     */
+    record DisplacedBid(UUID bidderUuid, String bidderName, double amount) {}
+
+    /**
+     * Claims the top-bid slot AND returns the bid that was actually displaced.
+     *
+     * <p>AUDIT FIX 2.2.6 (ESC-02): the caller used to refund the previous top
+     * bidder from a PHASE-1 SNAPSHOT taken before the escrow charge ran on
+     * the economy executor. Two overlapping bids could both snapshot the same
+     * old top bid (A@100): X claims 150 (refunds A@100), then Y claims 200
+     * and refunded A@100 AGAIN from its stale snapshot — A was paid twice
+     * (money printing) while X's 150 stayed trapped in escrow with no bid
+     * state pointing at it. Reading the displaced bid at claim time, on the
+     * same serialized executor (SQLite) or inside the same locked transaction
+     * (MySQL), guarantees the refund targets exactly the bid this claim
+     * displaced.</p>
+     *
+     * @return the displaced bid, or null when there was no prior top bid;
+     *         the claim itself failed when {@code claimed} is false
+     */
+    private ClaimResult claimTopBidWithDisplaced(UUID listingId, double amount,
+                                                 UUID bidderUuid, String bidderName) throws SQLException {
+        // SQLite: the single auction executor serializes this whole method
+        // against every other bid-state mutation on this server, and the
+        // conditional UPDATE is the cross-writer lock. MySQL: read + claim run
+        // in ONE transaction with SELECT ... FOR UPDATE so a concurrent
+        // server can never slip a claim between our read and our write.
+        if (dialect != AuctionDialect.MYSQL) {
+            BidState before = loadBidState(listingId);
+            boolean claimed = claimTopBid(listingId, amount, bidderUuid, bidderName);
+            return new ClaimResult(claimed, displacedOf(before));
+        }
+        return withAuction(conn -> {
+            boolean locked = false;
+            try {
+                conn.setAutoCommit(false);
+                locked = true;
+                BidState before = loadBidStateVia(conn, listingId);
+                boolean claimed = claimTopBidVia(conn, listingId, amount, bidderUuid, bidderName);
+                ClaimResult result = new ClaimResult(claimed, displacedOf(before));
+                conn.commit();
+                return result;
+            } catch (SQLException e) {
+                if (locked) {
+                    rollbackTx(conn, dialect); // never commit partial read-claim work
+                }
+                throw e;
+            } finally {
+                if (locked) {
+                    try {
+                        conn.setAutoCommit(true);
+                    } catch (SQLException ignored) {
+                        // connection is broken — the pool discards it
+                    }
+                }
+            }
+        });
+    }
+
+    /** Claim outcome: whether the claim landed, and whom it displaced. */
+    record ClaimResult(boolean claimed, DisplacedBid displaced) {}
+
+    /** Extracts the displaced-top-bid info from a (possibly null) state. */
+    private static DisplacedBid displacedOf(BidState state) {
+        if (state == null || !state.hasBids() || state.currentBidderUuid() == null) return null;
+        return new DisplacedBid(state.currentBidderUuid(), state.currentBidderName(), state.currentBid());
+    }
+
+    /**
+     * {@link #loadBidState} on a caller-supplied connection, INSIDE the
+     * caller's open transaction and with {@code FOR UPDATE} so the row is
+     * locked for the read-claim pair (used by the MySQL claim path).
+     */
+    private BidState loadBidStateVia(Connection conn, UUID listingId) throws SQLException {
+        String sql = "SELECT * FROM auction_bid_state WHERE listing_id = ? FOR UPDATE";
+        try (PreparedStatement ps = conn.prepareStatement(sql)) {
+            ps.setString(1, listingId.toString());
+            try (ResultSet rs = ps.executeQuery()) {
+                return rs.next() ? mapBidStateResultSet(listingId, rs) : null;
+            }
+        }
+    }
+
+    /** Row mapping shared by {@link #loadBidState} and {@link #loadBidStateVia}. */
+    private BidState mapBidStateRow(Connection conn, UUID listingId) throws SQLException {
+        String sql = "SELECT * FROM auction_bid_state WHERE listing_id = ?";
+        try (PreparedStatement ps = conn.prepareStatement(sql)) {
+            ps.setString(1, listingId.toString());
+            try (ResultSet rs = ps.executeQuery()) {
+                return rs.next() ? mapBidStateResultSet(listingId, rs) : null;
+            }
+        }
+    }
+
+    private BidState mapBidStateResultSet(UUID listingId, ResultSet rs) throws SQLException {
+        double startPrice = rs.getDouble("start_price");
+        double currentBid = rs.getDouble("current_bid");
+        boolean hasBid = !rs.wasNull();
+        String bidderUuidStr = rs.getString("current_bidder_uuid");
+        String bidderName = rs.getString("current_bidder_name");
+        return new BidState(
+            listingId,
+            startPrice,
+            hasBid ? currentBid : null,
+            bidderUuidStr != null ? UUID.fromString(bidderUuidStr) : null,
+            bidderName,
+            rs.getInt("bid_count"),
+            rs.getInt("extensions_used"));
+    }
+
+    /**
+     * Loads the bid state for a listing, or null when the listing is buy-now-only.
+     */
+    private BidState loadBidState(UUID listingId) throws SQLException {
+        return withAuction(conn -> mapBidStateRow(conn, listingId));
+    }
+
+    /**
+     * {@link #claimTopBid} on a caller-supplied connection (for use inside
+     * the locked claim transaction).
+     */
+    private boolean claimTopBidVia(Connection conn, UUID listingId, double amount,
+                                   UUID bidderUuid, String bidderName) throws SQLException {
+        String sql = """
+            UPDATE auction_bid_state
+            SET current_bid = ?, current_bidder_uuid = ?, current_bidder_name = ?,
+                bid_count = bid_count + 1
+            WHERE listing_id = ? AND (current_bid IS NULL OR current_bid < ?)
+        """;
+        try (PreparedStatement ps = conn.prepareStatement(sql)) {
+            ps.setDouble(1, amount);
+            ps.setString(2, bidderUuid.toString());
+            // SECURITY (audit SOL-004): bidder names feed the GUI lore.
+            ps.setString(3, TextUtil.sanitizePlayerName(bidderName));
+            ps.setString(4, listingId.toString());
+            ps.setDouble(5, amount);
+            return ps.executeUpdate() > 0;
+        }
+    }
+
+    /**
      * Conditionally claims the top-bid slot for {@code bidder} at
      * {@code amount}. Returns true only when THIS call replaced the previous
      * top bid (exactly-once semantics via the conditional WHERE clause; all
@@ -2204,23 +2366,7 @@ public class AuctionManager {
      */
     private boolean claimTopBid(UUID listingId, double amount, UUID bidderUuid, String bidderName)
             throws SQLException {
-        String sql = """
-            UPDATE auction_bid_state
-            SET current_bid = ?, current_bidder_uuid = ?, current_bidder_name = ?,
-                bid_count = bid_count + 1
-            WHERE listing_id = ? AND (current_bid IS NULL OR current_bid < ?)
-        """;
-        return withAuction(conn -> {
-            try (PreparedStatement ps = conn.prepareStatement(sql)) {
-                ps.setDouble(1, amount);
-                ps.setString(2, bidderUuid.toString());
-                // SECURITY (audit SOL-004): bidder names feed the GUI lore.
-                ps.setString(3, TextUtil.sanitizePlayerName(bidderName));
-                ps.setString(4, listingId.toString());
-                ps.setDouble(5, amount);
-                return ps.executeUpdate() > 0;
-            }
-        });
+        return withAuction(conn -> claimTopBidVia(conn, listingId, amount, bidderUuid, bidderName));
     }
 
     private void insertBidHistory(UUID listingId, UUID bidderUuid, String bidderName, double amount)
@@ -2244,15 +2390,31 @@ public class AuctionManager {
     private void extendListingExpiry(UUID listingId, long newExpiry) throws SQLException {
         // BUGFIX (2.2.1): extensions_used was never incremented in 2.1.x, so the
         // MAX_ANTI_SNIPE_EXTENSIONS cap (12) never took effect and every bid in
-        // the last window extended the deadline indefinitely. The counter now
-        // advances with every successful extension.
-        String sql = "UPDATE auction_listings SET expire_timestamp = ?, "
-            + "extensions_used = extensions_used + 1 "
-            + "WHERE listing_id = ? AND status = 0";
+        // the last window extended the deadline indefinitely.
+        //
+        // AUDIT FIX 2.2.6 (ASC-01): the 2.2.1 "fix" incremented
+        // extensions_used on auction_listings — a column that exists on
+        // NEITHER dialect's DDL (it lives on auction_bid_state). Every
+        // anti-snipe-window bid therefore threw "no such column /
+        // Unknown column" AFTER the bid claim had already succeeded and the
+        // previous bidder had already been refunded; the phase-3 catch then
+        // refunded the NEW bidder too, leaving a top bid with NO escrow
+        // behind it: the bidder could win the item for free while the seller
+        // was never paid (escrow release fails INSUFFICIENT_FUNDS) and the
+        // escrow-consistency check reported a mismatch.
+        //
+        // Correct targets: expire_timestamp on auction_listings (guarded by
+        // status), the extension counter on auction_bid_state.
         withAuction(conn -> {
-            try (PreparedStatement ps = conn.prepareStatement(sql)) {
+            try (PreparedStatement ps = conn.prepareStatement(
+                    "UPDATE auction_listings SET expire_timestamp = ? WHERE listing_id = ? AND status = 0")) {
                 ps.setLong(1, newExpiry);
                 ps.setString(2, listingId.toString());
+                ps.executeUpdate();
+            }
+            try (PreparedStatement ps = conn.prepareStatement(
+                    "UPDATE auction_bid_state SET extensions_used = extensions_used + 1 WHERE listing_id = ?")) {
+                ps.setString(1, listingId.toString());
                 ps.executeUpdate();
             }
             return null;
@@ -2267,32 +2429,6 @@ public class AuctionManager {
                 ps.setString(1, listingId.toString());
                 try (ResultSet rs = ps.executeQuery()) {
                     return rs.next() ? mapResultSetToEntry(rs) : null;
-                }
-            }
-        });
-    }
-
-    /** Loads the bid state for a listing, or null when the listing is buy-now-only. */
-    private BidState loadBidState(UUID listingId) throws SQLException {
-        String sql = "SELECT * FROM auction_bid_state WHERE listing_id = ?";
-        return withAuction(conn -> {
-            try (PreparedStatement ps = conn.prepareStatement(sql)) {
-                ps.setString(1, listingId.toString());
-                try (ResultSet rs = ps.executeQuery()) {
-                    if (!rs.next()) return null;
-                    double startPrice = rs.getDouble("start_price");
-                    double currentBid = rs.getDouble("current_bid");
-                    boolean hasBid = !rs.wasNull();
-                    String bidderUuidStr = rs.getString("current_bidder_uuid");
-                    String bidderName = rs.getString("current_bidder_name");
-                    return new BidState(
-                        listingId,
-                        startPrice,
-                        hasBid ? currentBid : null,
-                        bidderUuidStr != null ? UUID.fromString(bidderUuidStr) : null,
-                        bidderName,
-                        rs.getInt("bid_count"),
-                        rs.getInt("extensions_used"));
                 }
             }
         });
@@ -2379,6 +2515,17 @@ public class AuctionManager {
      * buy-now purchases, cancellations and expired-archived listings where a
      * crash prevented the inline refund, and guarantees no bidder money can
      * be trapped by a listing that can never settle.
+     *
+     * <p>AUDIT FIX 2.2.6 (ASC-03): the refund used to run BEFORE the
+     * bid-state delete, and the delete's affected-rows were ignored. That
+     * order double-paid in two ways: (a) on a network, every server runs this
+     * sweep at boot — two servers starting together both read the same orphan
+     * rows and both refunded; (b) a crash after the refund but before the
+     * delete replayed the whole refund on the next boot. The sweep now CLAIMS
+     * each bid-state row first (delete, exactly-once via affected-rows) and
+     * only the claiming server/attempt refunds — the crash-safe failure mode
+     * is money left IN escrow (flagged by the consistency check), never money
+     * paid twice.</p>
      */
     private void refundOrphanedBidStates() {
         try {
@@ -2412,16 +2559,21 @@ public class AuctionManager {
             } catch (SQLException inner) {
                 throw inner;
             }
+            int refunded = 0;
             for (BidState orphan : orphans) {
-                refundFromEscrow(orphan.currentBidderUuid(), orphan.currentBidderName(),
-                    orphan.currentBid(),
-                    "Startup sweep: listing " + shortId(orphan.listingId())
-                        + " no longer active - bid refunded");
-                deleteBidState(orphan.listingId());
+                // Claim FIRST (exactly-once), refund only when this call won
+                // the claim (ASC-03).
+                if (deleteBidStateClaimed(orphan.listingId())) {
+                    refundFromEscrow(orphan.currentBidderUuid(), orphan.currentBidderName(),
+                        orphan.currentBid(),
+                        "Startup sweep: listing " + shortId(orphan.listingId())
+                            + " no longer active - bid refunded");
+                    refunded++;
+                }
             }
-            if (!orphans.isEmpty()) {
+            if (refunded > 0) {
                 SolidusMod.LOGGER.info(
-                    "Bid recovery sweep: refunded {} orphaned top bid(s) from escrow.", orphans.size());
+                    "Bid recovery sweep: refunded {} orphaned top bid(s) from escrow.", refunded);
             }
 
             // Escrow consistency check: escrow balance should equal the sum of
@@ -2442,6 +2594,22 @@ public class AuctionManager {
                 ps.executeUpdate();
             }
             return null;
+        });
+    }
+
+    /**
+     * Exactly-once bid-state delete: returns true only when THIS call removed
+     * the row (AUDIT FIX 2.2.6, ASC-03). Callers that refund escrow money
+     * must gate the refund on this result, so two servers (or a crash-restart
+     * replay) can never both pay the same displaced bidder.
+     */
+    private boolean deleteBidStateClaimed(UUID listingId) throws SQLException {
+        return withAuction(conn -> {
+            try (PreparedStatement ps = conn.prepareStatement(
+                    "DELETE FROM auction_bid_state WHERE listing_id = ?")) {
+                ps.setString(1, listingId.toString());
+                return ps.executeUpdate() > 0;
+            }
         });
     }
 
@@ -2491,21 +2659,31 @@ public class AuctionManager {
 
     /**
      * Deletes the bid state for a listing and refunds its top bidder from
-     * escrow (used by cancel and buy-now override). Fire-and-forget: the
-     * startup sweep is the self-healing backstop if any step is interrupted.
+     * escrow (used by cancel and buy-now override). The delete is the
+     * exactly-once CLAIM (ASC-03): the refund runs only when this call removed
+     * the row, so a replay or a concurrent server can never double-refund.
+     * Failure mode stays crash-safe: if the refund transfer itself then
+     * fails, the money remains IN escrow and the startup consistency check
+     * flags it for admin reconciliation.
      */
     private void settleBidStateOnRemoval(UUID listingId, String refundReason) {
         CompletableFuture.runAsync(() -> {
             try {
+                // Read first (to know whom to refund), then CLAIM by delete,
+                // then refund only when this call won the claim.
                 BidState state = loadBidState(listingId);
                 if (state == null) return;
-                deleteBidState(listingId);
                 if (state.hasBids()) {
+                    if (!deleteBidStateClaimed(listingId)) {
+                        return; // another flow already claimed and refunded this state
+                    }
                     refundFromEscrow(state.currentBidderUuid(), state.currentBidderName(),
                         state.currentBid(), refundReason);
                     notify(state.currentBidderUuid(),
                         "The auction you were bidding on ended before expiry - your bid of "
                             + CurrencyUtil.format(state.currentBid()) + " has been refunded.");
+                } else {
+                    deleteBidState(listingId);
                 }
             } catch (SQLException e) {
                 SolidusMod.LOGGER.error("settleBidStateOnRemoval failed for listing {}", listingId, e);

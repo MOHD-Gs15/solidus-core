@@ -20,6 +20,7 @@ import net.minecraft.ChatFormatting;
 import net.minecraft.network.chat.Component;
 import net.minecraft.network.chat.MutableComponent;
 import net.minecraft.network.chat.ComponentSerialization;
+import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.level.ServerPlayer;
 
 import java.util.ArrayList;
@@ -350,6 +351,19 @@ public class ShopManager {
         // Use double arithmetic to avoid integer overflow on large quantities
         double totalCost = CurrencyUtil.round(item.buyPrice() * (double) quantity);
 
+        // AUDIT FIX 2.2.6 (L-2): a bulk quantity can push the total past the
+        // transaction cap (e.g. 2304 x 10,000 S$). The old path surfaced a
+        // misleading "Insufficient funds" (subtractBalance rejects over-cap
+        // amounts) instead of a clear cap message.
+        if (totalCost > CurrencyUtil.MAX_TRANSACTION) {
+            player.sendSystemMessage(TextUtil.error(
+                "That order totals " + CurrencyUtil.format(totalCost)
+                    + " and exceeds the single-transaction cap of "
+                    + CurrencyUtil.format(CurrencyUtil.MAX_TRANSACTION)
+                    + ". Buy a smaller quantity."));
+            return;
+        }
+
         // Transaction hook veto (Solidus 2.1.0+): cost is fully known, before
         // any money moves. A denial here is a clean no-op.
         SolidusTransactionHook.Decision hookDecision = EconomyHooks.allow(hook ->
@@ -362,20 +376,31 @@ public class ShopManager {
 
         BalanceManager balanceManager = economyEngine.getBalanceManager();
 
-        // Atomic check-and-deduct: subtractBalance checks funds AND deducts
-        // on the same single-threaded executor, eliminating the TOCTOU window.
+        // AUDIT FIX 2.2.6 (M-1): the deducted player reference used to be
+        // captured here and reused after the async hop — a disconnect in that
+        // window wrote the purchased items into a detached, already-saved
+        // player object (money taken, goods silently destroyed). The
+        // delivery now re-resolves the live player and recovers the stacks
+        // via a world drop at the disconnecting player's position when they
+        // are already gone.
+        final ServerPlayer capturedPlayer = player;
         balanceManager.subtractBalance(player, totalCost).thenAccept(newBalance -> {
-            player.level().getServer().execute(() -> {
+            MinecraftServer srv = capturedPlayer.level().getServer();
+            if (srv == null) return;
+            srv.execute(() -> {
                 try {
+                    ServerPlayer live = srv.getPlayerList().getPlayer(playerId);
                     if (newBalance < 0) {
                         // Insufficient funds or failure - no money was deducted
-                        player.sendSystemMessage(
-                            TextUtil.error("Insufficient funds! You need " + CurrencyUtil.format(totalCost)
-                                + " to complete this purchase."));
+                        if (live != null) {
+                            live.sendSystemMessage(
+                                TextUtil.error("Insufficient funds! You need " + CurrencyUtil.format(totalCost)
+                                    + " to complete this purchase."));
+                        }
                         return;
                     }
 
-                    // Spawn item into player's inventory
+                    // Spawn item into the (live) player's inventory
                     net.minecraft.world.item.ItemStack itemStack = createItemStack(material, quantity);
                     if (itemStack.isEmpty()) {
                         // Should be impossible now (validated before charging), but we
@@ -383,20 +408,31 @@ public class ShopManager {
                         SolidusMod.LOGGER.error(
                             "Buy produced an empty stack for material '{}'! Refunding {}.",
                             material, totalCost);
-                        balanceManager.addBalance(player, totalCost);
-                        player.sendSystemMessage(TextUtil.error("Purchase failed. You have been refunded."));
+                        balanceManager.addBalance(playerId, player.getName().getString(), totalCost);
+                        if (live != null) {
+                            live.sendSystemMessage(TextUtil.error("Purchase failed. You have been refunded."));
+                        }
                         return;
                     }
-                    if (!player.getInventory().add(itemStack)) {
-                        // Inventory full - drop at player's feet
-                        player.drop(itemStack, false);
-                        player.sendSystemMessage(TextUtil.warning("Inventory full! Item dropped at your feet."));
+                    if (live != null) {
+                        if (!live.getInventory().add(itemStack)) {
+                            // Inventory full - drop at player's feet
+                            live.drop(itemStack, false);
+                            live.sendSystemMessage(TextUtil.warning("Inventory full! Item dropped at your feet."));
+                        }
+                    } else {
+                        // Buyer disconnected during the async deduction — recover
+                        // the paid-for goods at their last known position (M-1).
+                        SolidusMod.LOGGER.warn(
+                            "Buyer {} disconnected during shop purchase - dropping {}x {} at their last position.",
+                            TextUtil.sanitizeForLog(capturedPlayer.getName().getString()), quantity, material);
+                        dropAtPlayerPosition(capturedPlayer, itemStack);
                     }
 
                     // Log transaction
                     economyEngine.getTransactionLog().log(
                         TransactionLog.Type.SHOP_BUY,
-                        player.getUUID(), player.getName().getString(),
+                        playerId, player.getName().getString(),
                         null, null,
                         totalCost, material, quantity,
                         "Bought " + quantity + "x " + material + " from shop"
@@ -407,12 +443,14 @@ public class ShopManager {
                         hook.afterShopPurchase(playerId, player.getName().getString(), totalCost));
 
                     // Success notification
-                    player.sendSystemMessage(
-                        TextUtil.success("Purchased " + quantity + "x " + material + " for ")
-                            .append(TextUtil.currency(CurrencyUtil.format(totalCost)))
-                            .append(TextUtil.styled(" | New balance: ", ChatFormatting.GRAY))
-                            .append(TextUtil.currency(CurrencyUtil.format(newBalance)))
-                    );
+                    if (live != null) {
+                        live.sendSystemMessage(
+                            TextUtil.success("Purchased " + quantity + "x " + material + " for ")
+                                .append(TextUtil.currency(CurrencyUtil.format(totalCost)))
+                                .append(TextUtil.styled(" | New balance: ", ChatFormatting.GRAY))
+                                .append(TextUtil.currency(CurrencyUtil.format(newBalance)))
+                        );
+                    }
                 } finally {
                     // Always release the lock so the player can buy again
                     pendingBuys.remove(playerId);
@@ -422,15 +460,43 @@ public class ShopManager {
             // Audit 2.1.3: an exceptionally-completed future skipped thenAccept
             // (and its finally block) - the pending-buy lock leaked until
             // disconnect, permanently blocking further purchases.
-            player.level().getServer().execute(() -> {
-                pendingBuys.remove(playerId);
-                // SECURITY (audit SOL-005): escape CR/LF in names that can be
-                // session-sourced on offline-mode proxies before logging.
-                SolidusMod.LOGGER.error("Buy deduction future failed for {} - lock released.",
-                    TextUtil.sanitizeForLog(player.getName().getString()), ex);
-            });
+            MinecraftServer srv = capturedPlayer.level().getServer();
+            if (srv != null) {
+                srv.execute(() -> {
+                    pendingBuys.remove(playerId);
+                    // SECURITY (audit SOL-005): escape CR/LF in names that can be
+                    // session-sourced on offline-mode proxies before logging.
+                    SolidusMod.LOGGER.error("Buy deduction future failed for {} - lock released.",
+                        TextUtil.sanitizeForLog(capturedPlayer.getName().getString()), ex);
+                });
+            }
             return null;
         });
+    }
+
+    /**
+     * Recovers a stack for a disconnected player by spawning an item entity
+     * at their last known position (AUDIT FIX 2.2.6, M-1/M-2). Server thread
+     * only. When the level reference is stale the loss is logged for manual
+     * ledger-based refund instead of silently vanishing.
+     */
+    private static void dropAtPlayerPosition(ServerPlayer lastKnown,
+                                             net.minecraft.world.item.ItemStack stack) {
+        if (stack == null || stack.isEmpty()) return;
+        try {
+            if (lastKnown.level() instanceof net.minecraft.server.level.ServerLevel level) {
+                var entity = new net.minecraft.world.entity.item.ItemEntity(
+                    level, lastKnown.getX(), lastKnown.getY() + 0.5, lastKnown.getZ(), stack.copy());
+                level.addFreshEntity(entity);
+                return;
+            }
+        } catch (Exception e) {
+            SolidusMod.LOGGER.error("World-drop recovery of purchased goods failed.", e);
+        }
+        SolidusMod.LOGGER.error(
+            "CRITICAL: {}x {} for player {} could not be delivered or dropped - refund from the ledger.",
+            stack.getCount(), TextUtil.getMaterialName(stack),
+            TextUtil.sanitizeForLog(lastKnown.getName().getString()));
     }
 
     /**
@@ -571,12 +637,30 @@ public class ShopManager {
     /**
      * Restores the actual removed stacks to the player (inventory first,
      * feet-drop fallback) - preserving all data components.
+     *
+     * <p>AUDIT FIX 2.2.6 (M-2): re-resolves the live player on the server
+     * thread. The caller captured the reference before an async hop; if the
+     * player disconnected in that window the old code wrote into a detached
+     * (never-persisted) inventory — the sold items vanished with the money
+     * not credited. A disconnected player now gets their stacks recovered via
+     * a world drop at their last known position.</p>
      */
     private void restoreRemovedStacks(ServerPlayer player, java.util.List<net.minecraft.world.item.ItemStack> stacks) {
+        MinecraftServer srv = player.level().getServer();
+        ServerPlayer live = srv != null ? srv.getPlayerList().getPlayer(player.getUUID()) : null;
+        if (live == null && srv != null) {
+            SolidusMod.LOGGER.warn(
+                "Player {} disconnected during a failed sell payout - restoring {} stack(s) via world drop at their last position.",
+                TextUtil.sanitizeForLog(player.getName().getString()), stacks.size());
+        }
         for (net.minecraft.world.item.ItemStack stack : stacks) {
             if (stack == null || stack.isEmpty()) continue;
-            if (!player.getInventory().add(stack.copy())) {
-                player.drop(stack.copy(), false);
+            if (live != null) {
+                if (!live.getInventory().add(stack.copy())) {
+                    live.drop(stack.copy(), false);
+                }
+            } else {
+                dropAtPlayerPosition(player, stack);
             }
         }
     }
@@ -688,7 +772,11 @@ public class ShopManager {
         // Only remove from main inventory (slots 0-35), skip armor and offhand
         for (int i = 0; i < 36 && remaining > 0; i++) {
             net.minecraft.world.item.ItemStack stack = player.getInventory().getItem(i);
-            if (!stack.isEmpty() && getMaterialName(stack).equalsIgnoreCase(material)) {
+            // AUDIT FIX 2.2.6 (M-3): component-bearing stacks (enchanted /
+            // renamed / damaged gear, containers) never count as plain sellable
+            // stock — they are skipped instead of being consumed at base price.
+            if (!stack.isEmpty() && !com.solidus.sell.SellScreenHandler.hasCustomComponents(stack)
+                    && getMaterialName(stack).equalsIgnoreCase(material)) {
                 int toRemove = Math.min(stack.getCount(), remaining);
                 if (removedSink != null && toRemove > 0) {
                     net.minecraft.world.item.ItemStack snapshot = stack.copy();

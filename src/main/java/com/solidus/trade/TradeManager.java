@@ -11,13 +11,17 @@ import com.solidus.util.TextUtil;
 import net.minecraft.ChatFormatting;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.level.ServerPlayer;
+import net.minecraft.server.level.ServerLevel;
+import net.minecraft.world.entity.item.ItemEntity;
 import net.minecraft.world.item.ItemStack;
 
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.TimeUnit;
 
 /**
  * Trade Manager - Orchestrates direct player-to-player trading (/trade).
@@ -283,17 +287,22 @@ public class TradeManager {
      * Cancels a session: every offered item returns to its owner, both
      * windows close, both players are notified. Idempotent.
      *
+     * <p>AUDIT FIX 2.2.6 (TRD-04): the terminal-state check and the CANCELLED
+     * transition are now one atomic step ({@link TradeSession#tryMarkCancelled}),
+     * so two racing cancellers (e.g. the disconnect event and the idle reaper)
+     * can no longer BOTH pass the check and both claim the escrowed stacks.
+     * The claim itself is additionally synchronized inside the session.</p>
+     *
      * @param reasonPhrase short human reason ("closed the trade window", ...)
      * @param actorName    who caused the cancellation (for the messages)
      */
     public void cancelSession(TradeSession session, String reasonPhrase, String actorName) {
-        if (session.isTerminal()) return;
-        if (session.state() == TradeSession.State.EXECUTING) {
-            // Execution is in flight - items/money are being settled; do not
-            // double-handle. (Execution never calls back into cancel.)
+        if (!session.tryMarkCancelled()) {
+            // Already terminal, or execution is in flight - the execution
+            // path owns the escrowed items in that case (its abort branch
+            // returns them); do not double-handle.
             return;
         }
-        session.markCancelled();
 
         // Return ALL offered items to their (resolved) owners.
         for (TradeSession.Side side : new TradeSession.Side[]{
@@ -306,10 +315,22 @@ public class TradeManager {
                         owner.drop(stack, false);
                     }
                 }
+            } else if (!items.isEmpty()) {
+                // AUDIT FIX 2.2.6 (TRD-04): the DISCONNECT event is expected to
+                // fire while the player is still resolvable; if it ever does
+                // not (event-order change in a future Fabric/vanilla), the
+                // old code silently DESTROYED the claimed stacks. Log loudly
+                // and recover them by dropping at the disconnecting player's
+                // position when we have one, so at minimum the loss is
+                // visible and attributable in the server log.
+                SolidusMod.LOGGER.error(
+                    "CRITICAL: trade cancel could not resolve owner {} of session {} - {} stack(s) recovered via world drop.",
+                    session.nameOf(side), session.sessionId(), items.size());
+                ServerPlayer reference = resolveReference(session.uuidOf(side));
+                for (ItemStack stack : items) {
+                    dropAtLastPosition(session, side, stack, reference);
+                }
             }
-            // Owner offline: cannot happen (disconnect cancels synchronously
-            // while the player is still resolvable) - the claim above already
-            // removed the items from the container.
         }
 
         sessions.remove(session.uuidOf(TradeSession.Side.INITIATOR));
@@ -355,9 +376,19 @@ public class TradeManager {
             now - e.getValue().createdAt() > REQUEST_TTL_MS);
     }
 
-    /** Server shutdown: return everything, silently. */
+    /** Server shutdown: drain in-flight executions, then return everything. */
     public void shutdown() {
         for (TradeSession session : new ArrayList<>(sessions.values())) {
+            if (session.state() == TradeSession.State.EXECUTING) {
+                // AUDIT FIX 2.2.6 (TRD-05): a trade caught mid-execution at
+                // shutdown used to have its items returned HERE while its
+                // money legs were still queued on the economy executor — the
+                // legs then committed during EconomyEngine.shutdown(),
+                // moving money between players who both got their items
+                // back. Drain the money phase (bounded) and complete the
+                // delivery on this (server) thread instead.
+                drainExecutingSession(session);
+            }
             if (!session.isTerminal()) {
                 session.markCancelled();
                 // On shutdown players are being saved; resolve may already be
@@ -372,6 +403,14 @@ public class TradeManager {
                                 owner.drop(stack, false);
                             }
                         }
+                    } else if (!items.isEmpty()) {
+                        SolidusMod.LOGGER.warn(
+                            "Trade shutdown: owner {} unresolvable - dropping {} stack(s) at last position.",
+                            session.nameOf(side), items.size());
+                        ServerPlayer reference = resolveReference(session.uuidOf(side));
+                        for (ItemStack stack : items) {
+                            dropAtLastPosition(session, side, stack, reference);
+                        }
                     }
                 }
             }
@@ -380,11 +419,53 @@ public class TradeManager {
         pendingRequests.clear();
     }
 
+    /**
+     * Drains an EXECUTING session's money phase and completes the delivery
+     * on the current (server) thread if the queued finisher has not run yet
+     * (TRD-05). Safe to race with the queued finisher: both run on the
+     * server thread and {@code finalizeTrade} is guarded by the terminal
+     * state, so exactly one of them performs the delivery.
+     */
+    private void drainExecutingSession(TradeSession session) {
+        CompletableFuture<MoneyPhaseResult> money = session.pendingMoneyPhase();
+        if (money == null) return;
+        try {
+            money.get(10, TimeUnit.SECONDS);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        } catch (Exception e) {
+            SolidusMod.LOGGER.warn("Trade money phase did not settle during shutdown (session {}): {}",
+                session.sessionId(), String.valueOf(e.getMessage()));
+        }
+        if (session.state() == TradeSession.State.EXECUTING) {
+            // No captured references on this path (players were re-resolved
+            // from scratch); the world-drop recovery falls back to logging.
+            finalizeTrade(session, money.getNow(null), null, null, null);
+        }
+    }
+
     // -- Execution -----------------------------------------
 
     /**
      * Both sides ready: move the money atomically, then swap the items.
      * Runs on the server thread; money legs chain on the economy executor.
+     *
+     * <p>AUDIT FIX 2.2.6 (TRD-01/02/03): hardened execution —
+     * (1) the ACTIVE -> EXECUTING transition is atomic
+     *     ({@link TradeSession#tryBeginExecution}), closing the cancel race;
+     * (2) the money chain is completed via {@code whenComplete}, so an
+     *     exceptionally-completed future (DB error, engine already shut
+     *     down) FORCE-aborts the session and returns the items — the old
+     *     {@code thenAccept}-only chain left the session stuck EXECUTING
+     *     forever, permanently locking both players out of trading with
+     *     their items held hostage;
+     * (3) players are RE-RESOLVED at delivery time. The old code captured
+     *     the two {@code ServerPlayer} references before the async money
+     *     phase and used them afterwards; a disconnect during that window
+     *     (cancel refuses EXECUTING sessions) meant items were deposited
+     *     into a detached, already-saved player object — silently destroyed.
+     *     A disconnected recipient now gets their stacks recovered via a
+     *     world drop at their last known position.
      */
     private void executeTrade(TradeSession session) {
         if (session.state() != TradeSession.State.ACTIVE) return;
@@ -407,69 +488,170 @@ public class TradeManager {
             return;
         }
 
-        session.markExecuting();
+        if (!session.tryBeginExecution()) {
+            // A cancel won the race between the READY check and here.
+            return;
+        }
 
         double moneyA = session.moneyOf(TradeSession.Side.INITIATOR);
         double moneyB = session.moneyOf(TradeSession.Side.PARTNER);
         BalanceManager balances = economyEngine.getBalanceManager();
 
+        // Keep the last-known player objects for position recovery if one of
+        // them disconnects during the async money phase (TRD-01).
+        final ServerPlayer lastKnownA = a;
+        final ServerPlayer lastKnownB = b;
+
         // Money phase (both legs atomic, sequential, with rollback of leg 1
         // if leg 2 fails - item swap only starts when ALL money is settled).
-        executeMoneyLegs(session, balances, moneyA, moneyB)
-            .thenAccept(moneyResult -> a.level().getServer().execute(() -> {
-                if (session.isTerminal()) {
-                    // A cancel raced us (should not happen while EXECUTING,
-                    // but stay defensive) - nothing to do.
-                    return;
+        // whenComplete (not thenAccept) so an exceptional completion still
+        // force-aborts the session (TRD-02).
+        CompletableFuture<MoneyPhaseResult> moneyFuture =
+            executeMoneyLegs(session, balances, moneyA, moneyB);
+        session.attachMoneyPhase(moneyFuture);
+        moneyFuture.whenComplete((moneyResult, error) -> {
+            MinecraftServer srv = lastKnownA.level().getServer();
+            Runnable finisher = () -> finalizeTrade(session, moneyResult, error, lastKnownA, lastKnownB);
+            if (srv != null) {
+                srv.execute(finisher);
+            } else {
+                finisher.run();
+            }
+        });
+    }
+
+    /**
+     * Single delivery/abort path for a settled money phase. Runs on the
+     * server thread (queued finisher, or the shutdown drain) and is guarded
+     * by the terminal state — exactly one invocation performs the work.
+     *
+     * @param lastKnownA/lastKnownB the players as captured when execution
+     *        started — used ONLY as position references for the world-drop
+     *        recovery when a recipient disconnected mid-execution (TRD-01)
+     */
+    private void finalizeTrade(TradeSession session, MoneyPhaseResult moneyResult, Throwable error,
+                               ServerPlayer lastKnownA, ServerPlayer lastKnownB) {
+        if (session.isTerminal()) return;
+
+        if (error != null) {
+            SolidusMod.LOGGER.error(
+                "Trade session {} money phase completed exceptionally - force-aborting the trade.",
+                session.sessionId(), error);
+            moneyResult = null; // fall through to the abort branch
+        }
+
+        if (moneyResult == null || !moneyResult.success()) {
+            // Money failed, was rolled back, or the phase errored out.
+            // (Rollback of a committed leg 1 is attempted inside
+            // executeMoneyLegs via the hook-free internal transfer — TRD-03.)
+            String reason = moneyResult != null ? moneyResult.message() : "system error";
+            session.markCancelled();
+            returnItemsToOwners(session);
+            removeSession(session);
+            closeWindow(session.uuidOf(TradeSession.Side.INITIATOR));
+            closeWindow(session.uuidOf(TradeSession.Side.PARTNER));
+            ServerPlayer a = resolvePlayer(session.uuidOf(TradeSession.Side.INITIATOR));
+            ServerPlayer b = resolvePlayer(session.uuidOf(TradeSession.Side.PARTNER));
+            if (a != null) a.sendSystemMessage(TextUtil.error("Trade failed: " + reason));
+            if (b != null) b.sendSystemMessage(TextUtil.error(
+                "Trade failed: " + reason + " - your offered items were returned."));
+            SolidusMod.LOGGER.warn("Trade session {} aborted during money phase: {}",
+                session.sessionId(), reason);
+            return;
+        }
+
+        // Items phase (money is fully settled at this point).
+        double moneyA = session.moneyOf(TradeSession.Side.INITIATOR);
+        double moneyB = session.moneyOf(TradeSession.Side.PARTNER);
+        List<ItemStack> aToB = session.takeOfferedItems(TradeSession.Side.INITIATOR);
+        List<ItemStack> bToA = session.takeOfferedItems(TradeSession.Side.PARTNER);
+
+        // TRD-01: re-resolve both players — the money phase was async and
+        // either of them may have disconnected during it.
+        ServerPlayer liveA = resolvePlayer(session.uuidOf(TradeSession.Side.INITIATOR));
+        ServerPlayer liveB = resolvePlayer(session.uuidOf(TradeSession.Side.PARTNER));
+        deliverStacks(liveA, TradeSession.Side.INITIATOR, session, bToA, lastKnownA);
+        deliverStacks(liveB, TradeSession.Side.PARTNER, session, aToB, lastKnownB);
+
+        session.markCompleted();
+        removeSession(session);
+
+        // Ledger: one TRADE_SEND + one TRADE_RECEIVE per direction with
+        // content summary (session-derived identities — works even when a
+        // player already disconnected).
+        logTradeLeg(session.uuidOf(TradeSession.Side.INITIATOR), session.nameOf(TradeSession.Side.INITIATOR),
+            session.uuidOf(TradeSession.Side.PARTNER), session.nameOf(TradeSession.Side.PARTNER),
+            aToB, moneyA);
+        logTradeLeg(session.uuidOf(TradeSession.Side.PARTNER), session.nameOf(TradeSession.Side.PARTNER),
+            session.uuidOf(TradeSession.Side.INITIATOR), session.nameOf(TradeSession.Side.INITIATOR),
+            bToA, moneyB);
+
+        closeWindow(session.uuidOf(TradeSession.Side.INITIATOR));
+        closeWindow(session.uuidOf(TradeSession.Side.PARTNER));
+
+        if (liveA != null) liveA.sendSystemMessage(TextUtil.success("Trade completed!"));
+        if (liveB != null) liveB.sendSystemMessage(TextUtil.success("Trade completed!"));
+        SolidusMod.LOGGER.info("Trade session {} completed: {} <-> {} (items {}<->{}, money {}<->{})",
+            session.sessionId(),
+            session.nameOf(TradeSession.Side.INITIATOR), session.nameOf(TradeSession.Side.PARTNER),
+            aToB.size(), bToA.size(),
+            CurrencyUtil.format(moneyA), CurrencyUtil.format(moneyB));
+    }
+
+    /**
+     * Delivers escrowed stacks to a recipient; when the recipient
+     * disconnected during the async money phase, the stacks are recovered by
+     * dropping them at their last known position instead of being written
+     * into a detached (never-persisted) player object (TRD-01).
+     */
+    private void deliverStacks(ServerPlayer liveOrNull, TradeSession.Side side,
+                               TradeSession session, List<ItemStack> stacks, ServerPlayer lastKnown) {
+        for (ItemStack stack : stacks) {
+            if (stack.isEmpty()) continue;
+            if (liveOrNull != null) {
+                if (!liveOrNull.getInventory().add(stack)) {
+                    liveOrNull.drop(stack, false);
                 }
-                if (!moneyResult.success()) {
-                    // Money failed or rolled back - abort the whole trade.
-                    session.markCancelled();
-                    returnItemsToOwners(session);
-                    sessions.remove(a.getUUID());
-                    sessions.remove(b.getUUID());
-                    closeWindow(a.getUUID());
-                    closeWindow(b.getUUID());
-                    a.sendSystemMessage(TextUtil.error("Trade failed: " + moneyResult.message()));
-                    b.sendSystemMessage(TextUtil.error("Trade failed: " + moneyResult.message()
-                        + " - your offered items were returned."));
-                    SolidusMod.LOGGER.warn("Trade session {} aborted during money phase: {}",
-                        session.sessionId(), moneyResult.message());
-                    return;
-                }
+            } else {
+                SolidusMod.LOGGER.warn(
+                    "Trade recipient {} (session {}) disconnected during execution - "
+                        + "recovering {} stack(s) via world drop at their last position.",
+                    session.nameOf(side), session.sessionId(), stacks.size());
+                dropAtLastPosition(session, side, stack, lastKnown);
+            }
+        }
+    }
 
-                // Items phase (money is fully settled at this point).
-                List<ItemStack> aToB = session.takeOfferedItems(TradeSession.Side.INITIATOR);
-                List<ItemStack> bToA = session.takeOfferedItems(TradeSession.Side.PARTNER);
+    /**
+     * Spawns one item entity at a disconnected participant's last known
+     * position (vanilla death-drop recovery semantics). Called on the server
+     * thread only. When no position reference exists either, the stack is
+     * logged as unrecoverable so operators can refund from the ledger.
+     */
+    private void dropAtLastPosition(TradeSession session, TradeSession.Side side,
+                                    ItemStack stack, ServerPlayer lastKnown) {
+        if (stack.isEmpty()) return;
+        try {
+            if (lastKnown != null && lastKnown.level() instanceof ServerLevel level) {
+                ItemEntity entity = new ItemEntity(
+                    level, lastKnown.getX(), lastKnown.getY() + 0.5, lastKnown.getZ(), stack.copy());
+                level.addFreshEntity(entity);
+                return;
+            }
+        } catch (Exception e) {
+            SolidusMod.LOGGER.error("World-drop recovery failed for trade session {}",
+                session.sessionId(), e);
+        }
+        SolidusMod.LOGGER.error(
+            "CRITICAL: {} for trade participant {} (session {}) could not be delivered - "
+                + "no live position. Refund manually from the trade ledger rows.",
+            stack.getCount() + "x " + TextUtil.getMaterialName(stack),
+            session.nameOf(side), session.sessionId());
+    }
 
-                for (ItemStack stack : aToB) {
-                    if (!b.getInventory().add(stack)) b.drop(stack, false);
-                }
-                for (ItemStack stack : bToA) {
-                    if (!a.getInventory().add(stack)) a.drop(stack, false);
-                }
-
-                session.markCompleted();
-                sessions.remove(a.getUUID());
-                sessions.remove(b.getUUID());
-
-                // Ledger: one TRADE_SEND + one TRADE_RECEIVE per direction
-                // with content summary (per-item rows would flood the ledger;
-                // /transactions shows the full item breakdown in the notes).
-                logTradeLeg(a, b, aToB, moneyA);
-                logTradeLeg(b, a, bToA, moneyB);
-
-                closeWindow(a.getUUID());
-                closeWindow(b.getUUID());
-
-                a.sendSystemMessage(TextUtil.success("Trade completed!"));
-                b.sendSystemMessage(TextUtil.success("Trade completed!"));
-                SolidusMod.LOGGER.info("Trade session {} completed: {} <-> {} (items {}<->{}, money {}<->{})",
-                    session.sessionId(),
-                    a.getName().getString(), b.getName().getString(),
-                    aToB.size(), bToA.size(),
-                    CurrencyUtil.format(moneyA), CurrencyUtil.format(moneyB));
-            }));
+    private void removeSession(TradeSession session) {
+        sessions.remove(session.uuidOf(TradeSession.Side.INITIATOR));
+        sessions.remove(session.uuidOf(TradeSession.Side.PARTNER));
     }
 
     private record MoneyPhaseResult(boolean success, String message) {}
@@ -478,8 +660,15 @@ public class TradeManager {
      * Runs the two money legs sequentially on the economy executor with a
      * rollback of the first leg if the second fails. A rolled-back or
      * failed phase moves NO money at all.
+     *
+     * <p>AUDIT FIX 2.2.6 (TRD-03): both legs AND the rollback use the
+     * hook-free {@link BalanceManager#transferInternal}. The old path went
+     * through {@code transferOffline}: a governance hook could veto the
+     * ROLLBACK of an already-committed leg (stranding the money with the
+     * partner), and every leg fired {@code afterTransfer} — triple-counting
+     * daily limits and taxes for one logical trade.</p>
      */
-    private java.util.concurrent.CompletableFuture<MoneyPhaseResult> executeMoneyLegs(
+    private CompletableFuture<MoneyPhaseResult> executeMoneyLegs(
             TradeSession session, BalanceManager balances, double moneyA, double moneyB) {
         UUID aUuid = session.uuidOf(TradeSession.Side.INITIATOR);
         String aName = session.nameOf(TradeSession.Side.INITIATOR);
@@ -487,41 +676,49 @@ public class TradeManager {
         String bName = session.nameOf(TradeSession.Side.PARTNER);
 
         if (moneyA <= 0 && moneyB <= 0) {
-            return java.util.concurrent.CompletableFuture.completedFuture(
-                new MoneyPhaseResult(true, ""));
+            return CompletableFuture.completedFuture(new MoneyPhaseResult(true, ""));
         }
 
-        return balances.transferOffline(aUuid, aName, bUuid, bName, moneyA)
-            .thenCompose(first -> {
-                if (moneyA > 0 && !first.success()) {
-                    return java.util.concurrent.CompletableFuture.completedFuture(
-                        new MoneyPhaseResult(false, first.message()));
-                }
-                if (moneyB <= 0) {
-                    return java.util.concurrent.CompletableFuture.completedFuture(
-                        new MoneyPhaseResult(true, ""));
-                }
-                return balances.transferOffline(bUuid, bName, aUuid, aName, moneyB)
-                    .thenCompose(second -> {
-                        if (!second.success()) {
-                            // Leg 2 failed after leg 1 committed -> roll leg 1 back.
-                            if (moneyA > 0) {
-                                return balances.transferOffline(bUuid, bName, aUuid, aName, moneyA)
-                                    .thenApply(rollback -> rollback.success()
-                                        ? new MoneyPhaseResult(false, second.message())
-                                        : new MoneyPhaseResult(false,
-                                            "CRITICAL: money rollback failed - contact an admin (session "
-                                                + session.sessionId() + ")"));
-                            }
-                        }
-                        return java.util.concurrent.CompletableFuture.completedFuture(
-                            new MoneyPhaseResult(true, ""));
-                    });
-            });
+        // Leg 1 (A -> B), skipped entirely when empty (the old code relied on
+        // the silent zero-amount failure of transferOffline — fragile).
+        CompletableFuture<MoneyPhaseResult> leg1 = moneyA > 0
+            ? balances.transferInternal(aUuid, aName, bUuid, bName, moneyA)
+                .thenApply(first -> first.success()
+                    ? new MoneyPhaseResult(true, "")
+                    : new MoneyPhaseResult(false, first.message()))
+            : CompletableFuture.completedFuture(new MoneyPhaseResult(true, ""));
+
+        return leg1.thenCompose(first -> {
+            if (!first.success()) {
+                return CompletableFuture.completedFuture(first);
+            }
+            if (moneyB <= 0) {
+                return CompletableFuture.completedFuture(new MoneyPhaseResult(true, ""));
+            }
+            // Leg 2 (B -> A)
+            return balances.transferInternal(bUuid, bName, aUuid, aName, moneyB)
+                .thenCompose(second -> {
+                    if (second.success()) {
+                        return CompletableFuture.completedFuture(new MoneyPhaseResult(true, ""));
+                    }
+                    // Leg 2 failed after leg 1 committed -> roll leg 1 back
+                    // (hook-free: a veto here used to strand the money, TRD-03).
+                    if (moneyA > 0) {
+                        return balances.transferInternal(bUuid, bName, aUuid, aName, moneyA)
+                            .thenApply(rollback -> rollback.success()
+                                ? new MoneyPhaseResult(false, second.message())
+                                : new MoneyPhaseResult(false,
+                                    "CRITICAL: money rollback failed - contact an admin (session "
+                                        + session.sessionId() + ")"));
+                    }
+                    return CompletableFuture.completedFuture(
+                        new MoneyPhaseResult(false, second.message()));
+                });
+        });
     }
 
     /** Logs one completed trade direction into the transaction ledger. */
-    private void logTradeLeg(ServerPlayer from, ServerPlayer to,
+    private void logTradeLeg(UUID fromUuid, String fromName, UUID toUuid, String toName,
                               List<ItemStack> items, double money) {
         TransactionLog log = economyEngine.getTransactionLog();
         String summary = items.isEmpty()
@@ -531,21 +728,21 @@ public class TradeManager {
                 .reduce((x, y) -> x + ", " + y).orElse("");
         log.log(
             TransactionLog.Type.TRADE_SEND,
-            from.getUUID(), from.getName().getString(),
-            to.getUUID(), to.getName().getString(),
+            fromUuid, fromName,
+            toUuid, toName,
             money,
             items.isEmpty() ? null : TextUtil.getMaterialName(items.get(0)),
             items.stream().mapToInt(ItemStack::getCount).sum(),
-            "Traded with " + to.getName().getString() + " - gave " + summary
+            "Traded with " + toName + " - gave " + summary
                 + (money > 0 ? " + " + CurrencyUtil.format(money) : ""));
         log.log(
             TransactionLog.Type.TRADE_RECEIVE,
-            to.getUUID(), to.getName().getString(),
-            from.getUUID(), from.getName().getString(),
+            toUuid, toName,
+            fromUuid, fromName,
             money,
             items.isEmpty() ? null : TextUtil.getMaterialName(items.get(0)),
             items.stream().mapToInt(ItemStack::getCount).sum(),
-            "Traded with " + from.getName().getString() + " - received " + summary
+            "Traded with " + fromName + " - received " + summary
                 + (money > 0 ? " + " + CurrencyUtil.format(money) : ""));
     }
 
@@ -559,6 +756,15 @@ public class TradeManager {
         MinecraftServer currentServer = this.server;
         return currentServer != null
             ? currentServer.getPlayerList().getPlayer(playerUuid) : null;
+    }
+
+    /**
+     * Best-effort reference for position recovery: the live player, or null.
+     * (A disconnected player's detached object is not reachable from here —
+     * callers that captured one pass it in directly.)
+     */
+    private ServerPlayer resolveReference(UUID playerUuid) {
+        return resolvePlayer(playerUuid);
     }
 
     private void returnItemsToOwners(TradeSession session) {

@@ -69,6 +69,14 @@ public class TradeSession {
     private volatile double partnerMoney = 0;
     private volatile long lastActivity = createdAt;
 
+    /**
+     * The in-flight money phase (AUDIT FIX 2.2.6, TRD-05): kept so the
+     * shutdown path can drain it and complete the item swap on the server
+     * thread, instead of returning escrowed items while the money legs are
+     * still queued on the economy executor (money moved, goods returned).
+     */
+    private volatile java.util.concurrent.CompletableFuture<?> pendingMoneyPhase;
+
     public TradeSession(UUID sessionId,
                         UUID initiatorUuid, String initiatorName,
                         UUID partnerUuid, String partnerName) {
@@ -187,8 +195,14 @@ public class TradeSession {
     /**
      * Removes (takes ownership of) the offered items of a side from their
      * container and returns them. Used at execution to swap the stacks.
+     *
+     * <p>AUDIT FIX 2.2.6 (TRD-04): synchronized so the read-and-clear is one
+     * atomic step. The cancel path is reachable from the server thread AND
+     * from the disconnect event; without synchronization two racing callers
+     * could both read the same non-empty slots before either cleared them —
+     * the classic duplicate-hand-out.</p>
      */
-    public List<ItemStack> takeOfferedItems(Side side) {
+    public synchronized List<ItemStack> takeOfferedItems(Side side) {
         TradeContainer container = containerOf(side);
         List<ItemStack> out = new ArrayList<>();
         for (int slot : TradeGUI.MY_OFFER_SLOTS) {
@@ -210,6 +224,29 @@ public class TradeSession {
         return takeOfferedItems(side);
     }
 
+    /**
+     * Atomic ACTIVE -> EXECUTING transition (AUDIT FIX 2.2.6, TRD-04):
+     * closes the cancel/execute check-then-act race. Returns false when the
+     * session already left ACTIVE (cancelled, or another executor began).
+     */
+    public synchronized boolean tryBeginExecution() {
+        if (state != State.ACTIVE) return false;
+        state = State.EXECUTING;
+        return true;
+    }
+
+    /**
+     * Atomic terminal transition for the cancel path: marks CANCELLED only
+     * when the session is not already terminal AND not mid-execution.
+     * Returns true when this call performed the transition (TRD-04).
+     */
+    public synchronized boolean tryMarkCancelled() {
+        if (state == State.COMPLETED || state == State.CANCELLED) return false;
+        if (state == State.EXECUTING) return false;
+        state = State.CANCELLED;
+        return true;
+    }
+
     public void markExecuting() {
         this.state = State.EXECUTING;
     }
@@ -224,5 +261,16 @@ public class TradeSession {
 
     public boolean isTerminal() {
         return state == State.COMPLETED || state == State.CANCELLED;
+    }
+
+    /** Attaches the in-flight money phase for the shutdown drain (TRD-05). */
+    public void attachMoneyPhase(java.util.concurrent.CompletableFuture<?> future) {
+        this.pendingMoneyPhase = future;
+    }
+
+    /** The in-flight money phase, or null when not executing (TRD-05). */
+    @SuppressWarnings("unchecked")
+    public <T> java.util.concurrent.CompletableFuture<T> pendingMoneyPhase() {
+        return (java.util.concurrent.CompletableFuture<T>) pendingMoneyPhase;
     }
 }

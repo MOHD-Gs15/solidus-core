@@ -261,17 +261,23 @@ public class MySqlStorage implements StorageBackend {
         ensureInitialized();
         scheduleNameRefresh(uuid, playerName);
         // L2 read path (2.2.1, optional): a cached balance skips the database
-        // round trip. Staleness is bounded by the TTL plus instant invalidation
-        // on writes; money MUTATIONS never trust this value — they re-validate
+        // round trip. AUDIT FIX 2.2.6 (HNG-01): the Redis probe used to run
+        // on the CALLER thread — often the server tick thread — where the
+        // guarded 250ms call timeout could stall every tick up to a quarter
+        // of a second whenever Redis slowed down. The probe now runs inside
+        // the async hop (economy executor): the server thread is never
+        // blocked, and the breaker still bounds the worker's exposure.
+        // Staleness is bounded by the TTL plus instant invalidation on
+        // writes; money MUTATIONS never trust this value — they re-validate
         // atomically inside their own SQL transaction.
-        RedisLayer layer = redis;
-        if (layer != null) {
-            Double cached = layer.getCachedBalance(uuid);
-            if (cached != null) {
-                return CompletableFuture.completedFuture(cached);
-            }
-        }
         return CompletableFuture.supplyAsync(() -> {
+            RedisLayer layer = redis;
+            if (layer != null) {
+                Double cached = layer.getCachedBalance(uuid);
+                if (cached != null) {
+                    return cached;
+                }
+            }
             try (Connection conn = dataSource.getConnection()) {
                 Double balance = selectBalance(conn, uuid);
                 if (balance == null) {
@@ -926,6 +932,32 @@ public class MySqlStorage implements StorageBackend {
     }
 
     // -- Shared services / lifecycle ---------------------------------------
+
+    /**
+     * Creates the account row only when missing (AUDIT FIX 2.2.6, ESC-01).
+     * See {@link StorageBackend#ensureAccount} for the escrow-destruction bug
+     * this replaces. INSERT IGNORE is atomic on MySQL/MariaDB, so the call is
+     * race-safe even against another server booting simultaneously.
+     */
+    @Override
+    public boolean ensureAccount(UUID uuid, String playerName, double startingBalance) {
+        ensureInitialized();
+        try (Connection conn = dataSource.getConnection();
+             PreparedStatement ps = conn.prepareStatement(INSERT_IGNORE_BALANCE)) {
+            ps.setString(1, uuid.toString());
+            ps.setString(2, TextUtil.sanitizePlayerName(playerName));
+            ps.setBigDecimal(3, Money.of(startingBalance).toDecimal());
+            ps.setLong(4, System.currentTimeMillis());
+            if (ps.executeUpdate() == 1) {
+                balanceFallbackCache.putIfAbsent(uuid, startingBalance);
+                return true;
+            }
+            return false;
+        } catch (SQLException e) {
+            LOGGER.error("Failed to ensure account row for {}", uuid, e);
+            return false;
+        }
+    }
 
     @Override
     public TransactionLog getTransactionLog() {

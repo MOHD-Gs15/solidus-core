@@ -916,6 +916,37 @@ public class SQLiteStorage implements StorageBackend {
     }
 
     /**
+     * Creates the account row only when missing (AUDIT FIX 2.2.6, ESC-01).
+     * See {@link StorageBackend#ensureAccount} for the escrow-destruction bug
+     * this replaces. Runs directly on the caller thread during the
+     * initialization window (the executor has no queued traffic yet — the
+     * same contract as {@link #loadAllBalancesIntoCache}); later calls are
+     * still safe because INSERT OR IGNORE is atomic in SQLite.
+     */
+    @Override
+    public boolean ensureAccount(UUID uuid, String playerName, double startingBalance) {
+        ensureInitialized();
+        String sql = """
+            INSERT OR IGNORE INTO player_balances (uuid, player_name, balance, last_updated)
+            VALUES (?, ?, ?, ?)
+        """;
+        try (PreparedStatement ps = persistentConnection.prepareStatement(sql)) {
+            ps.setString(1, uuid.toString());
+            ps.setString(2, TextUtil.sanitizePlayerName(playerName));
+            ps.setDouble(3, startingBalance);
+            ps.setLong(4, System.currentTimeMillis());
+            if (ps.executeUpdate() == 1) {
+                balanceCache.putIfAbsent(uuid, startingBalance);
+                return true;
+            }
+            return false;
+        } catch (SQLException e) {
+            LOGGER.error("Failed to ensure account row for {}", uuid, e);
+            return false;
+        }
+    }
+
+    /**
      * Returns the transaction log instance.
      * Available after initialize() has been called.
      */

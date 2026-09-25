@@ -135,6 +135,30 @@ public interface StorageBackend {
 
     // -- Shared services ------------------------------------
 
+    /**
+     * Creates the account row ONLY when it does not exist yet (create-if-absent),
+     * with the given starting balance. Returns true when this call actually
+     * created the row; false when it already existed (or on failure).
+     *
+     * <p>AUDIT FIX 2.2.6 (ESC-01): the escrow account used to be
+     * "pre-created" through {@link #setBalance} with 0.0 — an unconditional
+     * UPSERT that ZEROED the escrow balance on EVERY server restart,
+     * destroying the escrowed bid money of every open auction the moment the
+     * server booted. Bidders lost their escrowed funds; outbid refunds and
+     * won-auction payouts then failed with INSUFFICIENT_FUNDS while the
+     * winner still received the item. This method makes the pre-creation a
+     * true insert-if-missing with no effect on an existing row.</p>
+     *
+     * <p>Concurrency contract: intended for the initialization window (called
+     * from {@code EconomyEngine.initialize()} before the executor has any
+     * queued traffic); implementations must not corrupt concurrent reads if
+     * invoked later (both flavors use an INSERT ... IGNORE shape, which is
+     * atomic in both SQLite and MySQL/MariaDB).</p>
+     */
+    default boolean ensureAccount(UUID uuid, String playerName, double startingBalance) {
+        return false;
+    }
+
     /** The transaction log / offline-notification service bound to this backend. */
     TransactionLog getTransactionLog();
 

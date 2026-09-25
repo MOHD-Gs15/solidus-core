@@ -210,6 +210,13 @@ public class SellCommand {
                 continue; // Not the target item
             }
 
+            // AUDIT FIX 2.2.6 (M-3): never sell component-bearing stacks
+            // (enchanted / renamed / damaged / container items) at the plain
+            // material price — they are returned to the inventory untouched.
+            if (SellScreenHandler.hasCustomComponents(stack)) {
+                continue;
+            }
+
             // Check if sellable
             ShopManager.ShopItem shopItem = shopManager.findItem(material);
             if (shopItem == null || shopItem.sellPrice() <= 0) {
@@ -235,7 +242,7 @@ public class SellCommand {
             if (!offhand.isEmpty() && !SellScreenHandler.isShulkerBox(offhand)) {
                 String material = getMaterialName(offhand);
                 boolean matchesTarget = targetMaterial == null || material.equalsIgnoreCase(targetMaterial);
-                if (matchesTarget) {
+                if (matchesTarget && !SellScreenHandler.hasCustomComponents(offhand)) {
                     ShopManager.ShopItem shopItem = shopManager.findItem(material);
                     if (shopItem != null && shopItem.sellPrice() > 0) {
                         double value = CurrencyUtil.round(shopItem.sellPrice() * offhand.getCount());
@@ -300,6 +307,14 @@ public class SellCommand {
 
             // Filter by target material if specified
             if (targetMaterial != null && !material.equalsIgnoreCase(targetMaterial)) {
+                allItemsSold = false;
+                continue;
+            }
+
+            // AUDIT FIX 2.2.6 (M-3): refuse component-bearing contents —
+            // selling an enchanted book INSIDE a shulker at base price is the
+            // same value-destruction trap as in the main inventory.
+            if (SellScreenHandler.hasCustomComponents(item)) {
                 allItemsSold = false;
                 continue;
             }

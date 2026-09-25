@@ -569,6 +569,14 @@ public class SellScreenHandler extends AbstractContainerMenu {
         }
 
         // Process all items in the input area (slots 9-53)
+        //
+        // AUDIT FIX 2.2.6 (M-5): the loop below empties slots one by one as it
+        // goes; any unexpected exception mid-loop (registry hiccup, a throwing
+        // hook in a future change) previously propagated out of removed() into
+        // the vanilla close path — every UNprocessed slot was silently
+        // destroyed and the payout never armed. The try/finally now returns
+        // whatever was left in the container, so no placed stack can ever be
+        // lost to an exception.
         double totalEarnings = 0.0;
         int totalItemsSold = 0;
         java.util.List<ItemStack> unsellableItems = new java.util.ArrayList<>();
@@ -577,66 +585,91 @@ public class SellScreenHandler extends AbstractContainerMenu {
         // instead of being silently destroyed.
         java.util.List<ItemStack> soldForCredit = new java.util.ArrayList<>();
 
-        for (int i = 9; i < 54; i++) {
-            ItemStack stack = sellContainer.getItem(i);
-            if (stack.isEmpty()) continue;
+        try {
+            for (int i = 9; i < 54; i++) {
+                ItemStack stack = sellContainer.getItem(i);
+                if (stack.isEmpty()) continue;
 
-            // Check if this is a shulker box
-            if (isShulkerBox(stack)) {
-                // Process shulker box contents
-                ShulkerProcessResult result = processShulkerBox(stack);
-                totalEarnings += result.earnings;
-                totalItemsSold += result.itemsSold;
+                // Check if this is a shulker box
+                if (isShulkerBox(stack)) {
+                    // Process shulker box contents
+                    ShulkerProcessResult result = processShulkerBox(stack);
+                    totalEarnings += result.earnings;
+                    totalItemsSold += result.itemsSold;
 
-                // Audit 2.1.3: snapshot exactly what was consumed - the sold
-                // contents, plus the (emptied) box itself when it was sold too.
-                // Previously shulker payouts were excluded from the failure
-                // restore, silently destroying contents + box on credit failure.
-                if (result.earnings > 0) {
-                    soldForCredit.addAll(result.soldStacks);
-                }
+                    // Audit 2.1.3: snapshot exactly what was consumed - the sold
+                    // contents, plus the (emptied) box itself when it was sold too.
+                    // Previously shulker payouts were excluded from the failure
+                    // restore, silently destroying contents + box on credit failure.
+                    if (result.earnings > 0) {
+                        soldForCredit.addAll(result.soldStacks);
+                    }
 
-                if (result.hasRemainingItems()) {
-                    // Shulker box still has unsellable items - return it
-                    unsellableItems.add(result.updatedShulkerBox);
-                } else if (result.earnings > 0) {
-                    // All items in the shulker were sold
-                    // The shulker box itself might be sellable too
-                    ShopManager.ShopItem shulkerShopItem = shopManager.findItem(getMaterialName(stack));
-                    if (shulkerShopItem != null && shulkerShopItem.sellPrice() > 0) {
-                        totalEarnings += shulkerShopItem.sellPrice();
-                        totalItemsSold += 1;
-                        // The emptied box is consumed - snapshot it for restore.
-                        soldForCredit.add(result.updatedShulkerBox.copy());
+                    if (result.hasRemainingItems()) {
+                        // Shulker box still has unsellable items - return it
+                        unsellableItems.add(result.updatedShulkerBox);
+                    } else if (result.earnings > 0) {
+                        // All items in the shulker were sold
+                        // The shulker box itself might be sellable too
+                        ShopManager.ShopItem shulkerShopItem = shopManager.findItem(getMaterialName(stack));
+                        if (shulkerShopItem != null && shulkerShopItem.sellPrice() > 0) {
+                            totalEarnings += shulkerShopItem.sellPrice();
+                            totalItemsSold += 1;
+                            // The emptied box is consumed - snapshot it for restore.
+                            soldForCredit.add(result.updatedShulkerBox.copy());
+                        } else {
+                            // Return empty shulker box
+                            ItemStack emptyShulker = stack.copy();
+                            emptyShulker.set(DataComponents.CONTAINER, ItemContainerContents.EMPTY);
+                            unsellableItems.add(emptyShulker);
+                        }
                     } else {
-                        // Return empty shulker box
-                        ItemStack emptyShulker = stack.copy();
-                        emptyShulker.set(DataComponents.CONTAINER, ItemContainerContents.EMPTY);
-                        unsellableItems.add(emptyShulker);
+                        // No items were sold from this shulker - return as-is
+                        unsellableItems.add(result.updatedShulkerBox);
                     }
                 } else {
-                    // No items were sold from this shulker - return as-is
-                    unsellableItems.add(result.updatedShulkerBox);
-                }
-            } else {
-                // Regular item - check if sellable
-                String material = getMaterialName(stack);
-                ShopManager.ShopItem shopItem = shopManager.findItem(material);
+                    // Regular item - check if sellable
+                    //
+                    // AUDIT FIX 2.2.6 (M-3): value-protection guard. Matching by
+                    // material only meant an enchanted / renamed / damaged /
+                    // component-bearing stack sold at the PLAIN material price —
+                    // a Sharpness V sword sold as scrap, a stuffed bundle sold
+                    // as an empty one. Component-bearing stacks are now returned
+                    // untouched with a clear message; the auction house is the
+                    // intended channel for anything with custom data.
+                    if (hasCustomComponents(stack)) {
+                        unsellableItems.add(stack.copy());
+                        continue;
+                    }
 
-                if (shopItem != null && shopItem.sellPrice() > 0) {
-                    // Sell the entire stack
-                    double value = CurrencyUtil.round(shopItem.sellPrice() * stack.getCount());
-                    totalEarnings += value;
-                    totalItemsSold += stack.getCount();
-                    // Recovery snapshot - see the balance-failure handler below.
-                    soldForCredit.add(stack.copy());
-                } else {
-                    // Not sellable - return to player
-                    unsellableItems.add(stack.copy());
+                    String material = getMaterialName(stack);
+                    ShopManager.ShopItem shopItem = shopManager.findItem(material);
+
+                    if (shopItem != null && shopItem.sellPrice() > 0) {
+                        // Sell the entire stack
+                        double value = CurrencyUtil.round(shopItem.sellPrice() * stack.getCount());
+                        totalEarnings += value;
+                        totalItemsSold += stack.getCount();
+                        // Recovery snapshot - see the balance-failure handler below.
+                        soldForCredit.add(stack.copy());
+                    } else {
+                        // Not sellable - return to player
+                        unsellableItems.add(stack.copy());
+                    }
+                }
+
+                sellContainer.setItem(i, ItemStack.EMPTY);
+            }
+        } finally {
+            // Exception safety (M-5): return everything still sitting in the
+            // container so no placed stack can be destroyed by a mid-loop throw.
+            for (int i = 9; i < 54; i++) {
+                ItemStack leftover = sellContainer.getItem(i);
+                if (!leftover.isEmpty()) {
+                    returnItemToPlayer(leftover);
+                    sellContainer.setItem(i, ItemStack.EMPTY);
                 }
             }
-
-            sellContainer.setItem(i, ItemStack.EMPTY);
         }
 
         // Return unsellable items to the player's inventory
@@ -718,16 +751,39 @@ public class SellScreenHandler extends AbstractContainerMenu {
         } else if (unsellableItems.isEmpty()) {
             // No items were placed in the GUI
             this.player.sendSystemMessage(TextUtil.styled("No items to sell.", ChatFormatting.GRAY));
-        } else {
-            // Some items couldn't be sold
+        } else if (!unsellableItems.isEmpty()) {
+            // Some items couldn't be sold (including component-bearing stacks
+            // refused by the M-3 guard).
             this.player.sendSystemMessage(TextUtil.warning(
-                "None of the placed items could be sold. They have been returned to your inventory."));
+                "Some items could not be sold (custom items like enchanted or renamed gear must be auctioned) "
+                    + "- they have been returned to your inventory."));
         }
 
         super.removed(player);
     }
 
     // -- Shulker Box Processing ------------------------------
+
+    /**
+     * True when the stack carries ANY non-default data components —
+     * enchantments, custom name, damage, container contents, custom model
+     * data (AUDIT FIX 2.2.6, M-3). Such stacks must not be sold at the plain
+     * material price: they are either worth more (value-destruction trap for
+     * the player) or hold contents that would be destroyed (stuffed bundles).
+     * Public/static so the /sell command and the shop sell path share ONE
+     * policy.
+     */
+    public static boolean hasCustomComponents(ItemStack stack) {
+        if (stack == null || stack.isEmpty()) return false;
+        try {
+            net.minecraft.core.component.DataComponentPatch patch = stack.getComponentsPatch();
+            return patch != null && !patch.isEmpty();
+        } catch (Exception e) {
+            // API drift safety: treat an unanswerable stack as custom (refuse
+            // to sell) — the conservative direction for player value.
+            return true;
+        }
+    }
 
     /**
      * Result of processing a shulker box's contents.
