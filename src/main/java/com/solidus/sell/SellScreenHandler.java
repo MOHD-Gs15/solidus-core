@@ -70,6 +70,11 @@ public class SellScreenHandler extends AbstractContainerMenu {
      * Opens a new sell screen for the player.
      */
     public static void openScreen(ServerPlayer player, List<GuiSlot> uiSlots, ShopManager shopManager) {
+        // Compat gate (audit W-3): never open a virtual menu whose click
+        // routing cannot be trusted on this Minecraft version.
+        if (!com.solidus.compat.Compat.ensureGuiAvailable(player)) {
+            return;
+        }
         player.openMenu(new net.minecraft.world.MenuProvider() {
             @Override
             public Component getDisplayName() {
@@ -166,8 +171,22 @@ public class SellScreenHandler extends AbstractContainerMenu {
      * - Click outside (slot -999): Drop cursor item
      */
     @Override
-    // TODO: 26.1.x - ClickType -> ContainerInput; button param may be removed (absorbed into ContainerInput)
     public void clicked(int slotIndex, int button, ContainerInput containerInput, Player player) {
+        // 2.3.0: normalize the version-specific input through the compat
+        // seam and run the shared Solidus pipeline (see the ContainerInput
+        // mapping in com.solidus.compat.impl_26_1 — the TODOs below are
+        // resolved there, verified at compile time against the 26.1.x jar).
+        handleSolidusClick(com.solidus.compat.Compat.describe(slotIndex, button, containerInput), player);
+    }
+
+    /**
+     * Solidus's own click pipeline — version-free entry point used by both
+     * the container-click mixin route (via PacketHandler) and the vanilla
+     * clicked() override above.
+     */
+    public void handleSolidusClick(com.solidus.compat.ClickDescriptor click, Player player) {
+        int slotIndex = click.slotIndex();
+        int button = click.button();
         // Defensive: only the player who owns this handler may interact.
         // Today the only reachable caller (PacketHandler) routes each click
         // through the clicking player's own menu, but this invariant must not
@@ -208,7 +227,7 @@ public class SellScreenHandler extends AbstractContainerMenu {
 
         // Handle input area slots (9-53)
         if (slotIndex >= 9 && slotIndex < 54) {
-            handleInputSlotClick(slotIndex, button, containerInput);
+            handleInputSlotClick(slotIndex, click);
             syncCursorToClient();
             return;
         }
@@ -220,7 +239,7 @@ public class SellScreenHandler extends AbstractContainerMenu {
         // uncaught IndexOutOfBoundsException through the mixin - kicking the
         // sender. Hard upper bound, mirroring ShopScreenHandler.
         if (slotIndex >= 54 && slotIndex < this.slots.size()) {
-            handleInventorySlotClick(slotIndex, button, containerInput);
+            handleInventorySlotClick(slotIndex, click);
             syncCursorToClient();
             return;
         }
@@ -229,16 +248,15 @@ public class SellScreenHandler extends AbstractContainerMenu {
     /**
      * Handles clicks on input area slots (9-53).
      */
-    private void handleInputSlotClick(int slotIndex, int button, ContainerInput containerInput) {
+    private void handleInputSlotClick(int slotIndex, com.solidus.compat.ClickDescriptor click) {
+        int button = click.button();
         Slot slot = this.slots.get(slotIndex);
         ItemStack slotStack = slot.getItem();
         ItemStack cursor = getCarried();
 
-        // TODO: 26.1.x - ContainerInput replaces ClickType. The old ClickType.QUICK_MOVE
-        //  likely corresponds to ContainerInput.QUICK_MOVE or a similar shift-click variant.
-        //  The old ClickType.PICKUP + button=0 (left) / button=1 (right) likely maps to
-        //  ContainerInput.PICKUP (or LEFT_CLICK/RIGHT_CLICK). Verify at compile time.
-        if (containerInput == ContainerInput.QUICK_MOVE) {
+        // Click semantics are normalized by the compat resolver (see
+        // com.solidus.compat.impl_26_1 for the 26.1.x ContainerInput mapping).
+        if (click.isQuickMove()) {
             // Shift-click: move item from input area back to player inventory
             if (!slotStack.isEmpty()) {
                 ItemStack toMove = slotStack.copy();
@@ -248,8 +266,7 @@ public class SellScreenHandler extends AbstractContainerMenu {
             return;
         }
 
-        // TODO: 26.1.x - ClickType.PICKUP -> ContainerInput.PICKUP (verify at compile time)
-        if (containerInput == ContainerInput.PICKUP) {
+        if (click.isPickup()) {
             if (button == 0) {
                 // Left click
                 if (cursor.isEmpty()) {
@@ -316,13 +333,13 @@ public class SellScreenHandler extends AbstractContainerMenu {
     /**
      * Handles clicks on player inventory slots (54+).
      */
-    private void handleInventorySlotClick(int slotIndex, int button, ContainerInput containerInput) {
+    private void handleInventorySlotClick(int slotIndex, com.solidus.compat.ClickDescriptor click) {
+        int button = click.button();
         Slot slot = this.slots.get(slotIndex);
         ItemStack slotStack = slot.getItem();
         ItemStack cursor = getCarried();
 
-        // TODO: 26.1.x - ContainerInput replaces ClickType. Verify QUICK_MOVE constant name.
-        if (containerInput == ContainerInput.QUICK_MOVE) {
+        if (click.isQuickMove()) {
             // Shift-click: move item from player inventory to input area
             if (!slotStack.isEmpty()) {
                 ItemStack remaining = moveItemToInputArea(slotStack);
@@ -335,8 +352,7 @@ public class SellScreenHandler extends AbstractContainerMenu {
             return;
         }
 
-        // TODO: 26.1.x - ClickType.PICKUP -> ContainerInput.PICKUP (verify at compile time)
-        if (containerInput == ContainerInput.PICKUP) {
+        if (click.isPickup()) {
             if (button == 0) {
                 // Left click
                 if (cursor.isEmpty()) {

@@ -1,0 +1,69 @@
+plugins {
+    id 'java-library'
+}
+
+// ----------------------------------------------------------
+// solidus-api — the stable, version-pinned contract jar.
+//
+// Purpose (audit W-5 fix): companion mods used to reach into
+// Solidus Core INTERNALS (EconomyEngine, SQLiteStorage) via
+// MethodHandles, with no loader-enforced dependency — a Core
+// refactor silently disabled Governance limits/taxes/freezes
+// while the server owner believed enforcement was active.
+//
+// This subproject is the fix: a tiny, Minecraft-free jar that
+// contains ONLY stable interfaces and value records. Companions
+// compile against it (compileOnly) and declare
+//   "depends": { "solidus": ">=2.3.0 <3.0.0" }
+// in their fabric.mod.json so Fabric's loader — not reflection —
+// decides whether the family combination is valid.
+//
+// Rules for this module (breaking any of these breaks the family):
+//   1. ZERO Minecraft imports. Zero third-party imports.
+//      java.base + slf4j only. This jar must be usable to compile
+//      ANY companion without a loom/Minecraft setup.
+//   2. The public surface changes ONLY on a core family bump
+//      (2.3.x -> 2.4.0), never in a patch release.
+//   3. Methods are never removed or re-typed — only deprecated
+//      and re-added beside a replacement, for at least one
+//      family cycle.
+//   4. Package stays "com.solidus.api" — the historic package of
+//      SolidusTransactionHook — so reflective 2.1.x-era companions
+//      keep finding the classes after the move from core's jar to
+//      this nested jar (same FQN, same shapes).
+// ----------------------------------------------------------
+
+import org.gradle.jvm.toolchain.JavaLanguageVersion
+
+java {
+    toolchain {
+        languageVersion = JavaLanguageVersion.of(25)
+        vendor = org.gradle.jvm.toolchain.JvmVendorSpec.ADOPTIUM
+    }
+    sourceCompatibility = JavaVersion.VERSION_25
+    targetCompatibility = JavaVersion.VERSION_25
+}
+
+// Tracks the core version so "which core ships which api" is
+// answered by the artifact coordinates alone.
+version = project.mod_version
+group = project.maven_group
+
+base {
+    archivesName = 'solidus-api'
+}
+
+tasks.withType(JavaCompile).configureEach {
+    options.encoding = "UTF-8"
+    options.release = 25
+}
+
+jar {
+    manifest {
+        attributes([
+            "Implementation-Title": "solidus-api",
+            "Implementation-Version": project.version,
+            "Solidus-Family-Contract": "2.3"
+        ])
+    }
+}

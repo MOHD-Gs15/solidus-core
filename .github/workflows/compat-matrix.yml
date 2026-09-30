@@ -1,0 +1,117 @@
+# ─────────────────────────────────────────────────────────────
+# Compatibility probe (audit W-3 / audit recommendation P0-3)
+#
+# Answers ONE question before players hit it: "does Solidus still
+# compile against the Minecraft versions it claims to support?"
+#
+# Matrix:
+#   - The pinned release version (26.1.2) is REQUIRED to pass
+#     (continue-on-error: false — same contract as test.yml).
+#   - Future/unreleased targets (26.2, 26.3, ...) are PROBES:
+#     failures are reported but do not block the release. The
+#     goal is early signal of exactly which internals churned,
+#     so the update checklist (compat/PACKAGE.md) starts from a
+#     failing diff instead of a player's crash report.
+#
+# Fabric API version is resolved dynamically from the Fabric
+# maven metadata (latest build for the target MC version) so the
+# matrix never goes stale.
+# ─────────────────────────────────────────────────────────────
+name: compat-matrix
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      mc-versions:
+        description: 'Comma-separated Minecraft versions to probe (overrides the default matrix)'
+        required: false
+        default: ''
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    name: MC ${{ matrix.mc }} compatibility probe
+    runs-on: ubuntu-latest
+    continue-on-error: ${{ matrix.required == 'false' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # The pinned, contractually-supported release target.
+          - mc: "26.1.2"
+            fabric_api: "0.155.2+26.1.2"
+            mc_dep: "~26.1.2"
+            required: "true"
+          # Forward probes: informative only. Extend this list as new
+          # Minecraft versions are announced — nothing else changes.
+          - mc: "26.2"
+            fabric_api: "resolve"
+            mc_dep: "~26.2"
+            required: "false"
+          - mc: "26.3"
+            fabric_api: "resolve"
+            mc_dep: "~26.3"
+            required: "false"
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0 (SA2-027)
+
+      - name: Set up JDK 25
+        uses: actions/setup-java@cf277c60eb25467037889841efdb72551f06f6c3 # v4.9.1 (SA2-027)
+        with:
+          distribution: temurin
+          java-version: 25
+
+      - name: Resolve latest Fabric API for MC ${{ matrix.mc }}
+        if: matrix.fabric_api == 'resolve'
+        run: |
+          set -euo pipefail
+          echo "Fetching Fabric maven metadata..."
+          METADATA=$(curl -fsSL "https://maven.fabricmc.net/net/fabricmc/fabric-api/fabric-api/maven-metadata.xml")
+          # Fabric API builds carry the MC version in the artifact string
+          # (e.g. 0.155.2+26.1.2). Pick the highest build for the target MC.
+          LATEST=$(printf '%s' "$METADATA" \
+            | grep -o '<version>[^<]*+${{ matrix.mc }}[^<]*</version>' \
+            | sed 's/<[^>]*>//g' \
+            | sort -V \
+            | tail -n 1 || true)
+          if [ -z "$LATEST" ]; then
+            echo "::warning::No Fabric API build found for MC ${{ matrix.mc }} yet — this probe cannot compile. If the MC version exists, publish or pin the fabric_api_version manually."
+            exit 1
+          fi
+          echo "Resolved Fabric API: $LATEST"
+          echo "RESOLVED_FABRIC_API=$LATEST" >> "$GITHUB_ENV"
+
+      - name: Determine Fabric API version
+        id: fabapi
+        run: |
+          if [ "${{ matrix.fabric_api }}" = "resolve" ]; then
+            echo "version=$RESOLVED_FABRIC_API" >> "$GITHUB_OUTPUT"
+          else
+            echo "version=${{ matrix.fabric_api }}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Compile against MC ${{ matrix.mc }}
+        run: |
+          set -euo pipefail
+          echo "Probing: MC ${{ matrix.mc }} / Fabric API ${{ steps.fabapi.outputs.version }} / dep ${{ matrix.mc_dep }}"
+          ./gradlew compileJava compileTestJava --console=plain --no-daemon \
+            -Pminecraft_version=${{ matrix.mc }} \
+            -Pfabric_api_version=${{ steps.fabapi.outputs.version }} \
+            -Pminecraft_dep=${{ matrix.mc_dep }}
+
+      - name: Report probe outcome
+        if: always()
+        run: |
+          if [ "${{ matrix.required }}" = "true" ]; then
+            echo "### ✅ Pinned target MC ${{ matrix.mc }}: required build PASSED" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "### ℹ️ Forward probe MC ${{ matrix.mc }}: $( [ '${{ job.status }}' = 'success' ] && echo 'COMPILES — candidate for support' || echo 'BROKEN — see compat/PACKAGE.md checklist' )" >> "$GITHUB_STEP_SUMMARY"
+          fi

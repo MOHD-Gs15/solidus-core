@@ -93,6 +93,11 @@ public class TradeScreenHandler extends AbstractContainerMenu {
     /** Opens the trade window for one side of the session. */
     public static void openFor(ServerPlayer viewer, TradeManager tradeManager,
                                 TradeSession session, TradeSession.Side side) {
+        // Compat gate (audit W-3): never open a virtual menu whose click
+        // routing cannot be trusted on this Minecraft version.
+        if (!com.solidus.compat.Compat.ensureGuiAvailable(viewer)) {
+            return;
+        }
         viewer.openMenu(new net.minecraft.world.MenuProvider() {
             @Override
             public Component getDisplayName() {
@@ -112,6 +117,18 @@ public class TradeScreenHandler extends AbstractContainerMenu {
 
     @Override
     public void clicked(int slotIndex, int button, ContainerInput containerInput, Player player) {
+        // 2.3.0: normalize the version-specific input through the compat
+        // seam and run the shared Solidus pipeline.
+        handleSolidusClick(com.solidus.compat.Compat.describe(slotIndex, button, containerInput), player);
+    }
+
+    /**
+     * Solidus's own click pipeline — version-free entry point used by both
+     * the container-click mixin route (via PacketHandler) and the vanilla
+     * clicked() override above.
+     */
+    public void handleSolidusClick(com.solidus.compat.ClickDescriptor click, Player player) {
+        int slotIndex = click.slotIndex();
         // Defensive: only the player who owns this handler may interact.
         if (player != this.player) {
             SolidusMod.LOGGER.warn("Rejected click on trade GUI of {} from a different actor.",
@@ -136,7 +153,7 @@ public class TradeScreenHandler extends AbstractContainerMenu {
 
         // Player inventory (54+)
         if (slotIndex >= 54 && slotIndex < this.slots.size()) {
-            handleInventorySlotClick(slotIndex, button, containerInput);
+            handleInventorySlotClick(slotIndex, click);
             refreshStatusDisplays();
             syncCursorToClient();
             return;
@@ -152,7 +169,7 @@ public class TradeScreenHandler extends AbstractContainerMenu {
 
         // MY offer slots: real item movement.
         if (isMyOfferSlot(slotIndex)) {
-            handleMyOfferSlotClick(slotIndex, button, containerInput);
+            handleMyOfferSlotClick(slotIndex, click);
             onMyOfferChanged();
             return;
         }
@@ -202,12 +219,13 @@ public class TradeScreenHandler extends AbstractContainerMenu {
 
     // -- Offer movement (SellScreenHandler pattern) --------
 
-    private void handleMyOfferSlotClick(int slotIndex, int button, ContainerInput containerInput) {
+    private void handleMyOfferSlotClick(int slotIndex, com.solidus.compat.ClickDescriptor click) {
+        int button = click.button();
         Slot slot = this.slots.get(slotIndex);
         ItemStack slotStack = slot.getItem();
         ItemStack cursor = getCarried();
 
-        if (containerInput == ContainerInput.QUICK_MOVE) {
+        if (click.isQuickMove()) {
             // Shift-click: move item out of the offer back to the inventory.
             if (!slotStack.isEmpty()) {
                 ItemStack toMove = slotStack.copy();
@@ -220,7 +238,7 @@ public class TradeScreenHandler extends AbstractContainerMenu {
             return;
         }
 
-        if (containerInput == ContainerInput.PICKUP) {
+        if (click.isPickup()) {
             if (button == 0) {
                 // Left click
                 if (cursor.isEmpty()) {
@@ -277,12 +295,13 @@ public class TradeScreenHandler extends AbstractContainerMenu {
         }
     }
 
-    private void handleInventorySlotClick(int slotIndex, int button, ContainerInput containerInput) {
+    private void handleInventorySlotClick(int slotIndex, com.solidus.compat.ClickDescriptor click) {
+        int button = click.button();
         Slot slot = this.slots.get(slotIndex);
         ItemStack slotStack = slot.getItem();
         ItemStack cursor = getCarried();
 
-        if (containerInput == ContainerInput.QUICK_MOVE) {
+        if (click.isQuickMove()) {
             // Shift-click: move from inventory into my offer area.
             if (!slotStack.isEmpty()) {
                 ItemStack remaining = moveToMyOffer(slotStack);
@@ -296,7 +315,7 @@ public class TradeScreenHandler extends AbstractContainerMenu {
             return;
         }
 
-        if (containerInput == ContainerInput.PICKUP) {
+        if (click.isPickup()) {
             if (button == 0) {
                 if (cursor.isEmpty()) {
                     if (!slotStack.isEmpty()) {

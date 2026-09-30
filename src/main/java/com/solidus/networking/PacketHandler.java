@@ -1,6 +1,7 @@
 package com.solidus.networking;
 
 import com.solidus.SolidusMod;
+import com.solidus.compat.ClickDescriptor;
 import com.solidus.shop.ShopScreenHandler;
 import com.solidus.sell.SellScreenHandler;
 import com.solidus.auction.AuctionScreenHandler;
@@ -116,8 +117,13 @@ public class PacketHandler {
     }
 
     /**
-     * Processes an incoming container click packet.
-     * Called by the ServerPlayerEntityMixin when a click packet is received.
+     * Processes one container click for a player with a Solidus GUI open.
+     * Called (indirectly) by the ContainerClickMixin via the compat bridge.
+     *
+     * 2.3.0: the signature is version-free — the raw Minecraft click-input
+     * type has been normalized into {@link ClickDescriptor} inside the
+     * compat package, so this class no longer references any
+     * Minecraft-internal click type (audit W-3: churn isolation).
      *
      * This method acts as the gateway between raw network packets and the
      * high-level ScreenHandler click processing. It routes the click to the
@@ -126,16 +132,13 @@ public class PacketHandler {
      * throttled broadcast (at most one per {@link #DROP_RESYNC_INTERVAL_MS})
      * for clicks dropped by the rate limiter.
      *
-     * @param player    The player who clicked
-     * @param slotIndex The slot index that was clicked
-     * @param button    The button used (0=left, 1=right)
-     * @param containerInput The container input (replaces ClickType in 26.1.x)
+     * @param player The player who clicked
+     * @param click   The normalized click (slot, button, input semantics)
      * @return true if the click was consumed by Solidus (processed or dropped
      *         by the rate limiter) and vanilla handling must be cancelled,
      *         false if it should be passed through to vanilla handling
      */
-    public boolean handleContainerClick(ServerPlayer player, int slotIndex,
-                                          int button, net.minecraft.world.inventory.ContainerInput containerInput) {
+    public boolean handleContainerClick(ServerPlayer player, ClickDescriptor click) {
         // SCOPE CHECK FIRST (audit 2.1.3): only Solidus virtual menus are
         // rate-limited. Vanilla containers (chests, inventories, crafting
         // tables) must pass through untouched - consuming their clicks broke
@@ -152,7 +155,7 @@ public class PacketHandler {
                 return true; // Consume the packet - don't pass to vanilla
             }
             // Route to shop click handler
-            shopHandler.clicked(slotIndex, button, containerInput, player);
+            shopHandler.handleSolidusClick(click, player);
             fullResync(player);
             return true;
         }
@@ -166,7 +169,7 @@ public class PacketHandler {
             }
             // Route to sell click handler - all clicks are handled manually
             // because the sell GUI allows item placement
-            sellHandler.clicked(slotIndex, button, containerInput, player);
+            sellHandler.handleSolidusClick(click, player);
             fullResync(player);
             return true;
         }
@@ -179,7 +182,7 @@ public class PacketHandler {
                 return true; // Consume the packet - don't pass to vanilla
             }
             // Route to auction click handler
-            auctionHandler.clicked(slotIndex, button, containerInput, player);
+            auctionHandler.handleSolidusClick(click, player);
             fullResync(player);
             return true;
         }
@@ -193,7 +196,7 @@ public class PacketHandler {
             }
             // Route to trade click handler - clicks are handled manually (the
             // trade window allows real item movement like the sell GUI).
-            tradeHandler.clicked(slotIndex, button, containerInput, player);
+            tradeHandler.handleSolidusClick(click, player);
             fullResync(player);
             return true;
         }

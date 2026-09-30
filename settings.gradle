@@ -17,3 +17,7 @@ plugins {
 }
 
 rootProject.name = 'solidus'
+
+// solidus-api: the stable, Minecraft-free contract jar companions compile
+// against (audit W-5). Nested into the core mod jar via `include`.
+include 'solidus-api'

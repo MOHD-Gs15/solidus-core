@@ -43,7 +43,16 @@ import java.util.UUID;
  * If a hook throws from any method, the exception is logged and the hook is
  * skipped for that call. A throwing veto hook can never wedge the economy.
  *
- * <h3>Registration (reflection-based, zero compile dependency):</h3>
+ * <h3>Registration (2.3.0+ — direct, no reflection):</h3>
+ * <pre>{@code
+ * SolidusApi api = SolidusApiAccess.get();
+ * if (api != null) {
+ *     api.registerTransactionHook(new MyEnforcementHook());
+ * }
+ * }</pre>
+ *
+ * <p>Legacy reflective registration (2.1.x-era companions - still
+ * supported through Core's compatibility shim):</p>
  * <pre>{@code
  * Class<?> hookItf = Class.forName("com.solidus.api.SolidusTransactionHook");
  * Object proxy = Proxy.newProxyInstance(hookItf.getClassLoader(),

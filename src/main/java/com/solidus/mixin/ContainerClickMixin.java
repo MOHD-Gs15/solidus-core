@@ -1,11 +1,9 @@
 package com.solidus.mixin;
 
-import com.solidus.SolidusMod;
-import com.solidus.networking.PacketHandler;
+import com.solidus.compat.Compat;
 
 import net.minecraft.server.level.ServerPlayer;
 import net.minecraft.server.network.ServerGamePacketListenerImpl;
-import net.minecraft.world.inventory.ContainerInput;
 
 import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.Shadow;
@@ -14,13 +12,16 @@ import org.spongepowered.asm.mixin.injection.Inject;
 import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
 
 /**
- * ServerPlayerEntity Mixin - Hooks into the player's network connection
- * to intercept container click packets for virtual GUI processing.
+ * ContainerClickMixin — hooks the server-side packet listener to intercept
+ * container click packets for virtual GUI processing.
  *
- * This mixin intercepts the handleContainerClick method on the server-side
- * packet listener. When a player clicks in any container, we check if it's
- * a Solidus virtual GUI (Shop or Auction) and route the click through our
- * custom handling pipeline with rate limiting.
+ * <p>(Renamed from ServerPlayerEntityMixin in 2.3.0 — the target is the
+ * packet listener, not the player.)</p>
+ *
+ * This mixin intercepts the handleContainerClick method. When a player
+ * clicks in any container, we check if it's a Solidus virtual GUI (Shop,
+ * Sell, Auction, Trade) and route the click through our custom handling
+ * pipeline with rate limiting.
  *
  * Defense-in-Depth Strategy:
  * - Primary defense: ShopScreenHandler and AuctionScreenHandler override
@@ -30,6 +31,31 @@ import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
  * - The abstract quickMoveStack is NOT targeted here (it cannot be injected
  *   into since it has no method body). Instead, the concrete overrides in
  *   our ScreenHandlers provide the protection.
+ *
+ * ─────────────────────────────────────────────────────────────────────
+ * UPDATE RESILIENCE (audit W-3 fix, family 2.3.0):
+ *
+ *   This injector declares require = 0. When a future Minecraft version
+ *   changes the shape of handleContainerClick (as 26.1.x already did when
+ *   ClickType+buttonNum became the ContainerInput record), the injection
+ *   logs a WARNING and is skipped — the server still boots.
+ *
+ *   The safety net is layered:
+ *   1. com.solidus.compat.CompatProbes reflectively verifies every
+ *      Minecraft shape this pipeline compiled against at startup, and
+ *      com.solidus.compat.CompatState turns the report into capability
+ *      flags.
+ *   2. When a probe fails, ALL virtual GUI open paths are blocked with a
+ *      clear message (Compat.ensureGuiAvailable) — commands, storage, the
+ *      ledger and companion enforcement keep working.
+ *   3. Compat.routeContainerClick passes clicks through to vanilla when
+ *      the compat surface is not fully verified, so a half-applied state
+ *      can never leave a Solidus menu open with un-routed clicks.
+ *
+ *   Every version-specific detail (packet accessors, ContainerInput) lives
+ *   in com.solidus.compat.impl_26_1 — see compat/PACKAGE.md for the
+ *   Minecraft-update checklist.
+ * ─────────────────────────────────────────────────────────────────────
  *
  * Ghost Item Prevention:
  * When the mixin cancels a container click packet on the server side, the
@@ -54,7 +80,7 @@ import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
  * sends the complete state, which is exactly what a rejected click needs.
  */
 @Mixin(ServerGamePacketListenerImpl.class)
-public abstract class ServerPlayerEntityMixin {
+public abstract class ContainerClickMixin {
 
     @Shadow
     public ServerPlayer player;
@@ -69,53 +95,15 @@ public abstract class ServerPlayerEntityMixin {
      * If the player is using a normal vanilla container, the click is
      * passed through unchanged.
      *
-     * CRITICAL: After canceling a packet, we MUST call broadcastChanges()
-     * to force the client to resync with the server's container state.
-     * Without this, ghost items appear due to the client-server state
-     * mismatch caused by network latency.
-     *
-     * Accessor Compatibility Note:
-     * ServerboundContainerClickPacket is a Record class in Minecraft 26.1.x,
-     * using record-style accessors (slotNum(), containerInput() - no get prefix).
-     *
-     * In 26.1.x, ServerboundContainerClickPacket uses ContainerInput
-     * instead of ClickType + separate buttonNum(). The button info is
-     * partially absorbed into the ContainerInput, but buttonNum() still
-     * carries the physical button (0 = left, 1 = right) - verified against
-     * the 26.1.2 mapped jar via javap.
+     * require = 0: a missing/reshaped target method on a newer Minecraft
+     * logs a warning instead of crashing the server (see class javadoc).
      */
-    @Inject(method = "handleContainerClick", at = @At("HEAD"), cancellable = true)
+    @Inject(method = "handleContainerClick", at = @At("HEAD"), cancellable = true, require = 0)
     private void onContainerClick(
         net.minecraft.network.protocol.game.ServerboundContainerClickPacket packet,
         CallbackInfo ci) {
 
-        PacketHandler packetHandler = SolidusMod.getPacketHandler();
-        if (packetHandler == null) return;
-
-        // Defense-in-depth (audit 2.1.3): vanilla's handleContainerClick
-        // validates the packet's containerId against the open menu BEFORE
-        // acting. Running at HEAD bypassed that guard, letting a stale
-        // containerId click land on whatever Solidus menu is currently open.
-        // Restore the check here so routing is strictly desync-safe.
-        if (player.containerMenu == null
-            || packet.containerId() != player.containerMenu.containerId) {
-            return;
-        }
-
-        // Extract click data from the packet (accessors verified via javap
-        // against the 26.1.2 mojmap-mapped jar)
-        int slotIndex = packet.slotNum();
-        int button = packet.buttonNum();
-        ContainerInput containerInput = packet.containerInput();
-
-        // Check if this is a Solidus GUI click. PacketHandler now owns the
-        // full resync policy: a broadcastFullState() after every PROCESSED
-        // Solidus click (anti-ghost guarantee, PR#13) and a THROTTLED
-        // broadcast (max 1 per 200ms) for clicks dropped by the rate
-        // limiter, so a flooded packet stream cannot amplify into a stream
-        // of multi-KB container resyncs.
-        boolean handled = packetHandler.handleContainerClick(
-            player, slotIndex, button, containerInput);
+        boolean handled = Compat.routeContainerClick(player, packet);
 
         if (handled) {
             // Cancel vanilla processing - the click has been handled (or

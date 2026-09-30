@@ -2,8 +2,9 @@
   "required": true,
   "package": "com.solidus.mixin",
   "compatibilityLevel": "JAVA_25",
+  "plugin": "com.solidus.compat.SolidusMixinPlugin",
   "server": [
-    "ServerPlayerEntityMixin"
+    "ContainerClickMixin"
   ],
   "injectors": {
     "defaultRequire": 1

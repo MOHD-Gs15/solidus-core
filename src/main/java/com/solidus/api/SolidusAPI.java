@@ -4,6 +4,7 @@ import com.solidus.SolidusMod;
 import com.solidus.economy.BalanceManager;
 import com.solidus.economy.EconomyEngine;
 import com.solidus.economy.SQLiteStorage;
+import com.solidus.economy.StorageBackend;
 import com.solidus.economy.TransactionLog;
 
 import net.minecraft.server.level.ServerPlayer;
@@ -13,50 +14,49 @@ import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 
 /**
- * SolidusAPI - Stable public API for inter-mod integration.
+ * SolidusAPI — the <b>legacy reflective facade</b>, kept binary-compatible
+ * for companion mods built before family 2.3.0.
  *
- * <p>This is the <b>only</b> class that external mods should depend on.
- * Internal classes ({@code EconomyEngine}, {@code BalanceManager}, etc.)
- * may change between versions without notice, but the methods defined
- * here are guaranteed to remain stable across minor and patch releases.</p>
+ * <p>As of family 2.3.0 (audit W-5 fix) the compile-time contract lives in
+ * the separate <b>solidus-api</b> artifact ({@link SolidusApi} +
+ * {@link SolidusApiAccess}), and this class implements and installs it.
+ * New companion code MUST compile against {@code solidus-api}:</p>
  *
- * <h3>Usage from another mod (reflection-based, no compile dependency):</h3>
  * <pre>{@code
- * // 1. Check if Solidus is loaded
- * boolean hasSolidus = FabricLoader.getInstance().isModLoaded("solidus");
- * if (!hasSolidus) return;
- *
- * // 2. Get the API instance via reflection
- * Class<?> apiClass = Class.forName("com.solidus.api.SolidusAPI");
- * Method getInstance = apiClass.getMethod("getInstance");
- * Object api = getInstance.invoke(null);
- *
- * // 3. Call methods via reflection
- * Method getBalance = apiClass.getMethod("getBalance", ServerPlayer.class);
- * CompletableFuture<Double> balance = (CompletableFuture<Double>) getBalance.invoke(api, player);
+ * SolidusApi api = SolidusApiAccess.get();
+ * api.getBalance(uuid, name).thenAccept(...);
  * }</pre>
  *
- * <h3>Usage from another mod (with compile dependency):</h3>
- * <pre>{@code
- * SolidusAPI api = SolidusAPI.getInstance();
- * if (api == null) return; // Solidus not loaded
+ * <h3>Why this class still exists</h3>
+ * <p>Governance 2.1.x, Enforcer 2.1.x and Analytics 2.1.x reach Core only
+ * through {@code Class.forName("com.solidus.api.SolidusAPI")} and reflective
+ * method invocation. Removing or re-typing those methods would silently push
+ * them into standalone mode — the exact failure this API exists to prevent.
+ * The class therefore keeps every historic public method with its exact
+ * erased signature, delegating to the same engine paths as the new
+ * interface. It is a shim, not the contract.</p>
  *
- * api.getBalance(victim).thenAccept(balance -> {
- *     double penalty = balance * 0.15;
- *     api.subtractBalance(victim, penalty);
- *     api.addBalance(killer, penalty);
- * });
- * }</pre>
+ * <h3>Binary-compatibility guarantees of this shim</h3>
+ * <ul>
+ *   <li>All method names and erased parameter types are frozen until 3.0.0.</li>
+ *   <li>Generic return types were migrated to the solidus-api records
+ *       ({@link BalanceEntry}, {@link EconomyStats}, {@link TransferResult},
+ *       {@link TransactionRecord}). Erasure keeps the reflective signatures
+ *       byte-identical, and the record component names match the historic
+ *       inner records — reflective readers see no difference.</li>
+ *   <li>{@link #getEconomyEngine()} and {@link #getTransactionLog()} still
+ *       expose Core internals for pre-2.3 Governance. They are deprecated:
+ *       new code must use the safe API surface instead
+ *       ({@link SolidusApi#setBalance} replaces the reflective
+ *       SQLiteStorage.setBalance reach-in, {@link SolidusApi#logTransaction}
+ *       replaces the TransactionLog grab).</li>
+ * </ul>
  *
- * <h3>Thread Safety:</h3>
- * All methods return {@link CompletableFuture} and execute asynchronously
- * on Solidus's dedicated database worker thread. Callers on the server
- * tick thread must use {@code .thenAccept()} + {@code server.execute()}
- * for any UI or game-state updates.
- *
+ * @deprecated compile against the solidus-api artifact instead
  * @since 1.0.0
  */
-public final class SolidusAPI {
+@Deprecated
+public final class SolidusAPI implements SolidusApi {
 
     private static volatile SolidusAPI instance;
 
@@ -67,7 +67,10 @@ public final class SolidusAPI {
     }
 
     /**
-     * Initializes the API singleton. Called once by SolidusMod during startup.
+     * Initializes the legacy facade and installs the {@link SolidusApi}
+     * contract. Called once by SolidusMod during startup — at mod-init time,
+     * before any server lifecycle event, so both reflective 2.1.x companions
+     * and 2.3.0+ compiled companions see a ready API in every hook.
      * External mods must NOT call this method.
      *
      * @param engine The initialized EconomyEngine instance
@@ -78,15 +81,15 @@ public final class SolidusAPI {
             return;
         }
         instance = new SolidusAPI(engine);
-        SolidusMod.LOGGER.info("SolidusAPI initialized. External mods can now integrate.");
+        SolidusApiAccess.install(instance);
+        SolidusMod.LOGGER.info(
+            "SolidusAPI initialized (legacy reflective shim + solidus-api contract installed). "
+                + "External mods can now integrate.");
     }
 
     /**
-     * Gets the SolidusAPI instance.
+     * Gets the legacy facade instance.
      * Returns {@code null} if Solidus is not loaded or not yet initialized.
-     *
-     * <p>External mods should always null-check the return value before
-     * calling any API methods.</p>
      *
      * @return The API instance, or null if Solidus is unavailable
      */
@@ -102,6 +105,18 @@ public final class SolidusAPI {
      */
     public static boolean isAvailable() {
         return instance != null && instance.engine != null && instance.engine.isInitialized();
+    }
+
+    // -- SolidusApi: availability --------------------------
+
+    @Override
+    public String getCoreVersion() {
+        return "2.3.0";
+    }
+
+    @Override
+    public boolean isEngineReady() {
+        return isAvailable();
     }
 
     // -- Balance Operations (Online Players) --------------
@@ -127,9 +142,13 @@ public final class SolidusAPI {
         return engine.getBalanceManager().getBalance(uuid, playerName);
     }
 
+    @Override
+    public CompletableFuture<Double> getBalance(UUID uuid, String name) {
+        return getBalanceOffline(uuid, name);
+    }
+
     /**
      * Adds currency to an online player's balance.
-     * Used for: rewards, death penalty transfers to killer, etc.
      *
      * @param player The server player (must be online)
      * @param amount The amount to add (must be positive)
@@ -149,6 +168,11 @@ public final class SolidusAPI {
      */
     public CompletableFuture<Double> addBalanceOffline(UUID uuid, String playerName, double amount) {
         return engine.getBalanceManager().addBalance(uuid, playerName, amount);
+    }
+
+    @Override
+    public CompletableFuture<Double> addBalance(UUID uuid, String name, double amount) {
+        return addBalanceOffline(uuid, name, amount);
     }
 
     /**
@@ -176,6 +200,11 @@ public final class SolidusAPI {
         return engine.getBalanceManager().subtractBalance(uuid, playerName, amount);
     }
 
+    @Override
+    public CompletableFuture<Double> subtractBalance(UUID uuid, String name, double amount) {
+        return subtractBalanceOffline(uuid, name, amount);
+    }
+
     /**
      * Checks if an online player can afford a specific amount.
      *
@@ -185,6 +214,36 @@ public final class SolidusAPI {
      */
     public CompletableFuture<Boolean> hasSufficientBalance(ServerPlayer player, double amount) {
         return engine.getBalanceManager().hasSufficientBalance(player, amount);
+    }
+
+    @Override
+    public CompletableFuture<Boolean> hasSufficientBalance(UUID uuid, String name, double amount) {
+        return getBalance(uuid, name).thenApply(balance -> balance != null && balance >= amount);
+    }
+
+    @Override
+    public CompletableFuture<Boolean> setBalance(UUID uuid, String name, double newBalance, String reason) {
+        if (newBalance < 0) {
+            return CompletableFuture.completedFuture(false);
+        }
+        StorageBackend storage = engine.getStorage();
+        if (storage == null) {
+            return CompletableFuture.completedFuture(false);
+        }
+        String safeReason = reason != null && !reason.isBlank() ? reason : "companion setBalance via solidus-api";
+        return storage.setBalance(uuid, name, newBalance).thenApply(written -> {
+            if (Boolean.TRUE.equals(written)) {
+                // Journal the administrative overwrite so the supply-integrity
+                // replay and the rebase workflow stay exact — the audited
+                // replacement for Governance's reflective SQLiteStorage hack.
+                TransactionLog txLog = engine.getTransactionLog();
+                if (txLog != null) {
+                    txLog.log(TransactionLog.Type.ADMIN_SET, uuid, name,
+                        null, null, newBalance, null, 0, safeReason);
+                }
+            }
+            return Boolean.TRUE.equals(written);
+        });
     }
 
     // -- Transfer Operations -----------------------------
@@ -198,9 +257,10 @@ public final class SolidusAPI {
      * @param amount   The amount to transfer
      * @return CompletableFuture with TransferResult indicating outcome
      */
-    public CompletableFuture<BalanceManager.TransferResult> transfer(
+    public CompletableFuture<TransferResult> transfer(
             ServerPlayer sender, ServerPlayer receiver, double amount) {
-        return engine.getBalanceManager().transfer(sender, receiver, amount);
+        return engine.getBalanceManager().transfer(sender, receiver, amount)
+            .thenApply(SolidusAPI::toApiTransferResult);
     }
 
     /**
@@ -215,12 +275,20 @@ public final class SolidusAPI {
      * @param amount           The amount to transfer
      * @return CompletableFuture with TransferResult indicating outcome
      */
-    public CompletableFuture<BalanceManager.TransferResult> transferOffline(
+    public CompletableFuture<TransferResult> transferOffline(
             UUID senderUuid, String senderName,
             UUID receiverUuid, String receiverName,
             double amount) {
         return engine.getBalanceManager().transferOffline(
-            senderUuid, senderName, receiverUuid, receiverName, amount);
+                senderUuid, senderName, receiverUuid, receiverName, amount)
+            .thenApply(SolidusAPI::toApiTransferResult);
+    }
+
+    @Override
+    public CompletableFuture<TransferResult> transfer(UUID senderUuid, String senderName,
+                                                      UUID receiverUuid, String receiverName,
+                                                      double amount) {
+        return transferOffline(senderUuid, senderName, receiverUuid, receiverName, amount);
     }
 
     // -- Leaderboard -------------------------------------
@@ -232,26 +300,26 @@ public final class SolidusAPI {
      * @param limit Maximum number of entries to return
      * @return CompletableFuture with list of BalanceEntry objects
      */
-    public CompletableFuture<List<SQLiteStorage.BalanceEntry>> getTopBalances(int limit) {
-        return engine.getBalanceManager().getTopBalances(limit);
+    public CompletableFuture<List<BalanceEntry>> getTopBalances(int limit) {
+        return engine.getBalanceManager().getTopBalances(limit)
+            .thenApply(entries -> entries.stream().map(SolidusAPI::toApiBalanceEntry).toList());
     }
 
     /**
-     * Gets a page of the leaderboard with pagination pushed down to SQLite
-     * (LIMIT/OFFSET), so deep pages cost the same as page 1. Ranks are
-     * global and continue across pages (offset 10 starts at rank 11).
+     * Gets a page of the leaderboard with pagination pushed down to the
+     * database (LIMIT/OFFSET), so deep pages cost the same as page 1.
      *
      * @param limit  Maximum number of entries to return (page size)
      * @param offset Number of higher-ranked entries to skip (0-based)
      * @return CompletableFuture with list of BalanceEntry objects
      */
-    public CompletableFuture<List<SQLiteStorage.BalanceEntry>> getTopBalances(int limit, int offset) {
-        return engine.getBalanceManager().getTopBalances(limit, offset);
+    public CompletableFuture<List<BalanceEntry>> getTopBalances(int limit, int offset) {
+        return engine.getBalanceManager().getTopBalances(limit, offset)
+            .thenApply(entries -> entries.stream().map(SolidusAPI::toApiBalanceEntry).toList());
     }
 
     /**
      * Counts all registered economy entries (players with a balance row).
-     * Useful with paged {@code getTopBalances} to compute total page counts.
      *
      * @return CompletableFuture with the total number of balance entries
      */
@@ -261,30 +329,95 @@ public final class SolidusAPI {
 
     /**
      * Economy-wide aggregates (player count, mean balance, money supply, Gini
-     * coefficient) computed inside SQLite with one aggregate query - no balance
-     * rows are materialized. This is the efficient way for companion mods to
-     * obtain distribution statistics: prefer this over
-     * {@code getTopBalances(100000)} when individual rows are not needed.
+     * coefficient) computed inside the database with one aggregate query.
      *
-     * @return CompletableFuture with the current {@link SQLiteStorage.EconomyStats}
-     * @since 2.1.0
+     * @return CompletableFuture with the current EconomyStats
      */
-    public CompletableFuture<SQLiteStorage.EconomyStats> getEconomyStats() {
-        return engine.getBalanceManager().getEconomyStats();
+    public CompletableFuture<EconomyStats> getEconomyStats() {
+        return engine.getBalanceManager().getEconomyStats()
+            .thenApply(stats -> new EconomyStats(
+                stats.playerCount(), stats.avgBalance(),
+                stats.totalSupply(), stats.giniCoefficient()));
     }
 
-    // -- Transaction Logging -----------------------------
+    // -- Transaction history (read) -------------------------
+
+    @Override
+    public CompletableFuture<List<TransactionRecord>> getTransactions(UUID playerUuid, int limit) {
+        TransactionLog txLog = engine.getTransactionLog();
+        if (txLog == null) {
+            return CompletableFuture.completedFuture(List.of());
+        }
+        return txLog.getTransactions(playerUuid, limit)
+            .thenApply(entries -> entries.stream().map(SolidusAPI::toApiTransactionRecord).toList());
+    }
+
+    @Override
+    public CompletableFuture<List<TransactionRecord>> getTransactions(UUID playerUuid, int limit, int offset) {
+        TransactionLog txLog = engine.getTransactionLog();
+        if (txLog == null) {
+            return CompletableFuture.completedFuture(List.of());
+        }
+        return txLog.getTransactions(playerUuid, limit, offset)
+            .thenApply(entries -> entries.stream().map(SolidusAPI::toApiTransactionRecord).toList());
+    }
+
+    @Override
+    public CompletableFuture<List<TransactionRecord>> getTransactionsSince(UUID playerUuid, long sinceEpochMs) {
+        TransactionLog txLog = engine.getTransactionLog();
+        if (txLog == null) {
+            return CompletableFuture.completedFuture(List.of());
+        }
+        return txLog.getTransactionsSince(playerUuid, sinceEpochMs)
+            .thenApply(entries -> entries.stream().map(SolidusAPI::toApiTransactionRecord).toList());
+    }
+
+    // -- Custom transaction logging (write) -----------------
+
+    @Override
+    public CompletableFuture<Boolean> logTransaction(TransactionRecord record) {
+        TransactionLog txLog = engine.getTransactionLog();
+        if (txLog == null || record == null || record.type() == null) {
+            return CompletableFuture.completedFuture(false);
+        }
+        // Reject codes that do not map to a real ledger Type: TransactionLog's
+        // fromCode() deliberately falls back to SHOP_BUY for unknown codes,
+        // which would corrupt transaction semantics. Validate strictly here.
+        TransactionLog.Type type = resolveType(record.type());
+        if (type == null) {
+            SolidusMod.LOGGER.warn(
+                "solidus-api logTransaction rejected unknown type code '{}'. "
+                    + "Use one of the documented TransactionLog type codes.",
+                record.type());
+            return CompletableFuture.completedFuture(false);
+        }
+        try {
+            txLog.log(type,
+                record.playerUuid(), record.playerName(),
+                record.targetUuid(), record.targetName(),
+                record.amount(), record.itemMaterial(),
+                record.itemQuantity(), record.description());
+            return CompletableFuture.completedFuture(true);
+        } catch (Throwable t) {
+            SolidusMod.LOGGER.warn("solidus-api logTransaction failed: {}", t.toString());
+            return CompletableFuture.completedFuture(false);
+        }
+    }
+
+    // -- Transaction Logging (legacy accessor) --------------
 
     /**
      * Gets the transaction log for recording custom transaction types
      * or querying a player's financial history.
      *
-     * <p>External mods can use this to log their own transactions
-     * (e.g., death penalties) so they appear in the player's
-     * {@code /transactions} history.</p>
+     * <p>Exposed for reflective 2.1.x companions (Enforcer's history reader).
+     * New code must use {@link #getTransactions(UUID, int)} /
+     * {@link #logTransaction(TransactionRecord)} instead.</p>
      *
      * @return The TransactionLog instance, or null if not initialized
+     * @deprecated internal type on the return — use the solidus-api surface
      */
+    @Deprecated
     public TransactionLog getTransactionLog() {
         if (engine == null || !engine.isInitialized()) return null;
         return engine.getTransactionLog();
@@ -303,7 +436,6 @@ public final class SolidusAPI {
      *
      * @param hook The hook to register (must not be null)
      * @return true if registered, false if a hook with the same name exists
-     * @since 2.1.0
      */
     public boolean registerTransactionHook(SolidusTransactionHook hook) {
         return EconomyHooks.register(hook);
@@ -314,7 +446,6 @@ public final class SolidusAPI {
      *
      * @param hook The hook instance to remove
      * @return true if it was registered and is now removed
-     * @since 2.1.0
      */
     public boolean unregisterTransactionHook(SolidusTransactionHook hook) {
         return EconomyHooks.unregister(hook);
@@ -322,10 +453,8 @@ public final class SolidusAPI {
 
     /**
      * Gets the number of currently registered transaction hooks.
-     * Intended for diagnostics/logging.
      *
      * @return the number of active hooks
-     * @since 2.1.0
      */
     public int getRegisteredHookCount() {
         return EconomyHooks.registeredHooks().size();
@@ -335,12 +464,43 @@ public final class SolidusAPI {
 
     /**
      * Gets the internal EconomyEngine instance.
-     * Only for advanced use cases that need direct access to
-     * Solidus internals. Most operations should use the API methods above.
+     *
+     * <p>Kept ONLY for reflective 2.1.x Governance (it reached the engine's
+     * storage through this method to perform rollback restores). 2.3.0+
+     * companions must use {@link #setBalance(UUID, String, double, String)}
+     * for administrative writes.</p>
      *
      * @return The EconomyEngine instance
+     * @deprecated internal type on the return — use the solidus-api surface
      */
+    @Deprecated
     public EconomyEngine getEconomyEngine() {
         return engine;
+    }
+
+    // -- Mapping helpers (internal -> api records) ----------
+
+    private static TransferResult toApiTransferResult(BalanceManager.TransferResult result) {
+        return new TransferResult(result.success(), result.message(),
+            result.senderNewBalance(), result.receiverNewBalance());
+    }
+
+    private static BalanceEntry toApiBalanceEntry(SQLiteStorage.BalanceEntry entry) {
+        return new BalanceEntry(entry.uuid(), entry.rank(), entry.playerName(), entry.balance());
+    }
+
+    private static TransactionRecord toApiTransactionRecord(TransactionLog.TransactionEntry entry) {
+        return new TransactionRecord(entry.timestamp(), entry.type().code(),
+            entry.playerUuid(), entry.playerName(), entry.targetUuid(), entry.targetName(),
+            entry.amount(), entry.itemMaterial(), entry.itemQuantity(), entry.description());
+    }
+
+    /** Strict type-code resolution (no silent SHOP_BUY fallback). */
+    private static TransactionLog.Type resolveType(String code) {
+        if (code == null) return null;
+        for (TransactionLog.Type type : TransactionLog.Type.values()) {
+            if (type.code().equals(code)) return type;
+        }
+        return null;
     }
 }

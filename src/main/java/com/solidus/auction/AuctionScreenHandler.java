@@ -57,6 +57,11 @@ public class AuctionScreenHandler extends AbstractContainerMenu {
                                    List<GuiSlot> slots, AuctionManager auctionManager,
                                    int page, boolean myItems,
                                    AuctionManager.SortOrder sortOrder) {
+        // Compat gate (audit W-3): never open a virtual menu whose click
+        // routing cannot be trusted on this Minecraft version.
+        if (!com.solidus.compat.Compat.ensureGuiAvailable(player)) {
+            return;
+        }
         player.openMenu(new net.minecraft.world.MenuProvider() {
             @Override
             public Component getDisplayName() {
@@ -112,6 +117,18 @@ public class AuctionScreenHandler extends AbstractContainerMenu {
 
     @Override
     public void clicked(int slotIndex, int button, net.minecraft.world.inventory.ContainerInput containerInput, Player player) {
+        // 2.3.0: normalize the version-specific input through the compat
+        // seam and run the shared Solidus pipeline.
+        handleSolidusClick(com.solidus.compat.Compat.describe(slotIndex, button, containerInput), player);
+    }
+
+    /**
+     * Solidus's own click pipeline — version-free entry point used by both
+     * the container-click mixin route (via PacketHandler) and the vanilla
+     * clicked() override above.
+     */
+    public void handleSolidusClick(com.solidus.compat.ClickDescriptor click, Player player) {
+        int slotIndex = click.slotIndex();
         // Defensive (audit 2.1.3): only the player who owns this handler may
         // interact - mirrors ShopScreenHandler's invariant.
         if (player != this.player) {
@@ -121,7 +138,7 @@ public class AuctionScreenHandler extends AbstractContainerMenu {
         }
 
         // Player inventory clicks (slot >= 54) - return without action.
-        // Note: Vanilla processing is already cancelled by the ServerPlayerEntityMixin,
+        // Note: Vanilla processing is already cancelled by the ContainerClickMixin,
         // so player inventory interaction is blocked while the auction GUI is open.
         // This is intentional for security - prevents item manipulation exploits.
         // The mixin then calls broadcastFullState(), erasing any optimistic
@@ -141,8 +158,7 @@ public class AuctionScreenHandler extends AbstractContainerMenu {
         // only a plain left PICKUP for item slots so forged/unusual gestures
         // can't initiate settlement, matching the documented interaction.
         if (guiSlot.type() == GuiSlot.Type.AUCTION_ITEM
-            && (containerInput != net.minecraft.world.inventory.ContainerInput.PICKUP || button != 0)
-            && !(containerInput == net.minecraft.world.inventory.ContainerInput.PICKUP && button == 1)) {
+            && !click.isPickup()) {
             return;
         }
 
@@ -150,7 +166,7 @@ public class AuctionScreenHandler extends AbstractContainerMenu {
             case AUCTION_ITEM -> {
                 // BIDDING: right-click opens the "type your bid in chat" prompt
                 // (standard auction-plugin UX); left-click stays Buy Now.
-                if (containerInput == net.minecraft.world.inventory.ContainerInput.PICKUP && button == 1) {
+                if (click.isRightPickup()) {
                     handleBidPrompt(guiSlot);
                 } else {
                     handleAuctionItemClick(guiSlot);

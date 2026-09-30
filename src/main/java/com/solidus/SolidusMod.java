@@ -10,6 +10,7 @@ import com.solidus.commands.ShopCommand;
 import com.solidus.commands.AuctionCommand;
 import com.solidus.commands.TransactionsCommand;
 import com.solidus.commands.SolidusAdminCommand;
+import com.solidus.compat.Compat;
 import com.solidus.economy.BalanceManager;
 import com.solidus.economy.EconomyEngine;
 import com.solidus.economy.MySqlStorage;
@@ -144,6 +145,13 @@ public class SolidusMod implements DedicatedServerModInitializer {
         packetHandler = new PacketHandler(shopManager, auctionManager, tradeManager, rateLimiter);
         packetHandler.register();
 
+        // ── Update-resilience (audit W-3, family 2.3.0) ──────────────────
+        // Reflectively verify every Minecraft shape the GUI pipeline compiled
+        // against, BEFORE any menu can open. On failure the GUI layer is
+        // disabled with a clear banner while commands/storage/ledger keep
+        // working (graceful degradation instead of a mixin crash).
+        Compat.verifyCompatibility();
+
         // Register all server-side commands
         BalanceManager balanceManager = economyEngine.getBalanceManager();
         CommandRegistrationCallback.EVENT.register((dispatcher, registryAccess, environment) -> {
@@ -217,6 +225,13 @@ public class SolidusMod implements DedicatedServerModInitializer {
 
         // Deliver pending offline notifications when a player joins
         ServerPlayConnectionEvents.JOIN.register((handler, sender, server) -> {
+            // W-3 runtime cross-check: by now the packet-listener class has
+            // been loaded, so the container-click mixin has either applied
+            // (SolidusMixinPlugin saw the postApply event) or definitively
+            // failed (require=0 warning in the log). If it failed, disable
+            // the GUI layer before anyone opens a broken menu.
+            Compat.confirmClickMixinAfterFirstConnection();
+
             TransactionLog transactionLog = economyEngine.getTransactionLog();
             if (transactionLog != null) {
                 transactionLog.deliverPendingNotifications(handler.getPlayer());

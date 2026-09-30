@@ -234,11 +234,48 @@ public class SolidusAdminCommand {
             .then(Commands.literal("rebase")
                 .executes(context -> report(context.getSource(), admin.integrityRebase()))));
 
+        // -- Compatibility diagnostics (2.3.0, audit W-3) ----------
+        // Surfaces the startup compat-probe report: which Minecraft shapes
+        // the GUI pipeline compiled against were verified, which failed, and
+        // whether the container-click mixin applied. The one place an owner
+        // checks after a Minecraft update breaks something.
+        root.then(Commands.literal("compat")
+            .executes(context -> reportCompat(context.getSource())));
+
         dispatcher.register(root);
     }
 
     // -- Async result plumbing ---------------------------------
 
+    /** Reports the compat-probe state (synchronous, in-memory). */
+    private static int reportCompat(CommandSourceStack source) {
+        List<String> lines = new ArrayList<>();
+        boolean verified = com.solidus.compat.CompatState.isVerified();
+        boolean guiSafe = com.solidus.compat.CompatState.isGuiSafe();
+        boolean mixinApplied = com.solidus.compat.SolidusMixinPlugin.isContainerClickMixinApplied();
+
+        lines.add("Solidus compatibility report (family 2.3.0):");
+        lines.add("  Startup probe: " + (verified ? "ran" : "NOT RUN"));
+        if (verified && guiSafe) {
+            lines.add("  Virtual GUI routing: HEALTHY");
+            lines.add("  Container-click mixin applied: " + mixinApplied);
+        } else {
+            lines.add("!!Virtual GUI routing: DISABLED (Minecraft internals changed)");
+            for (String failure : com.solidus.compat.CompatState.failures()) {
+                lines.add("!!  - " + failure);
+            }
+            lines.add("  Commands, storage, ledger, taxes and enforcement are unaffected.");
+            lines.add("  Update path: see src/main/java/com/solidus/compat/PACKAGE.md");
+        }
+        for (String line : lines) {
+            if (line.startsWith("!!")) {
+                source.sendFailure(TextUtil.error(line.substring(2)));
+            } else {
+                source.sendSuccess(() -> TextUtil.plain(line), false);
+            }
+        }
+        return Command.SINGLE_SUCCESS;
+    }
     /** Reports one {@link AdminOps.OpResult} on the server thread. */
     private static int report(CommandSourceStack source, CompletableFuture<AdminOps.OpResult> future) {
         var server = source.getServer();

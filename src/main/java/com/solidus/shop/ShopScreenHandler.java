@@ -63,6 +63,11 @@ public class ShopScreenHandler extends AbstractContainerMenu {
     public static void openScreen(ServerPlayer player, Component title,
                                    List<GuiSlot> slots, ShopManager shopManager,
                                    String section, int page) {
+        // Compat gate (audit W-3): never open a virtual menu whose click
+        // routing cannot be trusted on this Minecraft version.
+        if (!com.solidus.compat.Compat.ensureGuiAvailable(player)) {
+            return;
+        }
         // Clamp page to >= 0 and store in a final variable for the inner class
         final int safePage;
         if (page < 0) {
@@ -135,15 +140,30 @@ public class ShopScreenHandler extends AbstractContainerMenu {
      * are analyzed for their intent (buy, sell, navigate) and processed
      * as financial transactions or navigation events.
      *
-     * The {@code button} parameter is retained for right-click detection
-     * (0 = left, 1 = right). In Minecraft 26.1.x, {@link ContainerInput}
-     * replaces the legacy {@code ClickType} enum and absorbs most click
-     * variants; {@code QUICK_MOVE} still indicates a shift-click.
+     * 2.3.0: the version-specific click-input type is normalized into a
+     * stable {@link com.solidus.compat.ClickDescriptor} inside the compat
+     * package, then routed to {@link #handleSolidusClick} — the single
+     * pipeline shared with the mixin route (audit W-3: churn isolation).
+     * This override remains the defense-in-depth path for the (never
+     * expected) case where the mixin route is unavailable.
      */
     @Override
     public void clicked(int slotIndex, int button, ContainerInput containerInput, Player player) {
+        handleSolidusClick(com.solidus.compat.Compat.describe(slotIndex, button, containerInput), player);
+    }
+
+    /**
+     * Solidus's own click pipeline — version-free entry point used by both
+     * the container-click mixin route (via PacketHandler) and the vanilla
+     * clicked() override above.
+     *
+     * @param click  the normalized click (slot, button, semantics)
+     * @param player the clicking player
+     */
+    public void handleSolidusClick(com.solidus.compat.ClickDescriptor click, Player player) {
+        int slotIndex = click.slotIndex();
         // Player inventory clicks (slot >= 54) - return without action.
-        // Vanilla processing is already cancelled by the ServerPlayerEntityMixin,
+        // Vanilla processing is already cancelled by the ContainerClickMixin,
         // so player inventory interaction is blocked while the shop GUI is open.
         // This is intentional for security - prevents item manipulation exploits.
         // The mixin then calls broadcastFullState(), erasing any optimistic
@@ -165,7 +185,7 @@ public class ShopScreenHandler extends AbstractContainerMenu {
         }
 
         switch (guiSlot.type()) {
-            case SHOP_ITEM -> handleShopItemClick(guiSlot, button, containerInput);
+            case SHOP_ITEM -> handleShopItemClick(guiSlot, click);
             case SECTION_BUTTON -> handleSectionButtonClick(guiSlot);
             case NAVIGATION -> handleNavigationClick(guiSlot);
             case DISPLAY_ONLY, FILLER -> {
@@ -188,12 +208,12 @@ public class ShopScreenHandler extends AbstractContainerMenu {
      *   <li>Shift+Right-click -> Sell all matching items in the main inventory</li>
      * </ul>
      */
-    private void handleShopItemClick(GuiSlot slot, int button, ContainerInput containerInput) {
+    private void handleShopItemClick(GuiSlot slot, com.solidus.compat.ClickDescriptor click) {
         String material = slot.actionKey();
         if (material == null || material.isBlank()) return;
 
-        boolean isShiftClick = containerInput == ContainerInput.QUICK_MOVE;
-        boolean isRightClick = button == 1;
+        boolean isShiftClick = click.isQuickMove();
+        boolean isRightClick = click.button() == 1;
 
         if (isShiftClick && isRightClick) {
             // Shift+Right-Click: Sell all of this item

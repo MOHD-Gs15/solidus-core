@@ -101,6 +101,11 @@ repositories {
 }
 
 dependencies {
+    // Stable family contract jar (audit W-5): companions compile against
+    // these interfaces; nested into the shipped mod jar below.
+    api project(':solidus-api')
+    include project(':solidus-api')
+
     // Minecraft (unobfuscated since 26.1 — no mappings needed)
     minecraft "com.mojang:minecraft:${project.minecraft_version}"
 
@@ -171,10 +176,12 @@ processResources {
     inputs.property "version", project.version
     inputs.property "minecraft_version", project.minecraft_version
     inputs.property "loader_version", project.loader_version
+    inputs.property "minecraft_dep", project.findProperty('minecraft_dep') ?: "~${project.minecraft_version}"
 
     filesMatching("fabric.mod.json") {
         expand "version": project.version,
                "minecraft_version": project.minecraft_version,
-               "loader_version": project.loader_version
+               "loader_version": project.loader_version,
+               "minecraft_dep": (project.findProperty('minecraft_dep') ?: "~${project.minecraft_version}")
     }
 }
