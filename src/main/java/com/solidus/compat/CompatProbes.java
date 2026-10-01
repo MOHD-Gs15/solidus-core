@@ -120,10 +120,15 @@ public final class CompatProbes {
             probe(failures, "ServerGamePacketListenerImpl.player",
                 () -> listenerClass.getDeclaredField("player"));
         }
-        Class<?> serverPlayerClass = softClass("net.minecraft.server.level.ServerPlayer");
-        if (serverPlayerClass != null) {
-            probe(failures, "ServerPlayer.containerMenu",
-                () -> serverPlayerClass.getDeclaredField("containerMenu"));
+        // containerMenu is DECLARED on Player and only INHERITED by
+        // ServerPlayer — getDeclaredField cannot see inherited members, so
+        // probing ServerPlayer for it always failed and wrongly disabled
+        // the GUI layer on every 2.3.0/2.3.1 server (caught by
+        // CompatDegradationTest, fixed 2.3.2). Probe the declaring class;
+        // the bridge reaches the field through the very same Player type.
+        if (playerClass != null) {
+            probe(failures, "Player.containerMenu",
+                () -> playerClass.getDeclaredField("containerMenu"));
         }
         if (menuClass != null) {
             probe(failures, "AbstractContainerMenu.containerId",
