@@ -30,6 +30,7 @@
   ],
   "suggests": {
     "solidus-governance": ">=2.1.0",
-    "solidus-analytics": ">=2.1.0"
+    "solidus-analytics": ">=2.1.0",
+    "solidus-enforcer": ">=2.1.0"
   }
 }

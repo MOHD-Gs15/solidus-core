@@ -10,7 +10,7 @@ server owner, at a glance, which releases are built and tested to work together.
 | **Family (Minor)** `2.1.x → 2.2.0` | **Owner-designated architecture era** — never used for ordinary feature additions. The `2.2` family is **reserved** for the cross-server / multi-server storage era. | No — the other mods must move to the new family in lockstep. |
 | **Major** `2.x → 3.0.0` | Architectural reset of the ecosystem contract. | No — full coordinated release. |
 
-Current family: **2.3.2** — the update-resilience / family-contract era. The
+Current family: **2.3.3** — the update-resilience / family-contract era. The
 compatibility architecture landed: all Minecraft-internal touch-points are
 confined to `com.solidus.compat` (audit W-3 — a Minecraft internals change now
 degrades the virtual-GUI layer gracefully with a clear banner instead of
@@ -19,18 +19,32 @@ reflection to a real contract (audit W-5): companions compile against the
 `solidus-api` jar (a Minecraft-free artifact nested inside Core) and declare
 a `"solidus": ">=2.3.x <3.0.0"` floor in their `fabric.mod.json`, so
 Fabric's loader — not a log line — rejects incompatible combinations.
+Patch **2.3.3** (Core alone, per the patch rule above) closed a CI-side hole
+the integration audit found in the W-2 net: the `test` task did not depend
+on `jar`, so on a fresh checkout (exactly what CI runs) the packaging smoke
+test SILENTLY ABORTED and the shipped-jar Redis checks never executed in CI;
+`test` now builds the jar first, and the smoke test both prefers the
+current version's artifact over stale ones in `build/libs` and asserts the
+nested `solidus-api-<version>.jar` matches `mod_version` (anti-drift).
+The same patch added `solidus-enforcer` to Core's `suggests` (it listed only
+Governance and Analytics) and refreshed the Jedis-era notes.
 Patch **2.3.2** closed audit finding **W-5** end-to-end: the solidus-api
 contract gained `isMysqlMode()`, `getShopSellPrices()` and
 `withLedgerConnection(LedgerWork)` — the three surfaces Enforcer and
 Analytics still reached by reflecting into Core internals
 (ShopManager records, EconomyEngine, a Proxy over
 TransactionLog$SqlWork). Both companions now compile against the
-contract with ZERO reflection; their `depends` floors are `>=2.3.2`
-(Governance stays `>=2.3.0` — it never used the new members). The same
-patch fixed a production bug the new degradation tests caught on their
-first run: a CompatProbes lookup used `ServerPlayer` for the
-`containerMenu` field, which is DECLARED on `Player` — the probe always
-failed and the GUI layer was silently disabled on every 2.3.0/2.3.1
+contract with ZERO reflection; their `depends` floors are `>=2.3.2`.
+Governance followed in the same patch line (2.3.0 → 2.3.2) when the
+follow-up integration audit found its simulation still carried the family's
+LAST reflective reach-in (`getEconomyEngine() → getStorage() →
+getActiveAccountCount(int)` — methods Core no longer declares, so the path
+silently returned -1 on every query and its direct-file fallback could never
+see the MySQL backend); it now rides `withLedgerConnection` like everyone
+else. The same 2.3.2 patch fixed a production bug the new degradation
+tests caught on their first run: a CompatProbes lookup used `ServerPlayer`
+for the `containerMenu` field, which is DECLARED on `Player` — the probe
+always failed and the GUI layer was silently disabled on every 2.3.0/2.3.1
 server.
 Patch **2.3.1** (Core alone, per the patch rule above) shipped audit fix
 **W-2**: the optional Redis layer's client was swapped from Lettuce 6.5.5
@@ -58,8 +72,8 @@ they were integration-tested against in their own `fabric.mod.json`.
 > changes remain impossible inside a patch family.
 
 Each mod's `fabric.mod.json` `suggests` entry declares the **minimum family version** it
-was integration-tested against (e.g. Core ships `"solidus-governance": ">=2.1.0",
-"solidus-analytics": ">=2.1.0"`).
+was integration-tested against (Core ships `"solidus-governance": ">=2.1.0",
+"solidus-analytics": ">=2.1.0", "solidus-enforcer": ">=2.1.0"`).
 
 ## Where the number lives
 

@@ -166,6 +166,14 @@ dependencies {
 
 tasks.withType(Test).configureEach {
     useJUnitPlatform()
+    // RedisPackagingSmokeTest drives the BUILT jar through an isolated
+    // URLClassLoader. Without this dependency, `./gradlew test` on a fresh
+    // checkout (exactly what CI does) finds no jar under build/libs and the
+    // smoke test SILENTLY ABORTS — the W-2 class of hole (green CI, broken
+    // shipped artifact) would come back through the back door. Building
+    // the jar first also guarantees the smoke test verifies the CURRENT
+    // version's artifact, never a stale one left in build/libs.
+    dependsOn tasks.jar
     testLogging {
         events "passed", "skipped", "failed"
         showStandardStreams = false

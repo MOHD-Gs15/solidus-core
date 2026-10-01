@@ -62,7 +62,8 @@ class RedisPackagingSmokeTest {
     void findJarAndTarget() throws Exception {
         modJar = findBuiltJar();
         if (modJar == null) {
-            Assumptions.abort("no built jar under build/libs — run ./gradlew jar first (CI does)");
+            Assumptions.abort("no built jar under build/libs — the test task depends on jar, "
+                + "so this only happens in exotic harnesses");
         }
         redisUri = System.getenv("SOLIDUS_TEST_REDIS_URI");
         if (redisUri == null || redisUri.isBlank()) {
@@ -78,10 +79,22 @@ class RedisPackagingSmokeTest {
         }
     }
 
-    /** Newest non-sources jar in build/libs, or null when nothing was built. */
+    /**
+     * The CURRENT version's jar ({@code solidus-<mod_version>.jar} read from
+     * gradle.properties, same anti-drift pattern as the contract-extension
+     * test), falling back to the newest non-sources jar when the exact name
+     * is absent. Preferring the version-matched name guarantees the smoke
+     * never verifies a STALE artifact left over in build/libs from an older
+     * build. Returns null when nothing was built.
+     */
     private static Path findBuiltJar() throws IOException {
         Path libs = Paths.get("build", "libs");
         if (!Files.isDirectory(libs)) return null;
+        String version = readModVersion();
+        if (version != null) {
+            Path exact = libs.resolve("solidus-" + version + ".jar");
+            if (Files.isRegularFile(exact)) return exact;
+        }
         try (Stream<Path> entries = Files.list(libs)) {
             return entries
                 .filter(Files::isRegularFile)
@@ -92,6 +105,17 @@ class RedisPackagingSmokeTest {
                 .max(Comparator.comparingLong(p -> p.toFile().lastModified()))
                 .orElse(null);
         }
+    }
+
+    /** mod_version from gradle.properties, or null when unreadable. */
+    private static String readModVersion() throws IOException {
+        Path props = Paths.get("gradle.properties");
+        if (!Files.isRegularFile(props)) return null;
+        return Files.readAllLines(props).stream()
+            .filter(l -> l.startsWith("mod_version"))
+            .map(l -> l.substring(l.indexOf('=') + 1).trim())
+            .findFirst()
+            .orElse(null);
     }
 
     @Test
@@ -111,9 +135,18 @@ class RedisPackagingSmokeTest {
             "lettuce must never ship again (W-2) — was: " + nested);
         assertTrue(nested.stream().noneMatch(n -> n.contains("netty")),
             "netty must never ship (collides with Minecraft's own Netty) — was: " + nested);
-        // Family contract (audit W-5) rides in the same jar.
-        assertTrue(nested.stream().anyMatch(n -> n.startsWith("solidus-api-")),
-            "solidus-api must stay nested (W-5) — was: " + nested);
+        // Family contract (audit W-5) rides in the same jar — and must be
+        // the CURRENT version's contract, not a stale one: the jar task
+        // derives the nested name from mod_version, so a mismatch here means
+        // the include wiring broke.
+        String version = readModVersion();
+        if (version != null) {
+            assertTrue(nested.stream().anyMatch(n -> n.equals("solidus-api-" + version + ".jar")),
+                "solidus-api-" + version + ".jar must be nested (W-5) — was: " + nested);
+        } else {
+            assertTrue(nested.stream().anyMatch(n -> n.startsWith("solidus-api-")),
+                "solidus-api must stay nested (W-5) — was: " + nested);
+        }
     }
 
     @Test

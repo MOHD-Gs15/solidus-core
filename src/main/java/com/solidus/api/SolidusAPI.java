@@ -117,7 +117,7 @@ public final class SolidusAPI implements SolidusApi {
 
     @Override
     public String getCoreVersion() {
-        return "2.3.2";
+        return "2.3.3";
     }
 
     @Override
