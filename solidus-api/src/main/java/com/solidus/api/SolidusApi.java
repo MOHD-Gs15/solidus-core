@@ -1,6 +1,8 @@
 package com.solidus.api;
 
+import java.sql.SQLException;
 import java.util.List;
+import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 
@@ -71,6 +73,23 @@ public interface SolidusApi {
      *         operations can be dispatched
      */
     boolean isEngineReady();
+
+    /**
+     * True when Core runs its shared MySQL/MariaDB network backend
+     * (DB scaling plan Phase 2). This is the decisive signal a companion
+     * needs to follow Core's storage choice (audit W-5, 2.3.2): when true,
+     * Core-side SQLite file paths are dead and every ledger read must go
+     * through {@link #withLedgerConnection} instead of a local file.
+     *
+     * <p>Historically reached by reflecting into Core's
+     * {@code EconomyEngine.isMysqlMode()} internal — now a first-class
+     * contract member so the switch is compile-checked, not
+     * silently-degrading.</p>
+     *
+     * @return true in MySQL/MariaDB network mode, false for SQLite
+     * @since 2.3.2 (family contract 2.3)
+     */
+    boolean isMysqlMode();
 
     // -- Balance operations (offline-safe) ------------------
 
@@ -183,6 +202,47 @@ public interface SolidusApi {
      * @return future completing with the aggregate snapshot
      */
     CompletableFuture<EconomyStats> getEconomyStats();
+
+    // -- Market data (shop price table) --------------------
+
+    /**
+     * Snapshot of the admin shop's sell prices: material name (uppercase,
+     * as used by Core's shop config) to the price one unit sells for.
+     * Only sellable items ({@code sellPrice > 0}) appear.
+     *
+     * <p>This is the audited replacement for companions reflectively
+     * walking Core's {@code ShopManager} internals to value inventories
+     * (audit W-5, 2.3.2). The table is small (the shop config), immutable
+     * between operator reloads, and read as an unmodifiable snapshot, so
+     * the future is typically already completed.</p>
+     *
+     * @return future completing with material -&gt; sell-price (empty when
+     *         the shop is not loaded)
+     * @since 2.3.2 (family contract 2.3)
+     */
+    CompletableFuture<Map<String, Double>> getShopSellPrices();
+
+    // -- Ledger connection (read-only seam) ----------------
+
+    /**
+     * Runs one bounded, read-only unit of SQL against Core's live ledger
+     * connection — whatever backend Core is configured for (shared SQLite
+     * or pooled MySQL/MariaDB). This is the audited replacement for
+     * companions building reflective proxies over Core's
+     * {@code TransactionLog$SqlWork} internal (audit W-5, 2.3.2).
+     *
+     * <p><b>Threading:</b> runs synchronously on the caller's thread —
+     * background collector threads only, never the server tick thread.
+     * Read the {@link LedgerWork} rules before use (read-only, bounded,
+     * never close or leak the connection).</p>
+     *
+     * @param work the query to run
+     * @param <T>  the query result type
+     * @return whatever {@code work} returned
+     * @throws SQLException when the query fails (propagated as-is)
+     * @since 2.3.2 (family contract 2.3)
+     */
+    <T> T withLedgerConnection(LedgerWork<T> work) throws SQLException;
 
     // -- Transaction history (read) -------------------------
 

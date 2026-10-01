@@ -7,9 +7,15 @@ import com.solidus.economy.SQLiteStorage;
 import com.solidus.economy.StorageBackend;
 import com.solidus.economy.TransactionLog;
 
+import com.solidus.shop.ShopManager;
+
 import net.minecraft.server.level.ServerPlayer;
 
+import java.sql.SQLException;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Locale;
+import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 
@@ -111,12 +117,77 @@ public final class SolidusAPI implements SolidusApi {
 
     @Override
     public String getCoreVersion() {
-        return "2.3.0";
+        return "2.3.2";
     }
 
     @Override
     public boolean isEngineReady() {
         return isAvailable();
+    }
+
+    /**
+     * solidus-api 2.3.2: the backend signal Analytics used to reach by
+     * reflecting into {@code EconomyEngine.isMysqlMode()}. SQLite tests and
+     * single-server setups see false; a MySQL/MariaDB network Core reports
+     * true and companions switch their ledger reads to
+     * {@link #withLedgerConnection}.
+     */
+    @Override
+    public boolean isMysqlMode() {
+        return engine != null && engine.isMysqlMode();
+    }
+
+    /**
+     * solidus-api 2.3.2: the sell-price table Enforcer used to walk by
+     * reflecting over {@code ShopManager} internals. The shop config is an
+     * immutable in-memory snapshot after load and {@link
+     * ShopManager#getSections()} returns an unmodifiable map, so this is a
+     * cheap, non-blocking snapshot — returned already-completed.
+     *
+     * <p>{@code SolidusMod.getShopManager()} is created <i>after</i>
+     * {@code SolidusAPI.initialize(...)} during mod init, so a companion
+     * calling in that window (or a unit test without the full mod boot)
+     * simply sees an empty table.</p>
+     */
+    @Override
+    public CompletableFuture<Map<String, Double>> getShopSellPrices() {
+        return CompletableFuture.completedFuture(snapshotShopSellPrices());
+    }
+
+    /**
+     * Builds the material -&gt; sell-price snapshot. First-writer-wins on
+     * duplicate materials across sections, mirroring the reflective walk it
+     * replaces (Enforcer's {@code putIfAbsent} + uppercase normalization).
+     */
+    private static Map<String, Double> snapshotShopSellPrices() {
+        ShopManager shop = SolidusMod.getShopManager();
+        if (shop == null) {
+            return Map.of();
+        }
+        Map<String, Double> prices = new LinkedHashMap<>();
+        for (ShopManager.ShopSection section : shop.getSections().values()) {
+            for (ShopManager.ShopItem item : section.items()) {
+                if (item.material() != null && item.sellPrice() > 0.0) {
+                    prices.putIfAbsent(item.material().toUpperCase(Locale.ROOT), item.sellPrice());
+                }
+            }
+        }
+        return java.util.Collections.unmodifiableMap(prices);
+    }
+
+    /**
+     * solidus-api 2.3.2: backend-agnostic ledger access. Companions used to
+     * build a reflective {@code Proxy} over Core's internal
+     * {@code TransactionLog$SqlWork} interface — now the adapter runs
+     * directly, with the same borrow/return semantics Core itself uses
+     * for the supply-integrity checker.
+     */
+    @Override
+    public <T> T withLedgerConnection(LedgerWork<T> work) throws SQLException {
+        if (engine == null || !engine.isInitialized() || engine.getTransactionLog() == null) {
+            throw new SQLException("Solidus ledger is not initialized");
+        }
+        return engine.getTransactionLog().withConnection(work::run);
     }
 
     // -- Balance Operations (Online Players) --------------
