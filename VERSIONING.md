@@ -10,15 +10,28 @@ server owner, at a glance, which releases are built and tested to work together.
 | **Family (Minor)** `2.1.x → 2.2.0` | **Owner-designated architecture era** — never used for ordinary feature additions. The `2.2` family is **reserved** for the cross-server / multi-server storage era. | No — the other mods must move to the new family in lockstep. |
 | **Major** `2.x → 3.0.0` | Architectural reset of the ecosystem contract. | No — full coordinated release. |
 
-Current family: **2.3.1** — the update-resilience / family-contract era. The
+Current family: **2.3.2** — the update-resilience / family-contract era. The
 compatibility architecture landed: all Minecraft-internal touch-points are
 confined to `com.solidus.compat` (audit W-3 — a Minecraft internals change now
 degrades the virtual-GUI layer gracefully with a clear banner instead of
 crashing the server at startup), and the family glue moved from silent
 reflection to a real contract (audit W-5): companions compile against the
 `solidus-api` jar (a Minecraft-free artifact nested inside Core) and declare
-`"depends": { "solidus": ">=2.3.0 <3.0.0" }` in their `fabric.mod.json`, so
+a `"solidus": ">=2.3.x <3.0.0"` floor in their `fabric.mod.json`, so
 Fabric's loader — not a log line — rejects incompatible combinations.
+Patch **2.3.2** closed audit finding **W-5** end-to-end: the solidus-api
+contract gained `isMysqlMode()`, `getShopSellPrices()` and
+`withLedgerConnection(LedgerWork)` — the three surfaces Enforcer and
+Analytics still reached by reflecting into Core internals
+(ShopManager records, EconomyEngine, a Proxy over
+TransactionLog$SqlWork). Both companions now compile against the
+contract with ZERO reflection; their `depends` floors are `>=2.3.2`
+(Governance stays `>=2.3.0` — it never used the new members). The same
+patch fixed a production bug the new degradation tests caught on their
+first run: a CompatProbes lookup used `ServerPlayer` for the
+`containerMenu` field, which is DECLARED on `Player` — the probe always
+failed and the GUI layer was silently disabled on every 2.3.0/2.3.1
+server.
 Patch **2.3.1** (Core alone, per the patch rule above) shipped audit fix
 **W-2**: the optional Redis layer's client was swapped from Lettuce 6.5.5
 to Jedis 5.2.0 — the old build nested only `lettuce-core` while Lettuce
