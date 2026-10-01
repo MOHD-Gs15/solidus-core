@@ -25,7 +25,10 @@ import static org.junit.jupiter.api.Assertions.*;
  *
  * <p><b>Activation</b> (self-skipping otherwise):
  * {@code SOLIDUS_TEST_REDIS_URI} (e.g. {@code redis://127.0.0.1:6379/0};
- * password via {@code SOLIDUS_TEST_REDIS_PASSWORD} if required).</p>
+ * password via {@code SOLIDUS_TEST_REDIS_PASSWORD} if required). Since the
+ * 2.3.1 W-2 round the same surface is ALSO verified infrastructure-free by
+ * {@code RedisLayerFakeServerTest}, and the BUILT jar by
+ * {@code RedisPackagingSmokeTest}.</p>
  */
 @DisplayName("Redis layer: L2 cache + pub/sub (2.2.1)")
 @TestInstance(TestInstance.Lifecycle.PER_CLASS)
@@ -72,9 +75,10 @@ public class RedisLayerTest {
             latch.countDown();
         });
 
-        // NOTE: publishing on the same StatefulRedisConnection that subscribed
-        // still delivers (Redis pub/sub is connection-mode based; the pubsub
-        // connection is separate here), so no second client is needed.
+        // NOTE: publishing on the layer's own command connection delivers
+        // to subscribers (Redis pub/sub is connection-mode based; the pubsub
+        // connection is separate here), so no second client is needed for the
+        // happy-path delivery itself.
         UUID uuid = UUID.randomUUID();
         layer.publishBalanceInvalidation(List.of(uuid));
 
@@ -112,10 +116,10 @@ public class RedisLayerTest {
         layer.onPlayerEvent((uuid, message) -> gotValid.countDown());
 
         // Send garbage through a raw second client to simulate a broken publisher.
-        try (var raw = io.lettuce.core.RedisClient.create(
-                System.getenv("SOLIDUS_TEST_REDIS_URI")).connect()) {
-            raw.sync().publish(RedisLayer.CHANNEL_EVENTS, "not-json");
-            raw.sync().publish(RedisLayer.CHANNEL_EVENTS, "{\"uuid\":\"zzz\"}");
+        try (var raw = new redis.clients.jedis.Jedis(java.net.URI.create(
+                System.getenv("SOLIDUS_TEST_REDIS_URI")))) {
+            raw.publish(RedisLayer.CHANNEL_EVENTS, "not-json");
+            raw.publish(RedisLayer.CHANNEL_EVENTS, "{\"uuid\":\"zzz\"}");
         }
 
         UUID player = UUID.randomUUID();

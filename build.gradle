@@ -132,11 +132,29 @@ dependencies {
     include "org.mariadb.jdbc:mariadb-java-client:3.5.10"
 
     // ── Optional Redis layer (DB scaling plan Phase 3, 2.2.1) ──
-    // Lettuce: async Redis client (L2 balance cache + pub/sub invalidation
-    // and network event bus). Entirely OPTIONAL — disabled by default in
-    // storage.json; a MySQL-only network needs none of it.
-    implementation "io.lettuce:lettuce-core:6.5.5.RELEASE"
-    include "io.lettuce:lettuce-core:6.5.5.RELEASE"
+    // Jedis: plain-socket Redis client (L2 balance cache + pub/sub
+    // invalidation and network event bus). Entirely OPTIONAL — disabled by
+    // default in storage.json; a MySQL-only network needs none of it.
+    //
+    // AUDIT FIX W-2 (2.3.1): replaced Lettuce 6.5.5 with Jedis 5.2.0. The
+    // old build nested ONLY lettuce-core, but Lettuce hard-requires Netty +
+    // Project Reactor at runtime — so the SHIPPED jar crashed with
+    // NoClassDefFoundError the moment redis.enabled=true, while CI stayed
+    // green because the Gradle TEST classpath silently supplied the missing
+    // transitives. RedisLayer never used Lettuce's async/reactive machinery
+    // (every call already funnels through one guard executor with a hard
+    // timeout), so the sync-only, zero-Netty Jedis client is the right shape:
+    // no classpath collision with Minecraft's own Netty, no JNI natives.
+    // commons-pool2 + org.json are Jedis compile-time companions (~150 KB
+    // combined) nested for completeness. slf4j + gson are provided by the
+    // Minecraft/Fabric runtime like the rest of the mod. The Redis wire
+    // payloads are unchanged — 2.3.x servers interoperate on the same Redis.
+    implementation "redis.clients:jedis:5.2.0"
+    implementation "org.apache.commons:commons-pool2:2.13.1"
+    implementation "org.json:json:20260814"
+    include "redis.clients:jedis:5.2.0"
+    include "org.apache.commons:commons-pool2:2.13.1"
+    include "org.json:json:20260814"
 
     // ── Testing ──────────────────────────────────────────
     testImplementation "org.junit.jupiter:junit-jupiter:5.10.2"

@@ -10,7 +10,7 @@ server owner, at a glance, which releases are built and tested to work together.
 | **Family (Minor)** `2.1.x → 2.2.0` | **Owner-designated architecture era** — never used for ordinary feature additions. The `2.2` family is **reserved** for the cross-server / multi-server storage era. | No — the other mods must move to the new family in lockstep. |
 | **Major** `2.x → 3.0.0` | Architectural reset of the ecosystem contract. | No — full coordinated release. |
 
-Current family: **2.3.0** — the update-resilience / family-contract era. The
+Current family: **2.3.1** — the update-resilience / family-contract era. The
 compatibility architecture landed: all Minecraft-internal touch-points are
 confined to `com.solidus.compat` (audit W-3 — a Minecraft internals change now
 degrades the virtual-GUI layer gracefully with a clear banner instead of
@@ -18,8 +18,17 @@ crashing the server at startup), and the family glue moved from silent
 reflection to a real contract (audit W-5): companions compile against the
 `solidus-api` jar (a Minecraft-free artifact nested inside Core) and declare
 `"depends": { "solidus": ">=2.3.0 <3.0.0" }` in their `fabric.mod.json`, so
-Fabric's loader — not a log line — rejects incompatible combinations. The
-previously promised family: 2.2.5 hardened the whole storage/auction surface against the security-audit
+Fabric's loader — not a log line — rejects incompatible combinations.
+Patch **2.3.1** (Core alone, per the patch rule above) shipped audit fix
+**W-2**: the optional Redis layer's client was swapped from Lettuce 6.5.5
+to Jedis 5.2.0 — the old build nested only `lettuce-core` while Lettuce
+hard-requires Netty + Project Reactor at runtime, so `redis.enabled=true`
+crashed the shipped jar with `NoClassDefFoundError` while CI stayed green
+(the test classpath silently supplied the missing transitives). Wire
+payloads are unchanged, so mixed 2.3.x servers interoperate on the same
+Redis; see `docs/DB_SCALING_PLAN.md` §12.
+
+The previously promised family: 2.2.5 hardened the whole storage/auction surface against the security-audit
 findings SOL-001…SOL-006 — Redis URI credential redaction + scheme allowlist,
 TLS-by-default MySQL connections with a loud cleartext warning off loopback,
 player-name sanitization at every ledger/auction boundary, log-forgery-proof

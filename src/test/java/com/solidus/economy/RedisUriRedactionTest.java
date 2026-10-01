@@ -15,7 +15,7 @@ import static org.junit.jupiter.api.Assertions.*;
  *       up front, and its error message must itself be credential-free.</li>
  * </ul>
  *
- * Pure unit tests — no Redis server, no Lettuce connection is ever opened
+ * Pure unit tests — no Redis server, no client connection is ever opened
  * (the scheme check fires before any network I/O).
  */
 @DisplayName("Redis URI security (SOL-001 redaction / SOL-003 scheme allowlist)")

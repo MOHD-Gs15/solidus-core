@@ -28,6 +28,8 @@
 8. [Migration & Rollout](#8-migration--rollout)
 9. [Risks & Mitigations](#9-risks--mitigations)
 10. [Effort Estimate](#10-effort-estimate)
+11. [Shipped vs Remaining (post-2.2.0 scope ledger)](#11-shipped-vs-remaining-post-2220-scope-ledger)
+12. [Redis Client Swap — Lettuce → Jedis (audit W-2, shipped 2.3.1)](#12-redis-client-swap--lettuce--jedis-audit-w-2-shipped-231)
 
 ---
 
@@ -261,9 +263,15 @@ transfers over 2 servers, final supply invariant holds).
 network works; Redis makes it fast and aware.
 
 ```gradle
-implementation "io.lettuce:lettuce-core:6.5.5.RELEASE"
-include "io.lettuce:lettuce-core:6.5.5.RELEASE"
+implementation "redis.clients:jedis:5.2.0"
+implementation "org.apache.commons:commons-pool2:2.13.1"
+implementation "org.json:json:20260814"
+include "redis.clients:jedis:5.2.0"
+include "org.apache.commons:commons-pool2:2.13.1"
+include "org.json:json:20260814"
 ```
+
+(W-2, 2.3.1: the original Lettuce choice was replaced by Jedis — see §12.)
 
 New `config` section:
 
@@ -409,7 +417,7 @@ Additional network flows:
 | --- | --- | --- |
 | 1 — Storage abstraction | Interface, base class, config hook, contract tests | ~1 week |
 | 2 — MySQL/MariaDB | Dialect, pool, schema, concurrency rewrite, race harness | ~2–3 weeks |
-| 3 — Redis cache/bus | Lettuce integration, L1/L2 cache, events | ~1 week |
+| 3 — Redis cache/bus | Jedis integration, L1/L2 cache, events | ~1 week |
 | 4 — Network integrity | Invariant checker, notification routing, baltop polish | ~1 week |
 | Migration tooling + docs | Cutover command, SQL scripts, runbook | ~3–4 days |
 
@@ -460,7 +468,7 @@ was already fully functional without Redis; the Redis layer stays optional.
    older than MariaDB 10.6 / MySQL 8). Transaction helpers use the JDBC API
    (`setAutoCommit(false)`) on MySQL and keep `BEGIN IMMEDIATE` on SQLite.
 2. **Redis layer** — DONE, OPTIONAL (`redis.enabled=false` default).
-   `RedisLayer` (Lettuce 6.5.5): L2 balance cache (TTL-bounded, default 30 s)
+   `RedisLayer` (Jedis 5.2.0 since 2.3.1/W-2 — plain sockets, no Netty): L2 balance cache (TTL-bounded, default 30 s)
    + pub/sub invalidation bus (`solidus:bal:inv`) + network-aware
    notification delivery (`solidus:events` — the server hosting the player
    delivers instantly and deletes the durable row). Circuit breaker: an
@@ -573,3 +581,34 @@ MariaDB 11.8 before re-pushing:
    escrow check dispatch) and `/solidus-admin integrity rebase` (accept
    current books after investigation). Default `storage.json` template now
    ships the `integrity` block with commented defaults.
+
+## 12. Redis Client Swap — Lettuce → Jedis (audit W-2, shipped 2.3.1)
+
+The original Phase 3 build used `io.lettuce:lettuce-core:6.5.5.RELEASE` and
+nested only that one jar. Lettuce hard-requires **Netty** and **Project
+Reactor** at runtime, so the SHIPPED mod jar crashed with
+`NoClassDefFoundError` the moment `redis.enabled=true` — while CI stayed
+green, because the Gradle **test** classpath silently supplied both missing
+transitives. That gap (the built artifact never matching what the tests ran
+against) is what audit finding **W-2** called out.
+
+`RedisLayer` never used Lettuce's async/reactive machinery — every call
+already funnels through a single guard executor with a hard timeout — so the
+sync-only, zero-Netty **Jedis 5.2.0** client is the correct shape:
+
+- plain sockets — no classpath collision with Minecraft's own Netty, no JNI
+  natives, no reactor;
+- RESP2 pinned, `CLIENT SETINFO` disabled (pre-7.2 servers and restrictive
+  managed-Redis proxies never see connect-time chatter they may refuse);
+- lazy command reconnect after connection loss; dedicated daemon thread
+  retries the pub/sub subscription on a 5 s backoff;
+- `commons-pool2` + `org.json` (Jedis compile-time companions, ~150 KB) are
+  nested for completeness; slf4j + gson remain provided by the Fabric runtime.
+
+The Redis wire payloads are unchanged — 2.3.x servers interoperate on the
+same Redis regardless of which client they embed. Guarding against a
+regression of the original packaging bug is now enforced in-repo by
+`RedisPackagingSmokeTest` (asserts the BUILT jar nests jedis/pool2/json and
+never lettuce/netty) and `RedisLayerFakeServerTest` (full client path over
+an in-JVM RESP2 server); live-server fidelity stays with `RedisLayerTest`
+against a `redis:7` container in CI.

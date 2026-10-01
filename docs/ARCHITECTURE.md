@@ -334,7 +334,7 @@ com.solidus
 │   ├── Money.java                // Exact 2-decimal boundary wrapper (BigDecimal, 2.2.0+)
 │   ├── BalanceManager.java       // High-level balance API
 │   ├── TransactionLog.java       // Audit trail + notifications + CSV export (dialect-aware 2.2.0+)
-│   ├── RedisLayer.java           // OPTIONAL Redis L2 cache + pub/sub (Lettuce, 2.2.1+)
+│   ├── RedisLayer.java           // OPTIONAL Redis L2 cache + pub/sub (Jedis, 2.2.1+; Jedis since 2.3.1/W-2)
 │   ├── StorageMigrator.java      // SQLite → MySQL cutover copy + verify (2.2.1+)
 │   └── EscrowAccount.java        // Bid-escrow system account (2.1.4+)
 ├── gui/                          // Shared GUI primitives
@@ -444,7 +444,9 @@ Since 2.1.5 all storage consumers depend on the `StorageBackend` interface, not 
 
 #### Optional Redis layer (2.2.1, DB scaling plan Phase 3)
 
-`RedisLayer` (Lettuce) activates ONLY with `"redis": { "enabled": true }` in `storage.json`. Role boundaries:
+`RedisLayer` (Jedis 5.2.0 — swapped from Lettuce in 2.3.1, audit W-2: the
+shipped jar must carry its own Redis runtime with zero Netty/Reactor) activates
+ONLY with `"redis": { "enabled": true }` in `storage.json`. Role boundaries:
 
 - **L2 balance cache** (read path): keys `solidus:bal:<uuid>` with a short TTL (default 30 s). A cache hit skips one database round trip; a miss falls through to MySQL and populates. Staleness is bounded by the TTL + instant invalidation — **money mutations never trust cached values** (they re-validate atomically inside their own SQL transaction).
 - **Invalidation bus** (`solidus:bal:inv`): after every committed mutation the writer DELetes its L2 keys and broadcasts — every server drops its local copy. Redis pub/sub is fire-and-forget: the TTL is the correctness backstop for lost messages.
