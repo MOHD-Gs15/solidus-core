@@ -4,14 +4,17 @@
 # Answers ONE question before players hit it: "does Solidus still
 # compile against the Minecraft versions it claims to support?"
 #
-# Matrix:
-#   - The pinned release version (26.1.2) is REQUIRED to pass
+# Matrix (since the 2.4.0 family / WS-1):
+#   - The pinned release version (26.3) is REQUIRED to pass
 #     (continue-on-error: false — same contract as test.yml).
-#   - Future/unreleased targets (26.2, 26.3, ...) are PROBES:
-#     failures are reported but do not block the release. The
-#     goal is early signal of exactly which internals churned,
-#     so the update checklist (compat/PACKAGE.md) starts from a
-#     failing diff instead of a player's crash report.
+#   - 26.1.2 is a BACKWARD probe (informative): Family A is registry-id
+#     keyed and Family B resolves its drop shape reflectively, so the
+#     green back-probe is nearly free and is the compat-matrix safety net.
+#   - 26.2 (backward) and 26.4 (forward) are PROBES: failures are
+#     reported but do not block the release. The goal is early signal
+#     of exactly which internals churned, so the update checklist
+#     (compat/PACKAGE.md) starts from a failing diff instead of a
+#     player's crash report.
 #
 # Fabric API version is resolved dynamically from the Fabric
 # maven metadata (latest build for the target MC version) so the
@@ -43,20 +46,32 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # The pinned, contractually-supported release target.
+          # WS-1: the pinned, contractually-supported release target.
+          # 26.3 is REQUIRED since the 2.4.0 family upgrade — failures
+          # block (continue-on-error: false, same contract as test.yml).
+          - mc: "26.3"
+            fabric_api: "0.165.0+26.3"
+            mc_dep: "~26.3"
+            required: "true"
+          # Backward probe (26.1.2): must stay green via the dual-strategy
+          # CompatDrop (THREE_ARG_PREDICTION on 26.3 / TWO_ARG on 26.1.x)
+          # and the version-free Palette. Informative, not a gate.
           - mc: "26.1.2"
             fabric_api: "0.155.2+26.1.2"
             mc_dep: "~26.1.2"
-            required: "true"
-          # Forward probes: informative only. Extend this list as new
-          # Minecraft versions are announced — nothing else changes.
+            required: "false"
+          # Backward/informative probe: expected green now that Family A is
+          # registry-id keyed and Family B is reflection-resolved. A failure
+          # here is a valuable early signal, not a release blocker.
           - mc: "26.2"
             fabric_api: "resolve"
             mc_dep: "~26.2"
             required: "false"
-          - mc: "26.3"
+          # Future probe: Fabric API builds for 26.4 already exist
+          # (0.165.1+26.4 and later). Informative, not a gate.
+          - mc: "26.4"
             fabric_api: "resolve"
-            mc_dep: "~26.3"
+            mc_dep: "~26.4"
             required: "false"
 
     steps:

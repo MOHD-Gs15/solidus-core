@@ -20,12 +20,17 @@ com/solidus/compat/
 ├── ClickDescriptor.java        ← تمثيل النقرة المستقر (بدون أي نوع من MC)
 ├── ClickInputResolver.java     ← الواجهة المستقرة لتحويل مدخلات النقر
 ├── ContainerClickBridge.java  ← الواجهة المستقرة لتوجيه نقرات الحاويات
+├── Palette.java               ← لوحة ألوان الـGUI بمفاتيح registry id (بلا ثوابت MC ملونة) — WS-1
+├── CompatDrop.java            ← الإسقاط الأرضي version-free (استراتيجية Prediction/2-arg) — WS-1
 └── impl_26_1/
     └── ContainerClickBridge_26_1.java   ← كل معرفة 26.1.x (accessors + ContainerInput)
 ```
 
 ## قائمة الفحص عند تحديث Minecraft (مثال: 26.1 → 26.2)
 
+0. **`CompatArchitectureGuardTest`** (WS-1): شغّل هذا الاختبار **قبل أي شيء آخر** —
+   إن أخضر فهذا يعني أن الشجرة ما زالت نظيفة (صفر ثوابت ملونة، صفر `.drop(` خام
+   خارج `com.solidus.compat`)، وأي انحدار يُكشف هنا بدل السجل.
 1. **`gradle.properties`**: `minecraft_version`، `fabric_api_version`، و`minecraft_dep`.
 2. **`impl_26_2/`** (جديدة): انسخ `ContainerClickBridge_26_1` وعدّل الأشكال المتغيرة
    (accessors الحزمة، نوع مدخل النقر بدل `ContainerInput`، إلخ).
@@ -67,6 +72,25 @@ com/solidus/compat/
 | `TransactionLog` | الـ mixins على `ServerPlayer.hurtServer`/`die` (Enforcer) |
 | التخزين (SQLite/MySQL) | `fabric.mod.json` version pinning (`minecraft_dep`) |
 | الـ ledger والـ cryptography | أي ربط بـ `ContainerInput` أو packet records |
+| `Palette` (مفاتيح registry id نصية) | ثوابت `Items.*`/`Blocks.*` الملونة (اختفت في 26.3) |
+| `CompatDrop` (واصفان معروفان + MethodHandle) | توقيع `Player/ServerPlayer.drop` (تغيّر في 26.3) |
+
+### القاعدة المستفادة من WS-1
+
+> **الثوابت تتغيّر، المعرّفات تبقى.** عند أي تحديث MC: فضّل الحلّ عبر
+> `BuiltInRegistries` بمفتاح نصي على الإحالة إلى ثوابت `Items`/`Blocks`.
+> في 26.3 حذف Mojang الثوابت الملونة من `Items` **و**`Blocks` (بقي ثابت عام واحد)
+> بينما بقيت registry IDs — فصار الملف الوحيد الذي يعرف الألوان هو `Palette`.
+
+> **The constants change, the ids stay.** On every Minecraft upgrade,
+> prefer resolving through `BuiltInRegistries` with a string id over
+> referencing `Items`/`Blocks` constants. In 26.3 Mojang removed the
+> colored constants from `Items` AND `Blocks` (one generic constant
+> survived) while the registry ids all remained — making `Palette` the
+> only file in the codebase that knows the colors. For world drops, the
+> same lesson applies to signatures: `CompatDrop` owns the two measured
+> shapes (26.1.x 2-arg, 26.3 `Prediction` 3-arg) so no call site ever
+> re-learns them.
 
 ---
 
@@ -81,3 +105,12 @@ surface produces a clear message while commands/storage/ledger keep working.
 The 26.1-specific knowledge lives exclusively in `impl_26_1/`. The checklist
 above is the complete Minecraft-update procedure — everything else in the
 codebase is deliberately version-free.
+
+**Since 2.4.0 (WS-1)**, two more surfaces joined the isolation boundary:
+`Palette` renders every GUI color from registry ids (the colored `Items.*`
+constants were removed in 26.3 — ids survived), and `CompatDrop` wraps the
+world-drop call sites behind a dual-strategy MethodHandle (26.3's
+`ServerPlayer#drop(ItemStack, boolean, Prediction)` with `SERVER_ONLY`,
+26.1.x's `Player#drop(ItemStack, boolean)`), failing closed with a CRITICAL
+log + persistent alternative instead of silently destroying items.
+`CompatArchitectureGuardTest` enforces both boundaries at build time.

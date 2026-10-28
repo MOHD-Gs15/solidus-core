@@ -10,7 +10,25 @@ server owner, at a glance, which releases are built and tested to work together.
 | **Family (Minor)** `2.1.x → 2.2.0` | **Owner-designated architecture era** — never used for ordinary feature additions. The `2.2` family is **reserved** for the cross-server / multi-server storage era. | No — the other mods must move to the new family in lockstep. |
 | **Major** `2.x → 3.0.0` | Architectural reset of the ecosystem contract. | No — full coordinated release. |
 
-Current family: **2.3.3** — the update-resilience / family-contract era. The
+Current family: **2.4.0** — the Minecraft 26.3 / registry-id era (WS-1).
+A Minecraft upgrade changes `minecraft_dep` for all four mods and touches
+surfaces companions reach too (the Enforcer mixins on
+`ServerPlayer.hurtServer`/`die`, shared Fabric API minors), so per the table
+above this is a LOCKSTEP family release: Analytics, Governance and Enforcer
+move to 2.4.0 on the same `fabric_api` minor (0.165.0+26.3) and loader
+(0.20.1), with mutual `depends`/`suggests` floors raised to
+`>=2.4.0 <3.0.0`. The code story: Minecraft 26.3 removed the colored
+`Items.*`/`Blocks.*` constants (15 panes + both indicator dyes) — Family A
+is now rendered from registry ids by `com.solidus.compat.Palette`, the one
+key measured to survive version churn — and reshaped `Player#drop` into
+`ServerPlayer#drop(ItemStack, boolean, Prediction)` — Family B is wrapped by
+`com.solidus.compat.CompatDrop` behind a dual-strategy MethodHandle
+(3-arg `Prediction.SERVER_ONLY` on 26.3, 2-arg on 26.1.x) that keeps the
+26.1.2 backward probe green; both boundaries are enforced at build time by
+`CompatArchitectureGuardTest`. 26.3 is the required compat-matrix target;
+26.1.2 and 26.2 ride as informative back-probes and 26.4 as a forward probe.
+
+Previous family: **2.3.3** — the update-resilience / family-contract era. The
 compatibility architecture landed: all Minecraft-internal touch-points are
 confined to `com.solidus.compat` (audit W-3 — a Minecraft internals change now
 degrades the virtual-GUI layer gracefully with a clear banner instead of
