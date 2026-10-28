@@ -418,3 +418,241 @@ concurrent race.
 31 — 27 MySQL + 4 Redis). Verified locally against a real MariaDB 11.8.6:
 397 executed, 0 failed, 4 skips (Redis only — no local Redis); GitHub
 Actions is expected to run all 397 with zero gated skips.
+
+---
+
+## 2.2.5 — Security-audit round: SOL-001..SOL-006 closed on the storage/auction surface
+
+The first dedicated security audit of the storage/auction plane produced six
+findings (SOL-001..SOL-006); all six are closed in this release, with 38 new
+tests pinning every fix. **Why:** the multi-server surface added in 2.2.0–2.2.4
+(passwords in Redis URIs, cleartext DB connections, unsanitized names flowing
+into the ledger and the logs, unbounded auction payloads) needed a hardening
+pass before real networks deployed it. Family: `2.2.x` (multi-server era),
+patch level.
+
+**Fixed (production):**
+
+- **SOL-001 / CWE-532 — Redis URI credential redaction.** Every
+  `RedisLayer` log and error path now goes through `redactUri`; the
+  `[^@]+@` pattern also covers raw `/` passwords, and the first `@` after
+  `//` is always treated as the RFC-3986 userinfo delimiter.
+- **SOL-002 / CWE-319 — TLS for MySQL by default.** `useSsl` now defaults
+  to **true** (secure silent default); a loud cleartext warning fires when
+  `useSsl=false` is chosen on a non-loopback host (`isLoopbackHost`:
+  `localhost`/`127.x`/`::1` only). The `storage.json` template and docs
+  were flipped accordingly.
+- **SOL-003 — Redis scheme allowlist.** Only `redis://` and `rediss://`
+  are accepted, fail-closed **before** any network I/O (`rediss://` gets
+  TLS with certificate verification).
+- **SOL-004 — player-name sanitization at every boundary.** Ledger/auction
+  names are clamped to the `VARCHAR(64)` width with control characters and
+  legacy color codes stripped (TransactionLog choke point, MySQL/SQLite
+  upserts + name caches, auction seller/bidder/buyer names, display side
+  for DB-sourced names).
+- **SOL-005 / CWE-117 — log-forgery-proof logging.** `sanitizeForLog`
+  escapes CR/LF/TAB so a tampered ledger row cannot forge log lines
+  (TransactionLog, PacketHandler, ShopManager).
+- **SOL-006 / CWE-400 — auction payload cap.** A 128 KB
+  `MAX_ITEM_NBT_CHARS` cap on serialized auction payloads is enforced at
+  LIST time, before any fee or row is written.
+
+**Tests:** +38 (sanitizers incl. log-forgery and the 64-char boundary, URI
+redaction incl. slash-passwords, scheme allowlist, SSL default flip,
+loopback classification, NBT cap at/past boundary) — new classes
+`RedisUriRedactionTest`, `MySqlLoopbackHostTest`, `AuctionNbtCapTest` and
+`StorageConfigRedisTest`.
+
+**Test totals after 2.2.5:** 435 tests per run; CI fully green — 870 passed,
+0 failed, 0 skipped across the two per-push executions (plain + coverage).
+
+---
+
+## 2.2.6 — Reliability & accounting integrity round (full-audit closure)
+
+A full economy audit (report in `docs/AUDIT_REPORT.md`, +209 lines) produced
+CRITICAL/HIGH/MEDIUM findings across escrow accounting, auctions, trades and
+the shop; all are fixed here. **Why:** each CRITICAL item is a scenario in
+which restarts, overlapping bids or cross-server races could lose or mint
+real money. Family: `2.2.x`, patch level.
+
+**CRITICAL — economy/accounting integrity:**
+
+- **ESC-01:** `EconomyEngine.initialize()` no longer resets the escrow
+  account to zero on restart; `ensureAccount()` creates it only if absent.
+  A restart no longer wipes escrowed bid funds.
+- **ASC-01:** `extendListingExpiry` updates the correct table/column — the
+  anti-snipe extension no longer throws `SQLException` after a bid lands
+  (which had left an unbacked top bid: bidder refunded, seller never paid).
+- **ASC-02:** `purchaseItem` claims listings conditionally (`status = 0`
+  guard) and validates affected rows — cross-server double purchase on a
+  shared MySQL market is eliminated.
+- **ESC-02:** `placeBidAs` re-reads displaced bid state inside the claim
+  phase; refunds are no longer sourced from stale phase-1 snapshots
+  (double refund + trapped escrow under overlapping bids).
+- **ASC-03:** `refundOrphanedBidStates` claims the bid-state row before
+  refunding — crash-replay and cross-server double refund eliminated.
+
+**HIGH/MEDIUM — trade, shop, network hardening:**
+
+- **TRD-01..05:** trade execution re-resolves players at hand-off, world-drop
+  recovery for item transfers, exceptional-future force-abort, hook-free
+  internal money transfers, synchronized state claims, shutdown drain.
+- **M-1/M-2:** shop buy/sell liveness re-checks + item recovery paths.
+- **M-5:** `SellScreenHandler.removed()` wrapped in try/finally — no lost
+  items when the screen closes mid-operation.
+- **HNG-01:** Redis L2 checks moved off the caller thread onto a
+  guarded-call executor with cancel — server-thread hang hardening.
+- **L-2/M-3/L-4:** `MAX_TRANSACTION` guard, component-bearing stack sell
+  guard, `PayCommand` exceptional-future handling + entry rounding.
+
+**Test totals after 2.2.6:** 435 tests executed, 0 failures, 31 skipped
+(the MySQL/Redis container integration tests run in CI only).
+
+---
+
+## 2.3.0 — FAMILY BUMP: update-resilience architecture + solidus-api contract
+
+**This is a family (minor) bump, not an ordinary feature release** — the
+compatibility architecture of the ecosystem changed (audit findings W-3 and
+W-5). Companions must move to the 2.3 family in lockstep (see
+`VERSIONING.md`).
+
+**W-3 — mixin fragility / update failure points:**
+
+- `ContainerClickMixin` (renamed from `ServerPlayerEntityMixin`) declares
+  `require=0` on the high-risk `handleContainerClick` injection — a future
+  Minecraft internals change logs a warning instead of crashing the server
+  at startup.
+- New `com.solidus.compat` package — the ONLY code that knows Minecraft
+  click internals: `Compat` facade + GUI gate, `CompatState` capability
+  flags, `CompatProbes` (startup reflective verification of every
+  compiled-against shape), `SolidusMixinPlugin` (IMixinConfigPlugin postApply
+  tracking + first-JOIN cross-check that downgrades if the mixin never
+  applied), and `impl_26_1/ContainerClickBridge_26_1` holding all 26.1.x
+  knowledge.
+- Graceful degradation: on any probe/apply failure every virtual-GUI open
+  path is blocked with a clear banner + player message, while commands,
+  storage, ledger, taxes and companion enforcement keep working.
+- `/solidus-admin compat` reports the probe state; `compat/PACKAGE.md` is
+  the complete Minecraft-update checklist (AR+EN).
+
+**W-5 — reflection family coupling replaced by a loader-enforced contract:**
+
+- New `solidus-api` Gradle subproject: a Minecraft-free contract jar
+  (`SolidusApi`, `SolidusApiAccess`, `SolidusTransactionHook`, `BalanceEntry`,
+  `EconomyStats`, `TransferResult`, `TransactionRecord`) shipped nested
+  jar-in-jar.
+- `SolidusAPI` becomes the legacy reflective shim: it implements + installs
+  the contract and keeps every historic erased signature for 2.1.x-era
+  companions (`getEconomyEngine`/`getTransactionLog` kept **deprecated for
+  one transition family**); a new audited `setBalance` replaces Governance's
+  internal `SQLiteStorage` reach-in; `logTransaction` validates type codes
+  strictly (no silent `SHOP_BUY` fallback).
+
+**CI:** new `compat-matrix.yml` compiles against MC 26.1.2 (required) and
+26.2/26.3 (forward probes, informative-only) with Fabric API resolved
+dynamically from maven metadata; `fabric.mod.json`'s Minecraft dependency is
+parametrized via `minecraft_dep` (default unchanged, `~26.1.2`).
+
+**Test totals after 2.3.0:** 435 tests green.
+
+---
+
+## 2.3.1 — W-2: self-contained Redis runtime (Lettuce → Jedis)
+
+**Why:** the old build nested only `lettuce-core`, while Lettuce
+hard-requires Netty + Project Reactor at runtime — `redis.enabled=true`
+meant `NoClassDefFoundError` on first use IN PRODUCTION, while CI stayed
+green because the Gradle test classpath silently supplied the missing
+transitives. Family: `2.3.x`, patch level (Core alone).
+
+- `RedisLayer` now speaks **Jedis 5.2.0** (plain sockets — no classpath
+  collision with Minecraft's own Netty, no JNI natives), with
+  commons-pool2 + org.json nested alongside. Wire payloads are unchanged:
+  2.3.x servers interoperate on the same Redis regardless of which client
+  they embed. RESP2 pinned, `CLIENT SETINFO` disabled (pre-7.2 servers
+  never see connect-time chatter), lazy command reconnect + dedicated
+  pub/sub reconnect thread.
+- **New regression guards:**
+  - `RedisPackagingSmokeTest` drives the BUILT jar through an isolated
+    `URLClassLoader` (null parent) so a missing runtime dependency fails
+    the build loudly instead of a customer's server; asserts
+    jedis/pool2/json are nested and lettuce/netty never come back.
+  - `FakeRedisServer` + `RedisLayerFakeServerTest`: the full Jedis client
+    path over an in-JVM RESP2 server on a real TCP socket, including
+    fail-closed startup; subscribe confirmations use RESP2 INTEGER counts
+    exactly like real Redis.
+  - The live `RedisLayerTest` (redis:7 container in CI) keeps real-server
+    fidelity.
+- Docs updated (`DB_SCALING_PLAN` §12, ARCHITECTURE, VERSIONING 2.3.1
+  entry); `mod_version` bumped so the nested solidus-api tracks it.
+
+**Test totals after 2.3.1:** 446 tests, 0 failures.
+
+---
+
+## 2.3.2 — W-5 closure: solidus-api contract extensions + compat probe fix
+
+**Why:** three companion surfaces still reached into Core internals by
+reflection (Enforcer's ShopManager walk, Analytics'
+`EconomyEngine.isMysqlMode` + a Proxy over `TransactionLog$SqlWork`); the
+integration audit flagged them as the last reflective coupling in the
+family. Family: `2.3.x`, patch level.
+
+- **Three new contract members** replace the last reflective reach-ins:
+  - `isMysqlMode()` — the backend signal Analytics needs to follow Core's
+    storage choice (SQLite files vs shared MySQL ledger).
+  - `getShopSellPrices()` — material → sell-price snapshot of the admin
+    shop; replaces Enforcer's reflective walk of ShopManager internals.
+  - `withLedgerConnection(LedgerWork<T>)` — backend-agnostic, bounded,
+    read-only ledger SQL through Core's own live connection; the new
+    `LedgerWork` functional interface mirrors `SqlWork` exactly.
+- `SolidusAPI` (the shim serving the contract) implements all three on the
+  existing engine/shop singletons; `getCoreVersion()` now tracks the
+  `mod_version`, with a new anti-drift test asserting equality with
+  `gradle.properties`.
+- `SolidusApiContractExtensionTest` pins the degradation semantics:
+  `isMysqlMode` false when uninitialized, empty shop table when the shop is
+  not yet loaded, fail-closed `SQLException` when the ledger is not live,
+  and the generic result/exception pass-through shape.
+- **Compat probe production fix** (caught by the new degradation tests on
+  their first run): a `CompatProbes` lookup used `ServerPlayer` for the
+  `containerMenu` field, which is DECLARED on `Player` — the probe always
+  failed and the GUI layer was **silently disabled on every 2.3.0/2.3.1
+  server**. The probe now reflects on the DECLARING class, and
+  `CompatDegradationTest` (11 tests) pins the W-3 degradation behavior.
+- Governance followed in the same patch line (2.3.0 → 2.3.2): its
+  simulation still carried the family's LAST reflective reach-in
+  (`getEconomyEngine() → getStorage() → getActiveAccountCount(int)` —
+  methods Core no longer declares, so the path silently returned -1 on
+  every query); it now rides `withLedgerConnection` like everyone else.
+  Both companions compile against the contract with ZERO reflection; their
+  `depends` floors are `>=2.3.2`.
+
+**Test totals after 2.3.2:** 462 tests, 0 failures.
+
+---
+
+## 2.3.3 — CI hole closed: the W-2 packaging smoke was silently skipping
+
+**Why:** the integration audit found that the `test` task did not depend on
+`jar`, and CI runs `./gradlew test` on a fresh checkout — so
+`RedisPackagingSmokeTest` found no jar under `build/libs` and aborted via
+`Assumptions`: green, but unverified. The W-2 net ("CI catches a broken
+shipped jar") was effectively OFF, and 2.3.2-era local runs had been
+smoke-testing the stale 2.3.1 artifact. Family: `2.3.x`, patch level (Core
+alone).
+
+- `build.gradle`: every Test task now `dependsOn jar` (local runs too).
+- `RedisPackagingSmokeTest` prefers `solidus-<mod_version>.jar` over stale
+  artifacts and asserts the nested contract jar is exactly
+  `solidus-api-<mod_version>.jar` (anti-drift for the include wiring).
+- `getCoreVersion` constant → 2.3.3 (the anti-drift test caught the bump).
+- `fabric.mod.json` `suggests`: added `solidus-enforcer` (previously listed
+  only Governance and Analytics).
+- `notes/AGENT_NOTES.md`: Redis layer documented on Jedis 5.2.0 (was still
+  "Lettuce 6.5.5"); SOL-003 note updated for Jedis TLS.
+
+**Test totals after 2.3.3:** 462 tests, 0 failures, 31 skipped
+(live-service env-gated as designed; all 462 execute in CI).

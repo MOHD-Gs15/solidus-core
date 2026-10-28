@@ -1,6 +1,6 @@
 # Solidus-Core Architecture Documentation
 
-> **Version**: 2.1.4 | **Minecraft**: 26.1.x | **Fabric**: 0.19.4+ | **Java**: 25  
+> **Version**: 2.3.3 | **Minecraft**: 26.1.x | **Fabric**: 0.19.4+ | **Java**: 25  
 > **License**: MIT | **Environment**: 100% Server-Side Only
 
 ---
@@ -1412,7 +1412,7 @@ Layer 6: broadcastFullState() resyncs
 | `getTopBalances(int, int)` | `CompletableFuture<List<BalanceEntry>>` | Paged leaderboard query (offset 10 → ranks start at 11) |
 | `getBalanceEntryCount()` | `CompletableFuture<Integer>` | Count of economy entries (page footers) |
 | `getEconomyStats()` | `CompletableFuture<EconomyStats>` | Aggregates: count, mean, supply, Gini |
-| `getTransactionLog()` | `TransactionLog` | Access to transaction logging |
+| `getTransactionLog()` | `TransactionLog` | **Deprecated** legacy shim (kept for 2.1.x-era companions) — use `withLedgerConnection(LedgerWork)` from the `solidus-api` contract instead; removal policy in [VERSIONING.md](../VERSIONING.md) |
 | `registerTransactionHook(hook)` | `boolean` | Register an economy transaction hook (false if name taken) |
 | `unregisterTransactionHook(hook)` | `boolean` | Remove a previously registered hook |
 | `getRegisteredHookCount()` | `int` | Number of active hooks (diagnostics) |
@@ -2041,35 +2041,76 @@ balance against the sum of open top bids on every boot.
 
 ## 18. Testing Strategy
 
-Solidus includes a comprehensive test suite using JUnit 5 and Mockito.
+Solidus includes a comprehensive test suite built on **JUnit 5 only — zero
+mocking frameworks**. An earlier revision of this section credited a mocking
+framework that the suite never actually used: the Java 25 toolchain cannot
+instrument classes or interfaces through an inline mock maker, so the suite
+relies on real storage harnesses, pure-Java stubs and a thin `EconomyEngine`
+subclass instead (history and dates in `notes/CHANGES.md`, 2.2.2 and 2.2.3).
 
 ### Test Files
 
-20 test classes, 309 `@Test` methods (all green on JDK 25). Storage/state-level
-tests run on plain SQLite or pure Java — no Minecraft bootstrap required:
+**42 test classes, 448 static `@Test` declarations** — both numbers are
+machine-enforced by `scripts/docs_lint.py` against `src/test`. The last
+CI-recorded total is **462 tests per full run** (2.3.3 release verification
+note; the small delta over the static count is runtime accounting — the
+abstract contract harness executes once per storage backend). Storage and
+state-level tests run on plain SQLite or pure Java — no Minecraft bootstrap
+required; the MySQL/Redis service-container tests self-skip locally and run
+for real in CI.
 
 | Test | Coverage |
 |------|----------|
-| `BalanceManagerTest` (17) | get/add/subtract balances, transfer validation, atomicity |
-| `SQLiteStorageTest` (27) | Player creation, persistence, concurrency (100-thread races), restart survival |
-| `TransferAtomicTest` (10) | Single-transaction transfer semantics (success/insufficient/overflow/self) |
-| `TransferAtomicLedgerTest` (5) | Ledger rows commit inside the money transaction; failure rolls back both |
-| `TransactionLogExportTest` (12) | CSV building, RFC 4180 escaping, formula-injection guard |
-| `TransactionLogPaginationTest` (10) | LIMIT/OFFSET pages, counts |
-| `BaltopPaginationTest` (10) | Paged leaderboard, rank continuity, escrow exclusion |
-| `EconomyStatsTest` (5) | Aggregates: count, mean, supply, Gini |
-| `BidEscrowFlowTest` (13) | 2.1.4: escrow charge/refund/release, exactly-once claims, BidRules arithmetic |
-| `TradeSessionStateTest` (8) | 2.1.4: anti bait-and-switch, empty-trade rejection, lifecycle, isolation |
-| `AuctionSettlementTest` (5) | Buy-now settlement claims |
-| `AuctionSettlementHistoryTest` (10) | Archive + delete invariants, startup recovery sweeps |
-| `AuctionSearchTest` (8) | Sanitized free-text search, escaping, caps |
-| `ShopGUILayoutTest` (36) | Layout arithmetic, centering, slot classification |
-| `RateLimiterTest` (32) | Cooldowns, per-player isolation, concurrency, cleanup |
-| `SolidusPermissionsTest` (10) | Naming convention, default OP levels |
-| `EconomyHooksTest` (16) | Hook registry: duplicates, fail-open, dispatch |
-| `TransferHookIntegrationTest` (8) | Veto/notification flow through transfers |
 | `CurrencyUtilTest` (48) | Constants, validation, rounding, formatting |
-| `TextUtilTest` (19) | Currency formatting, legacy-code sanitization |
+| `ShopGUILayoutTest` (36) | Layout arithmetic, centering, slot classification |
+| `TextUtilTest` (35) | Currency formatting, legacy-code sanitization |
+| `RateLimiterTest` (32) | Cooldowns, per-player isolation, concurrency, cleanup |
+| `SQLiteStorageTest` (27) | Player creation, persistence, 100-thread races, restart survival |
+| `AdminOpsTest` (23) | Console harness: dummy accounts, pay-as, bid-as, audit/diag (real SQLiteStorage, no mocks) |
+| `BalanceManagerTest` (17) | get/add/subtract balances, transfer validation, atomicity |
+| `EconomyHooksTest` (16) | Hook registry: duplicates, fail-open, dispatch |
+| `BidEscrowFlowTest` (13) | Escrow charge/refund/release, exactly-once claims, BidRules arithmetic |
+| `TransactionLogExportTest` (12) | CSV building, RFC 4180 escaping, formula-injection guard |
+| `CompatDegradationTest` (11) | W-3 graceful degradation: probe failure → GUI gate closed, economy alive |
+| `AuctionSettlementHistoryTest` (10) | Archive + delete invariants, startup recovery sweeps |
+| `BaltopPaginationTest` (10) | Paged leaderboard, rank continuity, escrow exclusion |
+| `RedisUriRedactionTest` (10) | SOL-001 credential redaction, SOL-003 scheme allowlist |
+| `SolidusPermissionsTest` (10) | Naming convention, default OP levels |
+| `TransactionLogPaginationTest` (10) | LIMIT/OFFSET pages, counts |
+| `TransferAtomicTest` (10) | Single-transaction transfer semantics (success/insufficient/overflow/self) |
+| `RedisLayerFakeServerTest` (9) | Full Jedis client path over an in-JVM RESP2 fake server (real TCP socket) |
+| `AuctionSearchTest` (8) | Sanitized free-text search, escaping, caps |
+| `TradeSessionStateTest` (8) | Anti bait-and-switch, empty-trade rejection, lifecycle, isolation |
+| `TransferHookIntegrationTest` (8) | Veto/notification flow through transfers |
+| `StorageConfigTest` (7) | storage.json parsing: sqlite/mysql + pool + env password |
+| `SupplyIntegrityTest` (6) | Ledger replay, drift tolerance, sticky baseline (SQLite) |
+| `AuctionNbtCapTest` (5) | SOL-006 128 KB item-payload cap at/past boundary |
+| `AuctionSettlementTest` (5) | Buy-now settlement claims |
+| `EconomyStatsTest` (5) | Aggregates: count, mean, supply, Gini |
+| `MoneyTest` (5) | Exact 2-decimal boundary wrapper (BigDecimal) |
+| `MySqlAuctionDialectTest` (5) | CI-gated: auction store on MySQL (exactly-once claims, tx API) |
+| `MySqlLoopbackHostTest` (5) | SOL-002 loopback classification + cleartext warning |
+| `SolidusApiContractExtensionTest` (5) | W-5 contract semantics: degradation shapes, anti-drift version pin |
+| `TransferAtomicLedgerTest` (5) | Ledger rows commit inside the money transaction; failure rolls back both |
+| `MySqlOperationsIdempotencyTest` (4) | CI-gated: idempotent replay semantics (INSERT IGNORE claim) |
+| `RedisLayerTest` (4) | CI-gated: L2 cache, invalidation bus, circuit breaker on real Redis |
+| `StorageConfigRedisTest` (4) | Redis config block parsing + URI validation |
+| `MySqlAuctionSweepRaceTest` (2) | CI-gated: two-connection exactly-once settlement race |
+| `MySqlSupplyIntegrityTest` (2) | CI-gated: ledger replay on MySQL |
+| `RedisPackagingSmokeTest` (2) | Shipped-jar packaging guard: nested Jedis/pool2/json present, no lettuce/netty |
+| `MySqlTransferRaceTest` (1) | CI-gated: 200 concurrent transfers across two connections |
+| `StorageMigratorTest` (1) | SQLite → MySQL cutover copy + cent-exact verify + re-run convergence |
+| `SQLiteStorageContractTest` (12 inherited) | Abstract storage contract executed on SQLite |
+| `MySqlStorageContractTest` (12 inherited) | Abstract storage contract executed on MySQL |
+
+### The contract-test harness
+
+`StorageBackendContractTest` is an **abstract 12-test behavioral harness**
+(one `@Test` block per storage guarantee: player upsert, balance round-trip,
+restart survival, atomic races, ledger rows, ...). Its two concrete
+subclasses bind it to each backend, so every guarantee is proven identically
+on SQLite and MySQL — a new dialect port starts green only if it genuinely
+implements the same behavior.
 
 ### Concurrency Testing
 
@@ -2079,21 +2120,52 @@ tests run on plain SQLite or pure Java — no Minecraft bootstrap required:
 - **No overdraft**: 100 threads simultaneously try to subtract more than the balance holds; the balance must never go negative
 - **New player race**: 100 threads simultaneously create the same player; only one record should exist
 - **Persistence**: Data survives a simulated restart (close + reopen database)
-### Concurrency Testing
 
-`SQLiteStorageTest` includes critical concurrency tests:
+The network-level races are covered by the CI-gated MySQL harness:
+`MySqlTransferRaceTest` (200 concurrent transfers, exactly-once `operations`
+claims), `MySqlAuctionSweepRaceTest` (two concurrent connections race the
+settlement claim) and `MySqlOperationsIdempotencyTest` (replay cannot
+double-pay).
 
-- **100 concurrent adds**: 100 threads simultaneously add to the same balance; the final balance must be exactly `startBalance + (100 × addAmount)`
-- **No overdraft**: 100 threads simultaneously try to subtract more than the balance holds; the balance must never go negative
-- **New player race**: 100 threads simultaneously create the same player; only one record should exist
-- **Persistence**: Data survives a simulated restart (close + reopen database)
+### Network & Redis safety nets
+
+- **`RedisPackagingSmokeTest`** drives the BUILT jar through an isolated
+  `URLClassLoader` (null parent) and fails the build loudly if the shipped
+  jar lacks its Redis runtime (Jedis + commons-pool2 + org.json) or ships
+  stale artifacts. This is the net that would have caught audit finding
+  W-2 before a customer's server did; since 2.3.3 every Test task depends
+  on `jar`, so CI always smokes the fresh artifact.
+- **`RedisLayerFakeServerTest`** runs the full Jedis client path against an
+  in-JVM RESP2 fake server on a real TCP socket — including fail-closed
+  startup and RESP2 subscribe confirmations — with no container required.
+- **`CompatDegradationTest`** pins the W-3 degradation contract: a failed
+  probe downgrades to the GUI gate instead of a startup crash.
 
 ### CI Pipeline
 
-The `.github/workflows/test.yml` runs:
-- JDK 25 setup
-- `./gradlew test`
-- Upload test results as artifacts
+`.github/workflows/test.yml` runs on every push/PR to `main`/`master`/`dev`:
+
+1. JDK 25 (Temurin) setup with Gradle package caching
+2. **Real service containers**: `mariadb:11` and `redis:7`, wired in via the
+   `SOLIDUS_TEST_MYSQL_*` and `SOLIDUS_TEST_REDIS_URI` variables — the
+   31 self-skipping network tests activate and run against real servers
+3. `./gradlew test` (since 2.3.3 every Test task depends on `jar`, so the
+   packaging smoke always executes against a fresh artifact)
+4. `./gradlew testWithCoverage` — JaCoCo report, non-blocking, uploaded as
+   the `jacoco-report` artifact
+5. SpotBugs (`spotbugsMain`, non-blocking during the Java 25 toolchain
+   shakeout) with its own artifact upload
+6. Test-results artifact upload (`if: always()`)
+
+`.github/workflows/compat-matrix.yml` (audit W-3 / recommendation P0-3)
+answers "does Solidus still compile against the Minecraft versions it
+claims to support?": the pinned release target 26.1.2 is **required** to
+pass (same contract as `test.yml`), while 26.2/26.3 are forward probes whose
+failures are reported but non-blocking — so upstream internals churn is
+known from a failing diff instead of a player's crash report. Fabric API
+versions for probes are resolved dynamically from maven metadata so the
+matrix never goes stale. `.github/workflows/codeql.yml` adds static
+security analysis on every push.
 
 ---
 
@@ -2154,6 +2226,12 @@ Solidus's virtual GUI pattern can be extended for custom menus:
 ---
 
 ## 21. Performance Characteristics
+
+> **⚠ These are design estimates, not measured benchmarks.** The numbers
+> below are engineering back-of-envelope figures used for capacity planning
+> during design. No instrumented measurement session has been run yet; they
+> will be replaced by actual results from `docs/BENCHMARKS.md` (workstream
+> WS-4) once benchmarks land. Do not quote them as observed facts.
 
 ### Memory Usage
 

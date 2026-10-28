@@ -72,15 +72,54 @@ they were integration-tested against in their own `fabric.mod.json`.
 > changes remain impossible inside a patch family.
 
 Each mod's `fabric.mod.json` `suggests` entry declares the **minimum family version** it
-was integration-tested against (Core ships `"solidus-governance": ">=2.1.0",
+was integration-tested against (Core currently ships `"solidus-governance": ">=2.1.0",
 "solidus-analytics": ">=2.1.0", "solidus-enforcer": ">=2.1.0"`).
+
+> **⚠ Known mismatch (tracked, owner decision pending — see
+> `notes/DECISION_MEMOS.md` MEMO-2):** Core's `suggests` floors are
+> informational and still read `>=2.1.0`, while the companions' own
+> `depends` floors are the loader-enforced `"solidus": ">=2.3.2"` since
+> 2.3.2. The *enforced* integration contract is therefore `>=2.3.2`;
+> Core's `suggests` numbers are stale-but-harmless. Two resolutions are
+> drafted in the memo (raise Core's `suggests` to `>=2.3.2`, or re-document
+> `suggests` as deliberately informational). `fabric.mod.json` is owned by
+> the build task — no doc-only edit can change it.
+
+## Deprecation & removal policy (reflective shims)
+
+The 2.3.0 family bump demoted `SolidusAPI`'s erased legacy signatures
+(`getEconomyEngine()`, `getTransactionLog()`) to **deprecated reflective
+shims**, kept "for one transition family" so 2.1.x-era companion builds keep
+loading while they migrate to the `solidus-api` contract. As of 2.3.2 all
+shipped companions compile against the contract with zero reflection — the
+shims have no known caller left in the ecosystem, but they are still public
+API, so removing them is a **breaking change that cannot ship inside a patch
+family** (see the bump table above).
+
+**Policy (documented, effective on owner approval — see
+`notes/DECISION_MEMOS.md` MEMO-1):**
+
+1. **Now (2.3.x patches):** shims stay exactly as they are — `@Deprecated`,
+   functional, zero internal callers. Each 2.3.x release note repeats the
+   deprecation so downstream authors see it at least once per family.
+2. **Next family bump (2.4.0 or 3.0.0, whichever comes first):** shims are
+   removed outright in the same release that already breaks the family
+   contract — no deprecation period is added on top of an already-broken
+   boundary, and a companion that still calls them fails fast at compile
+   time (they compile against `solidus-api`, which never contained them).
+3. **Never** removed in a `2.3.x` patch, even if audit tooling reports zero
+   callers — the patch rule above makes API removal impossible by
+   definition.
+
+The concrete version number and date are a **proposal for the owner** in
+MEMO-1 — it is not decided by documentation alone.
 
 ## Where the number lives
 
 Each mod's version has exactly one source of truth — a single line in `gradle.properties`:
 
 ```properties
-mod_version = 2.1.4
+mod_version = 2.3.3
 ```
 
 `fabric.mod.json` picks it up through the `${version}` expansion at build time — never

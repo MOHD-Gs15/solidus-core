@@ -6,7 +6,7 @@ Balances, transfers, a server shop, an auction house, and secure player-to-playe
 <p align="center">
   <a href="https://github.com/MOHD-Gs15/solidus-core/actions/workflows/test.yml"><img src="https://github.com/MOHD-Gs15/solidus-core/actions/workflows/test.yml/badge.svg" alt="Tests"></a>
   <a href="https://github.com/MOHD-Gs15/solidus-core/actions/workflows/codeql.yml"><img src="https://github.com/MOHD-Gs15/solidus-core/actions/workflows/codeql.yml/badge.svg" alt="CodeQL"></a>
-  <img src="https://img.shields.io/badge/version-2.2.5-blue" alt="Version 2.2.5">
+  <img src="https://img.shields.io/badge/version-2.3.3-blue" alt="Version 2.3.3">
   <img src="https://img.shields.io/badge/Minecraft-26.1.2-brightgreen" alt="Minecraft 26.1.2">
   <img src="https://img.shields.io/badge/Java-25-orange" alt="Java 25">
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-green" alt="MIT License"></a>
@@ -41,7 +41,7 @@ Balances, transfers, a server shop, an auction house, and secure player-to-playe
 
 1. Install [Fabric Loader](https://fabricmc.net/use/) on your server (Minecraft 26.1.2).
 2. Drop [Fabric API](https://modrinth.com/mod/fabric-api) into your `mods` folder.
-3. Drop `solidus-2.2.5.jar` into `mods`.
+3. Drop `solidus-2.3.3.jar` into `mods`.
 4. Start the server — the economy is live immediately on local SQLite storage.
 
 > Server-side only: players connect with the vanilla client and need zero downloads.
@@ -108,11 +108,11 @@ After the first start you'll find `config/solidus/storage.json`. The keys that m
 
 **Money-supply integrity.** A periodic auditor compares the sum of all balances against a full ledger replay (all income sources, sinks, and admin operations) and verifies that the escrow total equals the sum of open winning bids. On a network, elect exactly one server with `integrity.elected: true`.
 
-**Versioning.** The ecosystem follows a documented family contract in [VERSIONING.md](VERSIONING.md): any `2.2.x` Solidus release works with any `2.1.x` release of the companion mods (Analytics / Governance / Enforcer).
+**Versioning.** The ecosystem follows a documented family contract in [VERSIONING.md](VERSIONING.md): the current family is **2.3.x**, companions compile against the Minecraft-free `solidus-api` contract jar, and each companion's `fabric.mod.json` declares a loader-enforced `"solidus": ">=2.3.2"` dependency floor — Fabric rejects mismatched combinations at startup instead of failing at runtime.
 
 **Currency.** The internal unit is the Solidus, symbol `S$`, formatted `1,250.5 S$`; rounding rules are specified in [docs/MONEY_ROUNDING.md](docs/MONEY_ROUNDING.md).
 
-**Testing.** The suite spans 38 test classes (435 tests per run). CI executes it twice per push — plain and under coverage (870 green executions) — against real `mariadb:11` and `redis:7` service containers, so the MySQL and Redis paths are exercised on every commit. Build locally with JDK 25: `./gradlew build` (artifact lands in `build/libs/`).
+**Testing.** The suite spans 42 test classes and 448 static `@Test` declarations (both machine-enforced by `scripts/docs_lint.py`); the last CI-recorded total is 462 tests per full run. CI executes the suite twice per push — plain and under coverage — against real `mariadb:11` and `redis:7` service containers, so the MySQL and Redis paths are exercised on every commit. A separate `compat-matrix` workflow compiles the mod against Minecraft 26.1.2 (required) and forward-probes 26.2/26.3 (informative). Build locally with JDK 25: `./gradlew build` (artifact lands in `build/libs/`).
 
 ## Documentation
 
@@ -123,6 +123,8 @@ After the first start you'll find `config/solidus/storage.json`. The keys that m
 | [docs/FEATURES_TRADE_BIDDING.md](docs/FEATURES_TRADE_BIDDING.md) | Step-by-step mechanics of trading and escrow bidding |
 | [docs/MONEY_ROUNDING.md](docs/MONEY_ROUNDING.md) | Rounding rules and currency representation |
 | [docs/CONSOLE_TESTING.md](docs/CONSOLE_TESTING.md) | Testing the economy from the server console |
+| [docs/BENCHMARKS.md](docs/BENCHMARKS.md) | Benchmark methodology and measured results (tables fill in as WS-4 lands) |
+| [docs/OPS_RUNBOOK.md](docs/OPS_RUNBOOK.md) | Operations: backup & restore, storage-migration rollback, housekeeping, secrets & TLS |
 | [docs/sql/mysql/001_init.sql](docs/sql/mysql/001_init.sql) | Ready-to-run MySQL schema script |
 | [VERSIONING.md](VERSIONING.md) | Version policy and family compatibility |
 | [notes/CHANGES.md](notes/CHANGES.md) | Changelog |
