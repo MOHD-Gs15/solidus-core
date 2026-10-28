@@ -1,5 +1,6 @@
 package com.solidus.auction;
 
+import com.solidus.compat.Palette;
 import com.solidus.util.CurrencyUtil;
 import com.solidus.util.TextUtil;
 
@@ -295,7 +296,7 @@ public final class AuctionGUI {
             occupiedSlots.add(slot.index());
         }
 
-        ItemStack glassPane = new ItemStack(Items.GRAY_STAINED_GLASS_PANE);
+        ItemStack glassPane = new ItemStack(Palette.GRAY_STAINED_GLASS_PANE);
         glassPane.set(net.minecraft.core.component.DataComponents.CUSTOM_NAME, Component.literal(" "));
 
         for (int i = 0; i < totalSlots; i++) {

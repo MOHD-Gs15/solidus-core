@@ -1,11 +1,11 @@
 package com.solidus.shop;
 
+import com.solidus.compat.Palette;
 import net.minecraft.ChatFormatting;
 import net.minecraft.core.component.DataComponents;
 import net.minecraft.network.chat.Component;
 import net.minecraft.world.item.Item;
 import net.minecraft.world.item.ItemStack;
-import net.minecraft.world.item.Items;
 
 import java.util.ArrayList;
 import java.util.List;
@@ -59,9 +59,10 @@ public final class ShopGUILayout {
     public static final int MAX_CONTENT_ITEMS = CONTENT_WIDTH * CONTENT_ROWS; // 28
 
     // -- Border Palette (dark, framing) -----------------------
-    // Lazy-initialized to avoid triggering Items.<clinit> (and the full
-    // Minecraft Bootstrap) when this class is loaded by unit tests that
-    // only exercise the pure-Java layout arithmetic.
+    // Lazy-initialized to avoid triggering Minecraft class bootstrap when
+    // this class is loaded by unit tests that only exercise the pure-Java
+    // layout arithmetic. (Palette resolves via the item registry — see
+    // com.solidus.compat.Palette.)
     private static volatile Item[] borderPanes;
 
     // -- Content Filler Palette (bright, accent) --------------
@@ -70,9 +71,9 @@ public final class ShopGUILayout {
     private static Item[] borderPanes() {
         if (borderPanes == null) {
             borderPanes = new Item[] {
-                Items.BLACK_STAINED_GLASS_PANE,
-                Items.GRAY_STAINED_GLASS_PANE,
-                Items.LIGHT_GRAY_STAINED_GLASS_PANE
+                Palette.BLACK_STAINED_GLASS_PANE,
+                Palette.GRAY_STAINED_GLASS_PANE,
+                Palette.LIGHT_GRAY_STAINED_GLASS_PANE
             };
         }
         return borderPanes;
@@ -81,17 +82,17 @@ public final class ShopGUILayout {
     private static Item[] accentPanes() {
         if (accentPanes == null) {
             accentPanes = new Item[] {
-                Items.BLUE_STAINED_GLASS_PANE,
-                Items.CYAN_STAINED_GLASS_PANE,
-                Items.LIGHT_BLUE_STAINED_GLASS_PANE,
-                Items.GREEN_STAINED_GLASS_PANE,
-                Items.LIME_STAINED_GLASS_PANE,
-                Items.YELLOW_STAINED_GLASS_PANE,
-                Items.ORANGE_STAINED_GLASS_PANE,
-                Items.RED_STAINED_GLASS_PANE,
-                Items.PINK_STAINED_GLASS_PANE,
-                Items.MAGENTA_STAINED_GLASS_PANE,
-                Items.PURPLE_STAINED_GLASS_PANE
+                Palette.BLUE_STAINED_GLASS_PANE,
+                Palette.CYAN_STAINED_GLASS_PANE,
+                Palette.LIGHT_BLUE_STAINED_GLASS_PANE,
+                Palette.GREEN_STAINED_GLASS_PANE,
+                Palette.LIME_STAINED_GLASS_PANE,
+                Palette.YELLOW_STAINED_GLASS_PANE,
+                Palette.ORANGE_STAINED_GLASS_PANE,
+                Palette.RED_STAINED_GLASS_PANE,
+                Palette.PINK_STAINED_GLASS_PANE,
+                Palette.MAGENTA_STAINED_GLASS_PANE,
+                Palette.PURPLE_STAINED_GLASS_PANE
             };
         }
         return accentPanes;
@@ -250,23 +251,23 @@ public final class ShopGUILayout {
     private static Item paneForColor(ChatFormatting color) {
         // Map ChatFormatting colors to the closest stained glass pane variant
         return switch (color) {
-            case BLACK -> Items.BLACK_STAINED_GLASS_PANE;
-            case DARK_BLUE -> Items.BLUE_STAINED_GLASS_PANE;
-            case DARK_GREEN -> Items.GREEN_STAINED_GLASS_PANE;
-            case DARK_AQUA -> Items.CYAN_STAINED_GLASS_PANE;
-            case DARK_RED -> Items.RED_STAINED_GLASS_PANE;
-            case DARK_PURPLE -> Items.PURPLE_STAINED_GLASS_PANE;
-            case GOLD -> Items.ORANGE_STAINED_GLASS_PANE;
-            case GRAY -> Items.GRAY_STAINED_GLASS_PANE;
-            case DARK_GRAY -> Items.LIGHT_GRAY_STAINED_GLASS_PANE;
-            case BLUE -> Items.LIGHT_BLUE_STAINED_GLASS_PANE;
-            case GREEN -> Items.LIME_STAINED_GLASS_PANE;
-            case AQUA -> Items.LIGHT_BLUE_STAINED_GLASS_PANE;
-            case RED -> Items.PINK_STAINED_GLASS_PANE;
-            case LIGHT_PURPLE -> Items.MAGENTA_STAINED_GLASS_PANE;
-            case YELLOW -> Items.YELLOW_STAINED_GLASS_PANE;
-            case WHITE -> Items.WHITE_STAINED_GLASS_PANE;
-            default -> Items.GRAY_STAINED_GLASS_PANE;
+            case BLACK -> Palette.BLACK_STAINED_GLASS_PANE;
+            case DARK_BLUE -> Palette.BLUE_STAINED_GLASS_PANE;
+            case DARK_GREEN -> Palette.GREEN_STAINED_GLASS_PANE;
+            case DARK_AQUA -> Palette.CYAN_STAINED_GLASS_PANE;
+            case DARK_RED -> Palette.RED_STAINED_GLASS_PANE;
+            case DARK_PURPLE -> Palette.PURPLE_STAINED_GLASS_PANE;
+            case GOLD -> Palette.ORANGE_STAINED_GLASS_PANE;
+            case GRAY -> Palette.GRAY_STAINED_GLASS_PANE;
+            case DARK_GRAY -> Palette.LIGHT_GRAY_STAINED_GLASS_PANE;
+            case BLUE -> Palette.LIGHT_BLUE_STAINED_GLASS_PANE;
+            case GREEN -> Palette.LIME_STAINED_GLASS_PANE;
+            case AQUA -> Palette.LIGHT_BLUE_STAINED_GLASS_PANE;
+            case RED -> Palette.PINK_STAINED_GLASS_PANE;
+            case LIGHT_PURPLE -> Palette.MAGENTA_STAINED_GLASS_PANE;
+            case YELLOW -> Palette.YELLOW_STAINED_GLASS_PANE;
+            case WHITE -> Palette.WHITE_STAINED_GLASS_PANE;
+            default -> Palette.GRAY_STAINED_GLASS_PANE;
         };
     }
 }
