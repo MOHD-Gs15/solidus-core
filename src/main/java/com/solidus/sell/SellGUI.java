@@ -1,5 +1,6 @@
 package com.solidus.sell;
 
+import com.solidus.compat.Palette;
 import com.solidus.shop.ShopManager;
 import com.solidus.util.TextUtil;
 
@@ -99,7 +100,7 @@ public final class SellGUI {
             occupied.add(slot.index());
         }
 
-        ItemStack glassPane = new ItemStack(Items.GRAY_STAINED_GLASS_PANE);
+        ItemStack glassPane = new ItemStack(Palette.GRAY_STAINED_GLASS_PANE);
         glassPane.set(net.minecraft.core.component.DataComponents.CUSTOM_NAME,
             Component.literal(" "));
 

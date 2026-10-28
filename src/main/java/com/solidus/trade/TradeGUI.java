@@ -1,5 +1,6 @@
 package com.solidus.trade;
 
+import com.solidus.compat.Palette;
 import com.solidus.util.CurrencyUtil;
 import com.solidus.util.TextUtil;
 
@@ -99,7 +100,7 @@ public final class TradeGUI {
     }
 
     public static ItemStack readyItem(boolean ready) {
-        return displayItem(ready ? Items.LIME_DYE : Items.GRAY_DYE,
+        return displayItem(ready ? Palette.LIME_DYE : Palette.GRAY_DYE,
             TextUtil.styledBold(ready ? "READY - waiting for partner" : "Ready?",
                 ready ? ChatFormatting.GREEN : ChatFormatting.YELLOW),
             TextUtil.loreLine(ready
@@ -108,7 +109,7 @@ public final class TradeGUI {
     }
 
     public static ItemStack theirReadyItem(boolean ready) {
-        return displayItem(ready ? Items.LIME_DYE : Items.GRAY_DYE,
+        return displayItem(ready ? Palette.LIME_DYE : Palette.GRAY_DYE,
             TextUtil.styledBold(ready ? "Partner: READY" : "Partner: not ready",
                 ready ? ChatFormatting.GREEN : ChatFormatting.GRAY),
             TextUtil.loreLine("Executes when both sides are ready"));
@@ -121,13 +122,13 @@ public final class TradeGUI {
     }
 
     public static ItemStack filler() {
-        ItemStack pane = new ItemStack(Items.GRAY_STAINED_GLASS_PANE);
+        ItemStack pane = new ItemStack(Palette.GRAY_STAINED_GLASS_PANE);
         pane.set(net.minecraft.core.component.DataComponents.CUSTOM_NAME, Component.literal(" "));
         return pane;
     }
 
     public static ItemStack theirOfferMarker() {
-        return displayItem(Items.LIGHT_BLUE_STAINED_GLASS_PANE,
+        return displayItem(Palette.LIGHT_BLUE_STAINED_GLASS_PANE,
             TextUtil.styledBold("Their Offer Area", ChatFormatting.AQUA),
             TextUtil.loreLine("Items they put up appear here"));
     }
