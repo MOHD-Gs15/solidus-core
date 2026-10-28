@@ -25,3 +25,6 @@ Thumbs.db
 
 # Runtime
 run/
+# WS-0 Task A: disposable live-boot sandbox (world/config/logs are wiped on
+# every drill — never commit it; see scripts/live-boot/boot_and_drive.sh).
+run-live/

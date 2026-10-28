@@ -440,11 +440,29 @@ public class AuctionManager {
                 }
             }
             // Create the schema (both dialects; null entries skipped for MYSQL).
-            try (Connection conn = connectionSource.open();
-                 Statement stmt = conn.createStatement()) {
-                for (String ddl : dialect.statements()) {
-                    if (ddl != null) {
-                        stmt.execute(ddl);
+            // WS-0 live-boot fix (2.3.3): for SQLITE the connectionSource hands
+            // out the SHARED persistent connection, which withAuction() relies
+            // on staying open ("MUST NOT be closed" per its contract). The old
+            // try-with-resources closed it immediately after DDL, so every
+            // later store operation died with "database connection closed"
+            // while all 462 JVM-only tests stayed green. MYSQL connections are
+            // pooled borrows and MUST still be returned (closed) — hence the
+            // split. Regression: AuctionSqliteStoreLivenessTest.
+            if (pooledConnections) {
+                try (Connection conn = connectionSource.open();
+                     Statement stmt = conn.createStatement()) {
+                    for (String ddl : dialect.statements()) {
+                        if (ddl != null) {
+                            stmt.execute(ddl);
+                        }
+                    }
+                }
+            } else {
+                try (Statement stmt = persistentConnection.createStatement()) {
+                    for (String ddl : dialect.statements()) {
+                        if (ddl != null) {
+                            stmt.execute(ddl);
+                        }
                     }
                 }
             }
@@ -2117,9 +2135,22 @@ public class AuctionManager {
             } catch (SQLException e) {
                 SolidusMod.LOGGER.error("Bid phase-1 DB error for listing {}", listingId, e);
                 return "DB_ERROR";
+            } catch (Exception e) {
+                // WS-0 live-boot (2.3.3): an unexpected phase-1 exception used to
+                // complete the future exceptionally and VANISH — no feedback, no
+                // state change, no log line (silent bid loss over RCON/console).
+                SolidusMod.LOGGER.error(
+                    "Bid phase-1 unexpected error for listing {} (bidder {}): {}",
+                    listingId, bidderName, e.toString(), e);
+                return "DB_ERROR";
             }
         }, asyncExecutor).thenAccept(phase1 -> {
             if (phase1 instanceof String err) {
+                // WS-0 (2.3.3): rejections are player-facing feedback only; the
+                // server log must also record WHY a bid did not land, otherwise
+                // admin-driven drills (RCON) lose the reason entirely.
+                SolidusMod.LOGGER.info("Bid rejected for listing {} (bidder {}): {}",
+                    listingId, bidderName, err);
                 feedback.accept(false, bidErrorMessage(err));
                 return;
             }
@@ -2141,6 +2172,10 @@ public class AuctionManager {
                             + entry.materialName() + " (listing " + shortId(listingId) + ")")))
                 .thenAccept(charge -> {
                     if (charge.status() != com.solidus.economy.SQLiteStorage.TransferStatus.SUCCESS) {
+                        // WS-0 (2.3.3): a non-success charge used to be silent
+                        // server-side (feedback only). Log it for RCON drills.
+                        SolidusMod.LOGGER.info("Bid escrow charge did not succeed for listing {} (bidder {}): {}",
+                            listingId, bidderName, charge.status());
                         feedback.accept(false,
                             charge.status() == com.solidus.economy.SQLiteStorage.TransferStatus.INSUFFICIENT_FUNDS
                                 ? "Insufficient funds for that bid."
@@ -2204,8 +2239,24 @@ public class AuctionManager {
                                     bidderName, amount, refundError);
                             }
                             return "DB_ERROR";
+                        } catch (Exception e) {
+                            // WS-0 (2.3.3): same silent-loss class as phase 1 —
+                            // any unexpected claim error must reach the log.
+                            SolidusMod.LOGGER.error(
+                                "Bid phase-3 unexpected error for listing {} (bidder {}): {}",
+                                listingId, bidderName, e.toString(), e);
+                            try {
+                                refundFromEscrow(bidderUuid, bidderName, amount,
+                                    "Bid system error refund (listing " + shortId(listingId) + ")");
+                            } catch (Exception refundError) {
+                                SolidusMod.LOGGER.error("CRITICAL: bid refund after claim error failed - bidder {} amount {}",
+                                    bidderName, amount, refundError);
+                            }
+                            return "DB_ERROR";
                         }
                     }, asyncExecutor).thenAccept(phase3 -> {
+                        SolidusMod.LOGGER.info("Bid pipeline outcome for listing {} (bidder {}): {}",
+                            listingId, bidderName, phase3);
                         switch (phase3) {
                             case "CLAIMED" -> feedback.accept(false,
                                 "Bid placed: " + CurrencyUtil.format(amount) + " on "
@@ -2219,8 +2270,23 @@ public class AuctionManager {
                                 "Bid failed due to a system error - your money was refunded.");
                             default -> feedback.accept(true, "Bid failed. Please try again.");
                         }
+                    }).whenComplete((ignored, error) -> {
+                        if (error != null) {
+                            SolidusMod.LOGGER.error("Bid phase-3 pipeline died for listing {} (bidder {})",
+                                listingId, bidderName, error);
+                        }
                     });
+                }).whenComplete((ignored, error) -> {
+                    if (error != null) {
+                        SolidusMod.LOGGER.error("Bid phase-2 pipeline died for listing {} (bidder {})",
+                            listingId, bidderName, error);
+                    }
                 });
+        }).whenComplete((ignored, error) -> {
+            if (error != null) {
+                SolidusMod.LOGGER.error("Bid phase-1 pipeline died for listing {} (bidder {})",
+                    listingId, bidderName, error);
+            }
         });
     }
 
