@@ -254,7 +254,7 @@ public class SolidusAdminCommand {
         boolean guiSafe = com.solidus.compat.CompatState.isGuiSafe();
         boolean mixinApplied = com.solidus.compat.SolidusMixinPlugin.isContainerClickMixinApplied();
 
-        lines.add("Solidus compatibility report (family 2.3.0):");
+        lines.add("Solidus compatibility report (family 2.4.0):");
         lines.add("  Startup probe: " + (verified ? "ran" : "NOT RUN"));
         if (verified && guiSafe) {
             lines.add("  Virtual GUI routing: HEALTHY");
@@ -267,6 +267,17 @@ public class SolidusAdminCommand {
             lines.add("  Commands, storage, ledger, taxes and enforcement are unaffected.");
             lines.add("  Update path: see src/main/java/com/solidus/compat/PACKAGE.md");
         }
+        // WS-1 surfaces: GUI palette (Family A) + world drop (Family B).
+        // A degraded palette is VISIBLE here but does not disable GUIs —
+        // fallback rendering is safe; a broken drop surface fails closed
+        // per recovery path with a CRITICAL log line instead.
+        lines.add("  " + com.solidus.compat.CompatState.paletteSummary());
+        if (com.solidus.compat.CompatState.isPaletteDegraded()) {
+            for (String note : com.solidus.compat.CompatState.paletteNotes()) {
+                lines.add("!!    - " + note);
+            }
+        }
+        lines.add("  " + com.solidus.compat.CompatState.dropSummary());
         for (String line : lines) {
             if (line.startsWith("!!")) {
                 source.sendFailure(TextUtil.error(line.substring(2)));

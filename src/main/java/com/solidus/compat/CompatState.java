@@ -70,6 +70,30 @@ public final class CompatState {
     /** Capability -> available. Guarded by the write-once protocol below. */
     private static volatile List<String> failures = List.of();
 
+    // -- WS-1 surfaces: GUI palette (Family A) + world drop (Family B) ------
+
+    /** Resolution outcome of the CompatDrop world-drop wrapper. */
+    public enum DropStrategy {
+        /** Not resolved yet (probe has not run). */
+        UNRESOLVED,
+        /** 26.3+: ServerPlayer#drop(ItemStack, boolean, Prediction). */
+        THREE_ARG_PREDICTION,
+        /** 26.1.x: Player#drop(ItemStack, boolean). */
+        TWO_ARG,
+        /** No shape resolved — world drops are refused (fail-closed). */
+        BROKEN
+    }
+
+    /** True when all 17 Palette entries resolved to their EXACT registry ids. */
+    private static volatile boolean paletteExact = false;
+    /** True when at least one Palette entry fell back (generic pane / dye / barrier refuge). */
+    private static volatile boolean paletteDegraded = false;
+    /** Human-readable palette resolution/degradation notes. */
+    private static volatile List<String> paletteNotes = List.of();
+
+    private static volatile DropStrategy dropStrategy = DropStrategy.UNRESOLVED;
+    private static volatile String dropStrategyReason = "probe has not run yet";
+
     private CompatState() {
     }
 
@@ -109,6 +133,40 @@ public final class CompatState {
         updated.add(reason);
         failures = List.copyOf(updated);
         verified = true;
+    }
+
+    // -- WS-1 surface reports (single call site: CompatProbes) ------------
+
+    /**
+     * Stores the Palette (Family A) probe outcome. Unlike the click-routing
+     * failures list, a DEGRADED palette does NOT block GUI opens — visual
+     * degradation is safe (fallback pane / dye / barrier); it must only be
+     * SEEN (log + /solidus-admin compat). A broken registry API itself is a
+     * probe failure and blocks the GUI layer through {@code failures}.
+     *
+     * @param exact    every entry resolved to its exact registry id
+     * @param degraded at least one entry fell back
+     * @param notes    resolution/degradation details for the admin report
+     */
+    static void reportPaletteSurface(boolean exact, boolean degraded, List<String> notes) {
+        synchronized (CompatState.class) {
+            paletteExact = exact;
+            paletteDegraded = degraded;
+            paletteNotes = List.copyOf(notes);
+        }
+    }
+
+    /**
+     * Stores the CompatDrop (Family B) strategy resolution. A BROKEN drop
+     * surface does not block GUIs either — the affected paths are the
+     * rare recovery drops, which fail closed (CRITICAL log + persistent
+     * alternative at the call site).
+     */
+    static void reportDropSurface(DropStrategy resolved, String reason) {
+        synchronized (CompatState.class) {
+            dropStrategy = resolved == null ? DropStrategy.UNRESOLVED : resolved;
+            dropStrategyReason = reason == null ? "" : reason;
+        }
     }
 
     // -- Queries --------------------------------------------
@@ -164,5 +222,49 @@ public final class CompatState {
         }
         return "compat: " + failures.size() + " failed probe(s): "
             + String.join("; ", failures);
+    }
+
+    // -- WS-1 surface queries ---------------------------------
+
+    /** @return true when all 17 palette entries resolved to their exact registry ids */
+    public static boolean isPaletteExact() {
+        return paletteExact;
+    }
+
+    /** @return true when at least one palette entry degraded to a fallback/refuge item */
+    public static boolean isPaletteDegraded() {
+        return paletteDegraded;
+    }
+
+    /** @return immutable palette resolution/degradation notes (empty when exact) */
+    public static List<String> paletteNotes() {
+        return paletteNotes;
+    }
+
+    /** @return the resolved world-drop strategy for the running Minecraft version */
+    public static DropStrategy dropStrategy() {
+        return dropStrategy;
+    }
+
+    /** @return human-readable reason/report for the drop strategy resolution */
+    public static String dropStrategyReason() {
+        return dropStrategyReason;
+    }
+
+    /** One-line palette status for the /solidus-admin compat report. */
+    public static String paletteSummary() {
+        if (paletteExact) {
+            return "GUI palette: EXACT (all 17 registry ids resolved)";
+        }
+        if (paletteDegraded) {
+            return "GUI palette: DEGRADED — " + String.join("; ", paletteNotes);
+        }
+        return "GUI palette: not verified (" + String.join("; ", paletteNotes) + ")";
+    }
+
+    /** One-line world-drop status for the /solidus-admin compat report. */
+    public static String dropSummary() {
+        return "World drop: " + dropStrategy
+            + (dropStrategyReason.isBlank() ? "" : " — " + dropStrategyReason);
     }
 }
