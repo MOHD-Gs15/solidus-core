@@ -126,7 +126,11 @@ jobs:
         if: always()
         run: |
           if [ "${{ matrix.required }}" = "true" ]; then
-            echo "### ✅ Pinned target MC ${{ matrix.mc }}: required build PASSED" >> "$GITHUB_STEP_SUMMARY"
+            if [ "${{ job.status }}" = "success" ]; then
+              echo "### ✅ Pinned target MC ${{ matrix.mc }}: required build PASSED" >> "$GITHUB_STEP_SUMMARY"
+            else
+              echo "### ❌ Pinned target MC ${{ matrix.mc }}: required build FAILED — blocks the release (see compat/PACKAGE.md)" >> "$GITHUB_STEP_SUMMARY"
+            fi
           else
-            echo "### ℹ️ Forward probe MC ${{ matrix.mc }}: $( [ '${{ job.status }}' = 'success' ] && echo 'COMPILES — candidate for support' || echo 'BROKEN — see compat/PACKAGE.md checklist' )" >> "$GITHUB_STEP_SUMMARY"
+            echo "### ℹ️ Probe MC ${{ matrix.mc }}: $( [ '${{ job.status }}' = 'success' ] && echo 'COMPILES — candidate for support' || echo 'BROKEN — see compat/PACKAGE.md checklist' )" >> "$GITHUB_STEP_SUMMARY"
           fi
