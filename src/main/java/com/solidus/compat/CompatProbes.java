@@ -2,6 +2,9 @@ package com.solidus.compat;
 
 import com.solidus.SolidusMod;
 
+import net.minecraft.core.registries.BuiltInRegistries;
+import net.minecraft.resources.Identifier;
+
 import java.lang.reflect.Method;
 import java.util.ArrayList;
 import java.util.List;
@@ -135,6 +138,44 @@ public final class CompatProbes {
                 () -> menuClass.getDeclaredField("containerId"));
         }
 
+        // 7) WS-1 registry.api — the version-free resolution idiom Family A
+        //    (Palette) rides on. This protects the PATTERN, not just one
+        //    use of it: if Mojang moves Identifier/Registry/Holder again,
+        //    the GUI layer must degrade here, not NPE inside a menu.
+        probe(failures, "registry.api (Identifier.tryParse / Registry.get / Holder.value / BuiltInRegistries.ITEM)",
+            CompatProbes::probeRegistryApi);
+
+        // 8) WS-1 palette probes (Family A) — resolve the 17 palette ids the
+        //    way Palette does, and pin the READY/NOT-READY distinction.
+        //    Skipped gracefully when the item registry is not populated
+        //    (plain unit-test JVM) — verified for real in the live-boot drill.
+        reportPaletteProbes(failures);
+
+        // 9) WS-1 drop.handle (Family B) — resolve the CompatDrop strategy
+        //    ONCE, here, exactly as the spec pins it. Outcome lands in
+        //    CompatState's DROP_STRATEGY surface (NOT in `failures`: a
+        //    broken drop surface must not switch off GUIs — it fails
+        //    closed per call site instead).
+        try {
+            CompatDrop.resolve();
+        } catch (Throwable t) {
+            SolidusMod.LOGGER.error("CompatDrop resolution threw unexpectedly: {}", t.toString(), t);
+        }
+        CompatState.DropStrategy resolvedStrategy;
+        try {
+            resolvedStrategy = CompatState.DropStrategy.valueOf(CompatDrop.strategy().name());
+        } catch (IllegalArgumentException badMapping) {
+            resolvedStrategy = CompatState.DropStrategy.UNRESOLVED;
+        }
+        CompatState.reportDropSurface(resolvedStrategy, CompatDrop.failureReason());
+        if (CompatDrop.isBroken()) {
+            SolidusMod.LOGGER.error(
+                "Solidus: CompatDrop has NO drop strategy on this Minecraft version — world-drop "
+                    + "recovery paths will REFUSE to hand out items (fail-closed, CRITICAL per call) "
+                    + "and keep them in their persistent store instead. Reason: {}",
+                CompatDrop.failureReason());
+        }
+
         CompatState.report(failures);
 
         if (failures.isEmpty()) {
@@ -166,6 +207,111 @@ public final class CompatProbes {
     }
 
     // -- helpers --------------------------------------------
+
+    /**
+     * WS-1: verifies the registry API the Palette pattern is built on —
+     * reflection only, so the probe itself never touches Minecraft statics
+     * that would trigger a bootstrap in a unit-test JVM.
+     */
+    private static void probeRegistryApi() throws Throwable {
+        Class<?> identifier = Class.forName("net.minecraft.resources.Identifier", false,
+            CompatProbes.class.getClassLoader());
+        identifier.getDeclaredMethod("tryParse", String.class);
+
+        Class<?> registries = Class.forName("net.minecraft.core.registries.BuiltInRegistries", false,
+            CompatProbes.class.getClassLoader());
+        registries.getField("ITEM");
+
+        Class<?> registry = Class.forName("net.minecraft.core.Registry", false,
+            CompatProbes.class.getClassLoader());
+        // The single-parameter lookup overload is named `get` in every 26.x
+        // jar we measured, but its erasure drifted between (Object) and
+        // (Identifier) — accept either, require one of them.
+        boolean hasSingleArgGet = false;
+        for (Method m : registry.getDeclaredMethods()) {
+            if (m.getName().equals("get") && m.getParameterCount() == 1) {
+                Class<?> p = m.getParameterTypes()[0];
+                if (p == Object.class || p == identifier) {
+                    hasSingleArgGet = true;
+                    break;
+                }
+            }
+        }
+        if (!hasSingleArgGet) {
+            throw new NoSuchMethodException(
+                "Registry.get(Identifier|Object) — the single-arg key lookup is gone");
+        }
+
+        Class<?> holder = Class.forName("net.minecraft.core.Holder", false,
+            CompatProbes.class.getClassLoader());
+        holder.getDeclaredMethod("value");
+    }
+
+    /**
+     * WS-1: palette.ids + palette.distinct. A registry that is not
+     * populated (plain unit-test JVM) is a SKIP, not a failure — the
+     * live-boot drill asserts PALETTE_EXACT for real. A missing SUBSET of
+     * ids degrades visually without blocking GUIs (flag + admin report);
+     * only a broken registry API (throw inside the probe) lands in
+     * {@code failures} and blocks the GUI layer.
+     */
+    private static void reportPaletteProbes(List<String> failures) {
+        try {
+            // Palette-free canary (pure reflection): is the vanilla item
+            // registry populated? Touching Palette itself would resolve its
+            // fields — against an EMPTY registry that falls all the way to
+            // Items.BARRIER and triggers a full bootstrap in a unit-test
+            // JVM (the exact trap ShopGUILayout's lazy arrays avoid).
+            if (!itemRegistryPopulated()) {
+                CompatState.reportPaletteSurface(false, false, java.util.List.of(
+                    "item registry not populated at probe time — palette is asserted "
+                        + "for real in the live-boot drill (compat/PACKAGE.md)"));
+                return;
+            }
+            java.util.List<String> missing = Palette.probeMissingIds();
+            boolean distinct = Palette.probeDistinctReadyIndicators();
+            boolean exact = Palette.isExact() && missing.isEmpty() && distinct;
+            java.util.List<String> notes = new ArrayList<>(Palette.degradationNotes());
+            if (!missing.isEmpty()) {
+                notes.add("unresolved palette ids: " + String.join(", ", missing));
+                SolidusMod.LOGGER.warn(
+                    "Solidus Palette degraded: {} palette id(s) unresolved even via fallbacks: {}",
+                    missing.size(), String.join(", ", missing));
+            }
+            if (!distinct) {
+                notes.add("LIME_DYE and GRAY_DYE collapsed to the same item — "
+                    + "READY / NOT-READY indicators are visually identical (GUIs stay open)");
+                SolidusMod.LOGGER.warn(
+                    "Solidus Palette: READY/NOT-READY indicator dyes collapsed to one item "
+                        + "— trade readiness must be re-checked visually.");
+            }
+            CompatState.reportPaletteSurface(exact, !exact, notes);
+        } catch (Throwable t) {
+            // The registry API itself is unusable — Family A cannot render
+            // GUIs. Fail closed for the GUI layer via the failures list.
+            failures.add("palette.registry (BuiltInRegistries.ITEM usable for Palette ids) -> "
+                + t.getClass().getSimpleName()
+                + (t.getMessage() != null ? ": " + t.getMessage() : ""));
+            CompatState.reportPaletteSurface(false, true,
+                java.util.List.of("palette registry probe threw: " + t));
+        }
+    }
+
+    /**
+     * WS-1 canary — is the vanilla item registry populated? Deliberately
+     * implemented HERE (not on Palette) and with a direct registry lookup:
+     * it neither touches {@code Palette} (whose clinit resolves the 17
+     * fields) nor {@code Items} (whose clinit IS the bootstrap), so in a
+     * plain unit-test JVM it returns false and the palette probes skip
+     * gracefully.
+     */
+    private static boolean itemRegistryPopulated() {
+        try {
+            return BuiltInRegistries.ITEM.get(Identifier.tryParse("air")).isPresent();
+        } catch (Throwable t) {
+            return false;
+        }
+    }
 
     /** Loads a class without initializing it; null (and a debug log) on failure. */
     private static Class<?> softClass(String name) {
