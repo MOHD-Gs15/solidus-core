@@ -54,7 +54,7 @@ tasks.named('jacocoTestReport') {
 
 // ----------------------------------------------------------
 // Solidus - Advanced Server-Side Economy & Commerce Engine
-// Minecraft 26.1.x | Fabric Loader 0.19.2+ | Java 25
+// Minecraft 26.3 | Fabric Loader 0.20.1+ | Java 25  (2.4.0 family, WS-1)
 // ----------------------------------------------------------
 //
 // IMPORTANT: MINECRAFT 26.1.x UNOBFUSCATED BUILD
