@@ -6,6 +6,7 @@ import com.google.gson.JsonParser;
 import com.mojang.serialization.DataResult;
 import com.mojang.serialization.JsonOps;
 import com.solidus.SolidusMod;
+import com.solidus.compat.CompatDrop;
 import com.solidus.api.EconomyHooks;
 import com.solidus.api.SolidusTransactionHook;
 import com.solidus.auction.AuctionEntry;
@@ -417,7 +418,7 @@ public class ShopManager {
                     if (live != null) {
                         if (!live.getInventory().add(itemStack)) {
                             // Inventory full - drop at player's feet
-                            live.drop(itemStack, false);
+                            CompatDrop.drop(live, itemStack, false);
                             live.sendSystemMessage(TextUtil.warning("Inventory full! Item dropped at your feet."));
                         }
                     } else {
@@ -657,7 +658,7 @@ public class ShopManager {
             if (stack == null || stack.isEmpty()) continue;
             if (live != null) {
                 if (!live.getInventory().add(stack.copy())) {
-                    live.drop(stack.copy(), false);
+                    CompatDrop.drop(live, stack.copy(), false);
                 }
             } else {
                 dropAtPlayerPosition(player, stack);
@@ -689,7 +690,7 @@ public class ShopManager {
             remaining -= chunk;
             net.minecraft.world.item.ItemStack stack = new net.minecraft.world.item.ItemStack(resolvedItem, chunk);
             if (!player.getInventory().add(stack)) {
-                player.drop(stack, false);
+                CompatDrop.drop(player, stack, false);
             }
         }
     }

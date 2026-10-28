@@ -1,6 +1,7 @@
 package com.solidus.trade;
 
 import com.solidus.SolidusMod;
+import com.solidus.compat.CompatDrop;
 import com.solidus.chat.ChatPrompts;
 import com.solidus.economy.BalanceManager;
 import com.solidus.economy.EconomyEngine;
@@ -312,7 +313,7 @@ public class TradeManager {
             if (owner != null && owner.isAlive()) {
                 for (ItemStack stack : items) {
                     if (!owner.getInventory().add(stack)) {
-                        owner.drop(stack, false);
+                        CompatDrop.drop(owner, stack, false);
                     }
                 }
             } else if (!items.isEmpty()) {
@@ -400,7 +401,7 @@ public class TradeManager {
                     if (owner != null) {
                         for (ItemStack stack : items) {
                             if (!owner.getInventory().add(stack)) {
-                                owner.drop(stack, false);
+                                CompatDrop.drop(owner, stack, false);
                             }
                         }
                     } else if (!items.isEmpty()) {
@@ -610,7 +611,7 @@ public class TradeManager {
             if (stack.isEmpty()) continue;
             if (liveOrNull != null) {
                 if (!liveOrNull.getInventory().add(stack)) {
-                    liveOrNull.drop(stack, false);
+                    CompatDrop.drop(liveOrNull, stack, false);
                 }
             } else {
                 SolidusMod.LOGGER.warn(
@@ -775,7 +776,7 @@ public class TradeManager {
             if (owner != null && owner.isAlive()) {
                 for (ItemStack stack : items) {
                     if (!owner.getInventory().add(stack)) {
-                        owner.drop(stack, false);
+                        CompatDrop.drop(owner, stack, false);
                     }
                 }
             }
