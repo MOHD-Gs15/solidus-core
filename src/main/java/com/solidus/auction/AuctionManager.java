@@ -3,6 +3,7 @@ package com.solidus.auction;
 import com.solidus.SolidusMod;
 import com.solidus.api.EconomyHooks;
 import com.solidus.api.SolidusTransactionHook;
+import com.solidus.compat.CompatDrop;
 import com.solidus.economy.BalanceManager;
 import com.solidus.economy.EconomyEngine;
 import com.solidus.economy.TransactionLog;
@@ -812,7 +813,7 @@ public class AuctionManager {
     private void returnCapturedItem(ServerPlayer player, ItemStack stack) {
         if (stack == null || stack.isEmpty()) return;
         if (!player.getInventory().add(stack)) {
-            player.drop(stack, false);
+            CompatDrop.drop(player, stack, false);
         }
     }
 
@@ -1007,7 +1008,7 @@ public class AuctionManager {
 
                             // Money moved atomically - deliver the (pre-validated) item
                             if (!buyer.getInventory().add(purchasedItem)) {
-                                buyer.drop(purchasedItem, false);
+                                CompatDrop.drop(buyer, purchasedItem, false);
                                 buyer.sendSystemMessage(TextUtil.warning("Inventory full! Item dropped at your feet."));
                             }
 
@@ -1372,7 +1373,7 @@ public class AuctionManager {
                     ItemStack returnedItem = deserializeItemStack(
                         entry.itemNbt(), entry.materialName(), entry.quantity());
                     if (!seller.getInventory().add(returnedItem)) {
-                        seller.drop(returnedItem, false);
+                        CompatDrop.drop(seller, returnedItem, false);
                     }
                     seller.sendSystemMessage(
                         TextUtil.warning("Your auction listing for " + entry.quantity() + "x " +
@@ -1793,7 +1794,7 @@ public class AuctionManager {
                         ItemStack item = deserializeItemStack(
                             entry.itemNbt(), entry.materialName(), entry.quantity());
                         if (!player.getInventory().add(item)) {
-                            player.drop(item, false);
+                            CompatDrop.drop(player, item, false);
                         }
                         collected++;
                     }
@@ -1884,7 +1885,15 @@ public class AuctionManager {
                 for (WonItemRow row : rows) {
                     ItemStack item = deserializeItemStack(row.itemNbt(), row.materialName(), row.quantity());
                     if (!player.getInventory().add(item)) {
-                        player.drop(item, false);
+                        var dropped = CompatDrop.drop(player, item, false);
+                        if (dropped == null && CompatDrop.isBroken()) {
+                            // DROP_BROKEN (WS-1 §4.3): the claim step already
+                            // DELETEd the won row, so a refused world drop must
+                            // re-persist it (idempotent) — otherwise the stack
+                            // would be silently destroyed. The next /ah collect
+                            // redelivers from the restored row.
+                            reinsertClaimedWonRow(row, playerUuid, playerName);
+                        }
                     }
                 }
                 if (!rows.isEmpty()) {
@@ -1980,7 +1989,7 @@ public class AuctionManager {
                 ItemStack item = deserializeItemStack(
                     entry.itemNbt(), entry.materialName(), entry.quantity());
                 if (!player.getInventory().add(item)) {
-                    player.drop(item, false);
+                    CompatDrop.drop(player, item, false);
                     player.sendSystemMessage(TextUtil.warning("Inventory full! Item dropped at your feet."));
                 }
 
@@ -2872,7 +2881,19 @@ public class AuctionManager {
                 continue;
             }
             if (!winner.getInventory().add(win.item())) {
-                winner.drop(win.item(), false);
+                var dropped = CompatDrop.drop(winner, win.item(), false);
+                if (dropped == null && CompatDrop.isBroken()) {
+                    // DROP_BROKEN (WS-1 §4.3): keep the won item collectible —
+                    // the same idempotent /ah collect row the offline-winner
+                    // path uses — instead of silently destroying the stack.
+                    try {
+                        storeWonItemRowFromDelivery(win);
+                    } catch (Exception e) {
+                        SolidusMod.LOGGER.error(
+                            "CRITICAL: could not persist refused won item for {} (listing {}) - reconcile manually from the ledger",
+                            win.winnerName(), win.listingId(), e);
+                    }
+                }
             }
             winner.sendSystemMessage(TextUtil.success(
                 "You WON the auction for " + win.quantity() + "x " + win.materialName()
@@ -2904,6 +2925,57 @@ public class AuctionManager {
             } catch (SQLException e) {
                 SolidusMod.LOGGER.error("Failed to persist undelivered won item for listing {}",
                     win.listingId(), e);
+            }
+        }, asyncExecutor);
+    }
+
+    /**
+     * DROP_BROKEN fallback for the /ah collect path (WS-1 §4.3, fail-closed
+     * contract of {@link com.solidus.compat.CompatDrop}). The claim step
+     * (SELECT + DELETE on the serialized executor) already consumed the
+     * won row BEFORE the hand-out, so when the world drop itself is refused
+     * (no drop strategy resolved on this Minecraft version), the only way
+     * to avoid silently destroying the stack is to re-persist the row.
+     *
+     * <p>The re-insert is idempotent: the listing_id is derived
+     * deterministically from the win_id ({@code UUID(0, winId)}), so a
+     * repeat of this fallback for the same row is a no-op under the
+     * INSERT-OR-IGNORE dialect, and the next /ah collect redelivers the
+     * full-fidelity item (the original item_nbt is preserved).</p>
+     */
+    private void reinsertClaimedWonRow(WonItemRow row, UUID winnerUuid, String winnerName) {
+        java.util.UUID syntheticListingId = new UUID(0L, row.winId());
+        String sql = dialect.insertIgnorePrefix() + """
+             INTO auction_won_items
+            (listing_id, winner_uuid, winner_name, material_name, item_nbt, quantity, win_price, won_timestamp)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """;
+        CompletableFuture.runAsync(() -> {
+            try {
+                withAuction(conn -> {
+                    try (PreparedStatement ps = conn.prepareStatement(sql)) {
+                        ps.setString(1, syntheticListingId.toString());
+                        ps.setString(2, winnerUuid.toString());
+                        ps.setString(3, winnerName);
+                        ps.setString(4, row.materialName());
+                        ps.setString(5, row.itemNbt());
+                        ps.setInt(6, row.quantity());
+                        ps.setDouble(7, row.winPrice());
+                        ps.setLong(8, System.currentTimeMillis());
+                        ps.executeUpdate();
+                    }
+                    return null;
+                });
+                SolidusMod.LOGGER.error(
+                    "CRITICAL recovery: refused world drop for {} re-persisted as a collectible "
+                        + "auction_won_items row (synthetic listing_id {} from win_id {}) - "
+                        + "the next /ah collect redelivers it.",
+                    winnerName, syntheticListingId, row.winId());
+            } catch (Exception e) {
+                SolidusMod.LOGGER.error(
+                    "CRITICAL: refused world drop for {} could NOT be re-persisted "
+                        + "({}x {}, win_id {}) - reconcile manually from the ledger.",
+                    winnerName, row.quantity(), row.materialName(), row.winId(), e);
             }
         }, asyncExecutor);
     }

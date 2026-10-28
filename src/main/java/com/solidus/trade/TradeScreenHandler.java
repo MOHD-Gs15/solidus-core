@@ -1,6 +1,7 @@
 package com.solidus.trade;
 
 import com.solidus.SolidusMod;
+import com.solidus.compat.CompatDrop;
 
 import net.minecraft.network.chat.Component;
 import net.minecraft.server.level.ServerPlayer;
@@ -402,7 +403,7 @@ public class TradeScreenHandler extends AbstractContainerMenu {
             // Inventory full: offer slot is the safe fallback (never the ground).
             ItemStack rest = moveToMyOffer(cursor);
             if (!rest.isEmpty()) {
-                player.drop(rest, false);
+                CompatDrop.drop(player, rest, false);
             }
         }
         refreshStatusDisplays();

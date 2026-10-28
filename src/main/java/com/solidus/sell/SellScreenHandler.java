@@ -3,6 +3,7 @@ package com.solidus.sell;
 import com.solidus.SolidusMod;
 import com.solidus.api.EconomyHooks;
 import com.solidus.api.SolidusTransactionHook;
+import com.solidus.compat.CompatDrop;
 import com.solidus.economy.BalanceManager;
 import com.solidus.economy.EconomyEngine;
 import com.solidus.economy.TransactionLog;
@@ -201,9 +202,21 @@ public class SellScreenHandler extends AbstractContainerMenu {
         if (slotIndex == -999) {
             ItemStack cursor = getCarried();
             if (!cursor.isEmpty()) {
-                player.drop(cursor, true);
-                setCarried(ItemStack.EMPTY);
-                syncCursorToClient();
+                // WS-1 (§4.4): the click dispatch hands us a Player (the
+                // vanilla override signature), but the wrapper needs the
+                // ServerPlayer — and 26.3 removed Player#drop entirely.
+                // The ownership guard above already proved player ==
+                // this.player (a ServerPlayer), so the instanceof always
+                // holds at runtime; the else branch only keeps the item
+                // safe instead of destroying it on an impossible type.
+                if (player instanceof ServerPlayer sp) {
+                    CompatDrop.drop(sp, cursor, true);
+                    setCarried(ItemStack.EMPTY);
+                    syncCursorToClient();
+                } else {
+                    SolidusMod.LOGGER.error(
+                        "Sell GUI cursor drop requested for a non-ServerPlayer - carried item kept in the menu.");
+                }
             }
             return;
         }
@@ -456,7 +469,7 @@ public class SellScreenHandler extends AbstractContainerMenu {
         if (stack.isEmpty()) return;
         if (!player.getInventory().add(stack)) {
             // Inventory full - drop at player's feet
-            player.drop(stack, false);
+            CompatDrop.drop(player, stack, false);
         }
     }
 
