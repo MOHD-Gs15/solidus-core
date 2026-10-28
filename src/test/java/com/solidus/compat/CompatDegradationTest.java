@@ -50,6 +50,12 @@ class CompatDegradationTest {
         setPrivateStatic(Compat.class, "clickBridge", null);
         setPrivateStatic(Compat.class, "inputResolver", null);
         setPrivateStatic(SolidusMixinPlugin.class, "containerClickMixinApplied", false);
+        // WS-1 surfaces
+        setPrivateStatic(CompatState.class, "paletteExact", false);
+        setPrivateStatic(CompatState.class, "paletteDegraded", false);
+        setPrivateStatic(CompatState.class, "paletteNotes", List.of());
+        setPrivateStatic(CompatState.class, "dropStrategy", CompatState.DropStrategy.UNRESOLVED);
+        setPrivateStatic(CompatState.class, "dropStrategyReason", "probe has not run yet");
     }
 
     // -- 1) Happy path: real probes against the compiled Minecraft --------
@@ -224,6 +230,105 @@ class CompatDegradationTest {
         plugin.postApply("net.minecraft.server.network.ServerGamePacketListenerImpl",
             null, SolidusMixinPlugin.CONTAINER_CLICK_MIXIN, null);
         assertTrue(SolidusMixinPlugin.isContainerClickMixinApplied());
+    }
+
+    // -- 6) WS-1: CompatDrop (Family B) -------------------------------------
+
+    @Test
+    @DisplayName("WS-1: real probes resolve a WORKING drop strategy against the compiled Minecraft")
+    void dropStrategyResolvesAgainstCompiledMinecraft() {
+        Compat.verifyCompatibility();
+
+        assertAll(
+            () -> assertNotEquals(CompatState.DropStrategy.UNRESOLVED, CompatState.dropStrategy(),
+                "the drop probe must have run and reported"),
+            () -> assertNotEquals(CompatState.DropStrategy.BROKEN, CompatState.dropStrategy(),
+                "the compiled Minecraft must offer one of the two known drop shapes — was: "
+                    + CompatState.dropStrategyReason()),
+            () -> assertFalse(CompatDrop.isBroken()),
+            () -> assertTrue(CompatDrop.strategy() == CompatDrop.Strategy.THREE_ARG_PREDICTION
+                    || CompatDrop.strategy() == CompatDrop.Strategy.TWO_ARG,
+                "exactly one of the two strategies must win"),
+            () -> assertTrue(CompatState.dropSummary().startsWith("World drop: ")));
+    }
+
+    @Test
+    @DisplayName("WS-1: DROP_STRATEGY=BROKEN refuses drops (fail-closed) and never blocks GUIs")
+    void dropBrokenFailsClosedWithoutBlockingGuis() throws Exception {
+        CompatState.report(List.of());
+        assertTrue(CompatState.isGuiSafe(), "precondition: healthy probes");
+
+        // Simulate a future Minecraft with NO known drop shape.
+        setPrivateStatic(CompatDrop.class, "strategy", CompatDrop.Strategy.BROKEN);
+        setPrivateStatic(CompatDrop.class, "threeArgDrop", null);
+        setPrivateStatic(CompatDrop.class, "twoArgDrop", null);
+        setPrivateStatic(CompatDrop.class, "failureReason", "simulated: no known drop shape");
+        // ...and report it the way CompatProbes would.
+        CompatState.reportDropSurface(CompatState.DropStrategy.BROKEN, "simulated: no known drop shape");
+
+        assertAll(
+            () -> assertTrue(CompatDrop.isBroken()),
+            () -> assertNull(CompatDrop.drop(null, null, false),
+                "a broken surface must refuse (null) — never throw out of a recovery path"),
+            () -> assertNull(CompatDrop.dropSilently(null, null)),
+            () -> assertTrue(CompatState.isGuiSafe(),
+                "the drop surface is a recovery-path concern, NOT a GUI concern"),
+            () -> assertTrue(CompatState.dropSummary().contains("BROKEN")));
+
+        // The refuse path itself must be exception-safe even for degenerate
+        // arguments — it is the last line of defense before item loss.
+        java.lang.reflect.Method refuse = CompatDrop.class.getDeclaredMethod("refuseAndReport",
+            net.minecraft.server.level.ServerPlayer.class,
+            net.minecraft.world.item.ItemStack.class,
+            boolean.class, CompatDrop.Strategy.class);
+        refuse.setAccessible(true);
+        assertNull(refuse.invoke(null, null, null, false, CompatDrop.Strategy.BROKEN),
+            "refuseAndReport must return null (and log CRITICAL) instead of throwing");
+    }
+
+    // -- 7) WS-1: Palette surface (Family A) --------------------------------
+
+    @Test
+    @DisplayName("WS-1: palette probes are coherent in a bare JVM — skip or EXACT, never a fake failure")
+    void paletteSurfaceIsCoherentInBareJvm() {
+        Compat.verifyCompatibility();
+
+        assertAll(
+            () -> assertTrue(CompatState.failures().stream().noneMatch(f -> f.contains("palette.registry")),
+                "the palette probes must never fail a healthy bare-JVM run — failures: "
+                    + CompatState.failures()),
+            () -> assertFalse(CompatState.isPaletteExact() && CompatState.isPaletteDegraded(),
+                "EXACT and DEGRADED are mutually exclusive"),
+            () -> assertTrue(CompatState.isPaletteExact() || !CompatState.isPaletteDegraded(),
+                "a bare JVM skips (neither flag); a bootstrapped one may report EXACT"),
+            () -> assertTrue(CompatState.isGuiSafe(),
+                "palette state alone must not flip GUI safety off"));
+    }
+
+    @Test
+    @DisplayName("WS-1: PALETTE_DEGRADED is visible but does not block GUIs; a registry failure does")
+    void paletteDegradationVisibilitySemantics() {
+        CompatState.report(List.of());
+        assertTrue(CompatState.isGuiSafe(), "precondition: healthy probes");
+
+        // Visual degradation: flags + admin visibility, GUIs stay open.
+        CompatState.reportPaletteSurface(false, true,
+            List.of("lime_dye -> resolved via fallback candidate 'dye'"));
+        assertAll(
+            () -> assertTrue(CompatState.isPaletteDegraded()),
+            () -> assertFalse(CompatState.isPaletteExact()),
+            () -> assertTrue(CompatState.isGuiSafe(),
+                "fallback rendering is safe — the GUI must stay open"),
+            () -> assertTrue(CompatState.paletteSummary().contains("DEGRADED")),
+            () -> assertTrue(CompatState.paletteSummary().contains("lime_dye"),
+                "the admin report must name the degraded entry"));
+
+        // A broken registry API cannot render ItemStacks at all — the GUI
+        // layer fails closed through the normal failures list.
+        CompatState.downgrade(
+            "palette.registry (BuiltInRegistries.ITEM usable for Palette ids) -> NoSuchMethodException");
+        assertFalse(CompatState.isGuiSafe(),
+            "a broken registry API must fail the GUI layer closed");
     }
 
     // -- helpers -----------------------------------------------------------
