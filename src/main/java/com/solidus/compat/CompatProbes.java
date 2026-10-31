@@ -289,11 +289,19 @@ public final class CompatProbes {
         } catch (Throwable t) {
             // The registry API itself is unusable — Family A cannot render
             // GUIs. Fail closed for the GUI layer via the failures list.
+            // Report the FULL cause chain: an ExceptionInInitializerError
+            // without its cause names the symptom, not the broken clinit
+            // (the live-boot drill needed the stack to diagnose 26.3).
+            StringBuilder chain = new StringBuilder(t.toString());
+            for (Throwable c = t.getCause(); c != null; c = c.getCause()) {
+                chain.append(" | caused by ").append(c);
+            }
             failures.add("palette.registry (BuiltInRegistries.ITEM usable for Palette ids) -> "
-                + t.getClass().getSimpleName()
-                + (t.getMessage() != null ? ": " + t.getMessage() : ""));
+                + chain);
+            SolidusMod.LOGGER.error(
+                "Solidus: palette registry probe threw — full stack for the update checklist:", t);
             CompatState.reportPaletteSurface(false, true,
-                java.util.List.of("palette registry probe threw: " + t));
+                java.util.List.of("palette registry probe threw: " + chain));
         }
     }
 

@@ -164,6 +164,42 @@ class PaletteIdsTest {
     }
 
     @Test
+    @DisplayName("resolution maps are declared BEFORE the item fields (clinit order — live-boot lesson)")
+    void resolutionMapsAreDeclaredBeforeTheItemFields() throws IOException {
+        String src = paletteSource();
+
+        // Static initialization runs in textual order: the 17 item fields'
+        // initializers call pane()/dye()/resolve(), which read RESOLVED and
+        // write RESOLVED/CHOSEN/NOTES. On the first real-server boot (the
+        // live-boot drill) the original WS-1 layout — machinery AFTER the
+        // fields — died in clinit with "Palette.RESOLVED is null", wrapped
+        // in ExceptionInInitializerError, and the compat probe disabled the
+        // whole GUI layer. The unit JVM never caught it because the probe
+        // canary deliberately skips Palette when no registry is populated.
+        // Pin the safe order as a source contract so this stays fixed.
+        int resolvedAt = src.indexOf("private static final ConcurrentHashMap<String, Item> RESOLVED");
+        int chosenAt  = src.indexOf("private static final ConcurrentHashMap<String, String> CHOSEN");
+        int notesAt   = src.indexOf("private static final List<String> NOTES");
+        int firstItemAt = src.indexOf("public static final Item ");
+
+        assertAll(
+            () -> assertTrue(resolvedAt >= 0, "RESOLVED map declaration not found"),
+            () -> assertTrue(chosenAt >= 0, "CHOSEN map declaration not found"),
+            () -> assertTrue(notesAt >= 0, "NOTES list declaration not found"),
+            () -> assertTrue(firstItemAt >= 0, "item field declaration not found"),
+            () -> assertTrue(resolvedAt < firstItemAt,
+                "RESOLVED must be declared BEFORE the first item field — clinit runs in textual order"),
+            () -> assertTrue(chosenAt < firstItemAt,
+                "CHOSEN must be declared BEFORE the first item field"),
+            () -> assertTrue(notesAt < firstItemAt,
+                "NOTES must be declared BEFORE the first item field"),
+            // ENTRY_IDS' static block feeds probeMissingIds and must also exist up top.
+            () -> assertTrue(src.indexOf("static final Map<String, String> ENTRY_IDS")
+                    < firstItemAt,
+                "ENTRY_IDS must be declared BEFORE the first item field"));
+    }
+
+    @Test
     @DisplayName("no file outside compat references the colored constants (spec §3.2 rule stated here too)")
     void paletteClassJavadocCarriesTheIsolationRule() throws IOException {
         String src = paletteSource();
