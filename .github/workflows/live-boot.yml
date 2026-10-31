@@ -4,10 +4,14 @@
 # The game layer had never been booted in the project's history (462 JVM-only
 # tests with fakes) and the audit trail shows what that hides (W-2, W-3,
 # silently-skipping packaging smoke). This workflow boots a REAL Fabric server
-# for the pinned Minecraft 26.1.2, drives the economy through the RCON admin
+# for the pinned Minecraft 26.3 (the 2.4.0 family release target — WS-1), drives
+# the economy through the RCON admin
 # harness (production code paths, no client), restarts it, and verifies the
 # funded escrow survives (ESC-01) — the exact TASK_A_LIVE_BOOT.md أ-3..أ-5
-# script, automated.
+# script, automated. Versions MUST track gradle.properties (mod_version /
+# minecraft_version / loader_version / fabric_api_version): the 2.4.0 jar
+# correctly REFUSES older environments (fabric.mod.json floors), so a drill
+# pinned to a stale MC/loader pair tests the refusal — not the game layer.
 #
 # Reuses scripts/live-boot/* so CI and local drills share ONE source of truth.
 # ─────────────────────────────────────────────────────────────────────────────
@@ -29,10 +33,11 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     env:
-      MC_VERSION: "26.1.2"
-      # Official 26.1.2 server jar (piston-data URL embeds its sha1).
-      SERVER_JAR_URL: "https://piston-data.mojang.com/v1/objects/97ccd4c0ed3f81bbb7bfacddd1090b0c56f9bc51/server.jar"
-      FABRIC_API_URL: "https://maven.fabricmc.net/net/fabricmc/fabric-api/fabric-api/0.155.2+26.1.2/fabric-api-0.155.2+26.1.2.jar"
+      MC_VERSION: "26.3"
+      # Official 26.3 server jar (piston-data URL embeds its sha1) — matches
+      # gradle.properties minecraft_version=26.3 (the 2.4.0 family target).
+      SERVER_JAR_URL: "https://piston-data.mojang.com/v1/objects/33680f5f2ac32864d6d7cf5e56a705fdb3e05f4c/server.jar"
+      FABRIC_API_URL: "https://maven.fabricmc.net/net/fabricmc/fabric-api/fabric-api/0.165.0+26.3/fabric-api-0.165.0+26.3.jar"
       FABRIC_INSTALLER_URL: "https://maven.fabricmc.net/net/fabricmc/fabric-installer/1.1.2/fabric-installer-1.1.2.jar"
 
     steps:
@@ -73,10 +78,10 @@ jobs:
           [ -f ../run-live-cache/fabric-installer.jar ] || curl --retry 3 -fsSL -o ../run-live-cache/fabric-installer.jar "$FABRIC_INSTALLER_URL"
           cp ../run-live-cache/server.jar server.jar
           cp ../run-live-cache/fabric-api.jar mods/fabric-api.jar
-          java -jar ../run-live-cache/fabric-installer.jar server -mc "$MC_VERSION" -loader 0.19.4 -downloadMinecraft \
+          java -jar ../run-live-cache/fabric-installer.jar server -mc "$MC_VERSION" -loader 0.20.1 -downloadMinecraft \
             || echo "::warning::installer re-download path — verifying launch jar exists"
           test -f fabric-server-launch.jar
-          # the installer re-downloads the LATEST server jar — restore the pinned 26.1.2 one
+          # the installer re-downloads the LATEST server jar — restore the pinned 26.3 one
           cp ../run-live-cache/server.jar server.jar
           cp ../build/libs/solidus-*.jar mods/
           echo "eula=true" > eula.txt
