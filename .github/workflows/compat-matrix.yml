@@ -15,6 +15,13 @@
 #     of exactly which internals churned, so the update checklist
 #     (compat/PACKAGE.md) starts from a failing diff instead of a
 #     player's crash report.
+#   - PROBE IDLE RULE: a forward probe for an UNRELEASED version idles
+#     green (steps skipped, ⏸ in the summary). Before release the probe
+#     cannot compile at all (Loom: "Failed to find minecraft version")
+#     so a red X there is NOISE, not signal — it would flag every PR
+#     "unstable" for weeks and train reviewers to ignore real reds. The
+#     probe arms itself automatically the day Mojang lists the version
+#     in piston-meta; from then on a failure is a real early signal.
 #
 # Fabric API version is resolved dynamically from the Fabric
 # maven metadata (latest build for the target MC version) so the
@@ -68,7 +75,9 @@ jobs:
             mc_dep: "~26.2"
             required: "false"
           # Future probe: Fabric API builds for 26.4 already exist
-          # (0.165.1+26.4 and later). Informative, not a gate.
+          # (0.165.1+26.4 and later). Informative, not a gate. While MC
+          # 26.4 is unreleased the probe IDLES GREEN (mccheck step) —
+          # a red X before release is impossible to fix and pure noise.
           - mc: "26.4"
             fabric_api: "resolve"
             mc_dep: "~26.4"
@@ -84,8 +93,39 @@ jobs:
           distribution: temurin
           java-version: 25
 
+      # ── Probe idle gate (WS-1 review polish) ─────────────────────────
+      # Loom resolves MC versions from Mojang's piston-meta manifest. A
+      # version that is not released yet (only "26.4-snapshot-N" entries)
+      # fails at CONFIGURE time — before a single Solidus source line is
+      # compiled — so the failure says nothing about our code. Non-required
+      # probes therefore IDLE (green) until the version ships; the pinned
+      # required target still hard-fails if it ever goes missing.
+      - name: Check MC release availability
+        id: mccheck
+        run: |
+          set -euo pipefail
+          MC="${{ matrix.mc }}"
+          AVAILABLE=true
+          if MANIFEST=$(curl -fsSL --retry 2 "https://piston-meta.mojang.com/mc/game/version_manifest_v2.json"); then
+            # Exact, quoted id match with whitespace-tolerant colon —
+            # "26.4" must NOT match "26.4-snapshot-6".
+            if ! printf '%s' "$MANIFEST" | grep -q "\"id\":[[:space:]]*\"${MC}\""; then
+              AVAILABLE=false
+            fi
+          else
+            echo "::warning::Could not fetch the Mojang version manifest — assuming MC ${MC} is available and letting the build decide."
+          fi
+          if [ "$AVAILABLE" = "false" ]; then
+            if [ "${{ matrix.required }}" = "true" ]; then
+              echo "::error::Pinned target MC ${MC} is not in the Mojang version manifest — the release target cannot be built."
+              exit 1
+            fi
+            echo "::warning::MC ${MC} is not released yet — forward probe idles GREEN until it ships (it will arm itself automatically)."
+          fi
+          echo "available=${AVAILABLE}" >> "$GITHUB_OUTPUT"
+
       - name: Resolve latest Fabric API for MC ${{ matrix.mc }}
-        if: matrix.fabric_api == 'resolve'
+        if: matrix.fabric_api == 'resolve' && steps.mccheck.outputs.available == 'true'
         run: |
           set -euo pipefail
           echo "Fetching Fabric maven metadata..."
@@ -105,6 +145,7 @@ jobs:
           echo "RESOLVED_FABRIC_API=$LATEST" >> "$GITHUB_ENV"
 
       - name: Determine Fabric API version
+        if: steps.mccheck.outputs.available == 'true'
         id: fabapi
         run: |
           if [ "${{ matrix.fabric_api }}" = "resolve" ]; then
@@ -114,6 +155,7 @@ jobs:
           fi
 
       - name: Compile against MC ${{ matrix.mc }}
+        if: steps.mccheck.outputs.available == 'true'
         run: |
           set -euo pipefail
           echo "Probing: MC ${{ matrix.mc }} / Fabric API ${{ steps.fabapi.outputs.version }} / dep ${{ matrix.mc_dep }}"
@@ -131,6 +173,8 @@ jobs:
             else
               echo "### ❌ Pinned target MC ${{ matrix.mc }}: required build FAILED — blocks the release (see compat/PACKAGE.md)" >> "$GITHUB_STEP_SUMMARY"
             fi
+          elif [ "${{ steps.mccheck.outputs.available }}" != "true" ]; then
+            echo "### ⏸ Probe MC ${{ matrix.mc }}: version not released yet — probe IDLES (arms itself automatically the day Mojang ships it)" >> "$GITHUB_STEP_SUMMARY"
           else
             echo "### ℹ️ Probe MC ${{ matrix.mc }}: $( [ '${{ job.status }}' = 'success' ] && echo 'COMPILES — candidate for support' || echo 'BROKEN — see compat/PACKAGE.md checklist' )" >> "$GITHUB_STEP_SUMMARY"
           fi
