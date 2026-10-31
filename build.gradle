@@ -149,10 +149,10 @@ dependencies {
     // combined) nested for completeness. slf4j + gson are provided by the
     // Minecraft/Fabric runtime like the rest of the mod. The Redis wire
     // payloads are unchanged — 2.3.x servers interoperate on the same Redis.
-    implementation "redis.clients:jedis:5.2.0"
+    implementation "redis.clients:jedis:8.0.1"
     implementation "org.apache.commons:commons-pool2:2.13.1"
     implementation "org.json:json:20260814"
-    include "redis.clients:jedis:5.2.0"
+    include "redis.clients:jedis:8.0.1"
     include "org.apache.commons:commons-pool2:2.13.1"
     include "org.json:json:20260814"
 
