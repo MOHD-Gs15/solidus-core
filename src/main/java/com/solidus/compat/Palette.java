@@ -64,31 +64,18 @@ import net.minecraft.world.item.Items;
  */
 public final class Palette {
 
-    // -- Glass panes (GUI chrome / filler) ----------------------------------
-    public static final Item BLACK_STAINED_GLASS_PANE       = pane("black_stained_glass_pane");
-    public static final Item BLUE_STAINED_GLASS_PANE        = pane("blue_stained_glass_pane");
-    public static final Item CYAN_STAINED_GLASS_PANE        = pane("cyan_stained_glass_pane");
-    public static final Item GRAY_STAINED_GLASS_PANE        = pane("gray_stained_glass_pane");
-    public static final Item GREEN_STAINED_GLASS_PANE       = pane("green_stained_glass_pane");
-    public static final Item LIGHT_BLUE_STAINED_GLASS_PANE  = pane("light_blue_stained_glass_pane");
-    public static final Item LIGHT_GRAY_STAINED_GLASS_PANE  = pane("light_gray_stained_glass_pane");
-    public static final Item LIME_STAINED_GLASS_PANE        = pane("lime_stained_glass_pane");
-    public static final Item MAGENTA_STAINED_GLASS_PANE     = pane("magenta_stained_glass_pane");
-    public static final Item ORANGE_STAINED_GLASS_PANE      = pane("orange_stained_glass_pane");
-    public static final Item PINK_STAINED_GLASS_PANE        = pane("pink_stained_glass_pane");
-    public static final Item PURPLE_STAINED_GLASS_PANE      = pane("purple_stained_glass_pane");
-    public static final Item RED_STAINED_GLASS_PANE         = pane("red_stained_glass_pane");
-    public static final Item WHITE_STAINED_GLASS_PANE       = pane("white_stained_glass_pane");
-    public static final Item YELLOW_STAINED_GLASS_PANE      = pane("yellow_stained_glass_pane");
-
-    // -- Dyes (READY / NOT-READY indicators) ---------------------------------
-
-    /** TradeGUI READY indicator — must stay a DIFFERENT item than {@link #GRAY_DYE}. */
-    public static final Item LIME_DYE = dye("lime_dye");
-    /** TradeGUI NOT-READY indicator — must stay a DIFFERENT item than {@link #LIME_DYE}. */
-    public static final Item GRAY_DYE = dye("gray_dye");
-
-    // -- Resolution machinery ------------------------------------------------
+    // -- Resolution machinery (MUST precede the 17 item fields) --------------
+    //
+    // Static initialization runs in TEXTUAL declaration order. Every item
+    // field below is initialized by pane()/dye(), whose resolve() reads and
+    // writes RESOLVED/CHOSEN/NOTES. Declared AFTER the fields (the original
+    // WS-1 layout) those maps were still null while the fields initialized —
+    // the first real-server boot died in clinit with
+    // "NullPointerException: ... Palette.RESOLVED is null" wrapped in
+    // ExceptionInInitializerError, and the compat probe then disabled the
+    // whole GUI layer (caught by the live-boot drill, not by the JVM suite —
+    // the tests deliberately never touch Palette clinit). PaletteIdsTest
+    // now pins this order as a source contract.
 
     /** The 17 palette entries: constant name -> exact registry id (ordered). */
     static final Map<String, String> ENTRY_IDS;
@@ -123,6 +110,30 @@ public final class Palette {
     private static final ConcurrentHashMap<String, String> CHOSEN = new ConcurrentHashMap<>();
     /** Human-readable degradation notes, filled during resolution. */
     private static final List<String> NOTES = Collections.synchronizedList(new ArrayList<>());
+
+    // -- Glass panes (GUI chrome / filler) ----------------------------------
+    public static final Item BLACK_STAINED_GLASS_PANE       = pane("black_stained_glass_pane");
+    public static final Item BLUE_STAINED_GLASS_PANE        = pane("blue_stained_glass_pane");
+    public static final Item CYAN_STAINED_GLASS_PANE        = pane("cyan_stained_glass_pane");
+    public static final Item GRAY_STAINED_GLASS_PANE        = pane("gray_stained_glass_pane");
+    public static final Item GREEN_STAINED_GLASS_PANE       = pane("green_stained_glass_pane");
+    public static final Item LIGHT_BLUE_STAINED_GLASS_PANE  = pane("light_blue_stained_glass_pane");
+    public static final Item LIGHT_GRAY_STAINED_GLASS_PANE  = pane("light_gray_stained_glass_pane");
+    public static final Item LIME_STAINED_GLASS_PANE        = pane("lime_stained_glass_pane");
+    public static final Item MAGENTA_STAINED_GLASS_PANE     = pane("magenta_stained_glass_pane");
+    public static final Item ORANGE_STAINED_GLASS_PANE      = pane("orange_stained_glass_pane");
+    public static final Item PINK_STAINED_GLASS_PANE        = pane("pink_stained_glass_pane");
+    public static final Item PURPLE_STAINED_GLASS_PANE      = pane("purple_stained_glass_pane");
+    public static final Item RED_STAINED_GLASS_PANE         = pane("red_stained_glass_pane");
+    public static final Item WHITE_STAINED_GLASS_PANE       = pane("white_stained_glass_pane");
+    public static final Item YELLOW_STAINED_GLASS_PANE      = pane("yellow_stained_glass_pane");
+
+    // -- Dyes (READY / NOT-READY indicators) ---------------------------------
+
+    /** TradeGUI READY indicator — must stay a DIFFERENT item than {@link #GRAY_DYE}. */
+    public static final Item LIME_DYE = dye("lime_dye");
+    /** TradeGUI NOT-READY indicator — must stay a DIFFERENT item than {@link #LIME_DYE}. */
+    public static final Item GRAY_DYE = dye("gray_dye");
 
     private static Item pane(String exactId) {
         Item resolved = resolve(exactId, exactId, "stained_glass_pane", "glass_pane");
