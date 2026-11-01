@@ -127,9 +127,9 @@ dependencies {
     // classpath dependencies. SQLite remains the DEFAULT backend; MySQL is
     // opt-in via config/solidus/storage.json.
     implementation "com.zaxxer:HikariCP:7.1.0"
-    implementation "org.mariadb.jdbc:mariadb-java-client:3.5.10"
+    implementation "org.mariadb.jdbc:mariadb-java-client:4.0.0"
     include "com.zaxxer:HikariCP:7.1.0"
-    include "org.mariadb.jdbc:mariadb-java-client:3.5.10"
+    include "org.mariadb.jdbc:mariadb-java-client:4.0.0"
 
     // ── Optional Redis layer (DB scaling plan Phase 3, 2.2.1) ──
     // Jedis: plain-socket Redis client (L2 balance cache + pub/sub
