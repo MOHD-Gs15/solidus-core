@@ -23,9 +23,11 @@
 #     probe arms itself automatically the day Mojang lists the version
 #     in piston-meta; from then on a failure is a real early signal.
 #
-# Fabric API version is resolved dynamically from the Fabric
-# maven metadata (latest build for the target MC version) so the
-# matrix never goes stale.
+# Fabric API version: every SUPPORTED/BACKWARD entry is pinned
+# explicitly — the maven-metadata "resolve" step proved flaky with
+# loom 1.16-SNAPSHOT (the 26.2 probe flipped red on db83a8dc with zero
+# relevant tree changes, single un-retried curl). Only the forward
+# probe resolves dynamically so it never goes stale.
 # ─────────────────────────────────────────────────────────────
 name: compat-matrix
 
@@ -70,8 +72,11 @@ jobs:
           # Backward/informative probe: expected green now that Family A is
           # registry-id keyed and Family B is reflection-resolved. A failure
           # here is a valuable early signal, not a release blocker.
+          # fabric_api PINNED (was "resolve", flaky): the latest 26.2 build
+          # has been 0.161.0+26.2 unchanged since 10-31 — resolving it buys
+          # nothing and red-flags the probe on metadata hiccups.
           - mc: "26.2"
-            fabric_api: "resolve"
+            fabric_api: "0.161.0+26.2"
             mc_dep: "~26.2"
             required: "false"
           # Future probe: Fabric API builds for 26.4 already exist
@@ -129,7 +134,7 @@ jobs:
         run: |
           set -euo pipefail
           echo "Fetching Fabric maven metadata..."
-          METADATA=$(curl -fsSL "https://maven.fabricmc.net/net/fabricmc/fabric-api/fabric-api/maven-metadata.xml")
+          METADATA=$(curl -fsSL --retry 3 "https://maven.fabricmc.net/net/fabricmc/fabric-api/fabric-api/maven-metadata.xml")
           # Fabric API builds carry the MC version in the artifact string
           # (e.g. 0.155.2+26.1.2). Pick the highest build for the target MC.
           LATEST=$(printf '%s' "$METADATA" \
