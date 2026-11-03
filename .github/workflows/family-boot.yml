@@ -179,9 +179,12 @@ jobs:
         timeout-minutes: 15
         run: bash core/scripts/live-boot/boot_and_drive.sh run-live familyboot2
 
-      - name: Boot-log hygiene (no ERROR / CRITICAL / degradation)
+      - name: "Boot-log hygiene (no ERROR / CRITICAL / degradation)"
         if: always()
-        run: bash core/scripts/live-boot/boot_and_drive.sh run-live logcheck
+        # 'family' mode exempts ONLY the exact lines a license-less CI family boot
+        # legitimately produces (vanilla flat-preset parse noise + companion
+        # premium-licensing errors); every other marker still fails the gate.
+        run: bash core/scripts/live-boot/boot_and_drive.sh run-live logcheck family
 
       - name: Upload family boot logs
         if: always()
@@ -192,5 +195,8 @@ jobs:
             run-live/boot.log
             run-live/logs/latest.log
             run-live/config/solidus-governance/governance.properties
+            run-live/config/solidus-governance/governance.db
+            run-live/config/solidus-governance/tax_ledger.db
+            run-live/config/*/economy.db
           if-no-files-found: ignore
           retention-days: 14
