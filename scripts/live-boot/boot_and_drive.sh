@@ -254,7 +254,7 @@ assert_family_entrypoints() { # init banners + cross-mod wiring from boot.log
     && pass "CoreHookBridge confirms registration" \
     || fail "CoreHookBridge registration banner missing"
   grep -q "injection skipped" boot.log && fail "mixin injection skipped" \
-    || pass "no skipped mixin injections (Enforcer mixins are require=1 — Done proves they applied)"
+    || pass "no skipped mixin injections in the boot log (per-surface Enforcer state is asserted via /enforcer compat)"
 }
 
 assert_core_compat_green() { # /solidus-admin compat output file
@@ -268,31 +268,55 @@ assert_core_compat_green() { # /solidus-admin compat output file
   grep -q "!!" "$1" && fail "compat report contains !! failure lines"
 }
 
-assert_governance_tax_ledger() { # amount label — pending_taxes row must exist
+assert_enforcer_compat_green() { # /enforcer compat output file (C-2ج)
+  echo "── family lockstep: Enforcer compat report on 26.3 (C-2ج) ──"
+  grep -qF "Startup probe: ran" "$1" || fail "enforcer-compat: startup probe did not run"
+  grep -qF "Damage surface (hurtServer): OK" "$1" \
+    || fail "enforcer-compat: damage surface not OK (C-2ج hurtServer regression)"
+  grep -qF "Kill surface (die): OK" "$1" \
+    || fail "enforcer-compat: kill surface not OK (C-2ج die regression)"
+  grep -qF "Bounty/kill pipeline: OPERATIONAL" "$1" \
+    || fail "enforcer-compat: bounty/kill pipeline not OPERATIONAL"
+  if grep -qE "FAILED|DEGRADED" "$1"; then
+    fail "enforcer-compat report contains FAILED/DEGRADED lines"
+  fi
+}
+
+assert_governance_tax_ledger() { # amount label — a successful TAX_TRANSFER audit row must exist
   local want="$1" label="$2"
   python3 - "$RUN_DIR" "$want" "$label" <<'PY'
-import sqlite3, glob, json, sys, pathlib
+import sqlite3, glob, re, sys, pathlib
 run, want, label = pathlib.Path(sys.argv[1]), float(sys.argv[2]), sys.argv[3]
-dbs = glob.glob(str(run / "config/solidus-governance/tax_ledger*")) + \
-      glob.glob(str(run / "config/*/tax_ledger*"))
+dbs = [p for p in glob.glob(str(run / "config/solidus-governance/governance.db"))
+           + glob.glob(str(run / "config/*/governance.db"))
+       if pathlib.Path(p).is_file()]
 rows = []
 for p in dbs:
-    if not p.endswith((".db", ".sqlite", ".sqlite3")):
-        continue
     con = sqlite3.connect(p)
-    rows += list(con.execute(
-        "SELECT player_name, tax_type, amount FROM pending_taxes WHERE amount > 0"))
-hit = [r for r in rows if r[0] == "Alice" and abs(float(r[2]) - want) < 0.02]
+    try:
+        rows += list(con.execute(
+            "SELECT action, category, target_name, details FROM audit_log "
+            "WHERE category = 'TAXATION'"))
+    finally:
+        con.close()
+hit = None
+for action, _category, target, details in rows:
+    if action != "TAX_TRANSFER" or target != "Alice":
+        continue
+    m = re.search(r"tax_amount=([0-9]+(?:\.[0-9]+)?)", details or "")
+    if m and abs(float(m.group(1)) - want) < 0.02:
+        hit = (action, target, details)
+        break
 if hit:
-    print(f"PASS {label}: pending_taxes row for Alice, amount={hit[0][2]} (type {hit[0][1]})")
+    print(f"PASS {label}: governance.db audit_log TAX_TRANSFER row for Alice ({hit[2]})")
     sys.exit(0)
-print(f"FAIL {label}: no pending_taxes row for Alice ~{want} "
-      f"(rows found: {rows}; tax_ledger dbs: {dbs}) — the Core->Governance "
-      "money-path hook (afterTransfer) did not produce a ledger trace")
+print(f"FAIL {label}: no TAX_TRANSFER audit row for Alice ~{want} in governance.db "
+      f"(taxation rows found: {rows if rows else 'none'}; dbs: {dbs}) — the Core->Governance "
+      "money-path hook (afterTransfer) did not collect the transfer tax")
 sys.exit(1)
 PY
   local rc=$?
-  [ $rc -eq 0 ] && pass "$2: transfer tax recorded in Governance ledger" || fail "$2: tax ledger trace missing"
+  [ $rc -eq 0 ] && pass "$2: transfer tax collected and audited (Governance audit_log)" || fail "$2: tax collection audit trace missing"
 }
 
 case "$PHASE" in
@@ -401,17 +425,37 @@ boot2)
   ;;
 
 logcheck)
-  echo "── log hygiene check on $RUN_DIR/boot.log ──"
+  MODE="${3:-core}"
+  echo "── log hygiene check on $RUN_DIR/boot.log (mode: ${MODE}) ──"
   cd "$RUN_DIR" || exit 1
   STATUS=0
+  # Exact-substring exemption list — the ONLY lines the license-less CI
+  # family boot may legitimately contain that match a forbidden pattern.
+  # Entries are fixed-string substrings matched anywhere in the line; every
+  # other ERROR/CRITICAL still fails the gate. Core-only live-boot keeps
+  # the strict (core) mode with zero exemptions.
+  EXEMPT=$(mktemp)
+  if [ "$MODE" = "family" ]; then
+    # Vanilla 26.3 flat-world-preset parse noise on the world-creation worker
+    # thread during the family's resource reload (harmless, cosmetic; run
+    # 41673532977 line 166 — Core-only boots don't trigger that reload).
+    echo "No key layers in MapLike" >> "$EXEMPT"
+    # Companion premium licensing: the drill deliberately ships no
+    # license.key — the FREE tier must install and boot green. Analytics
+    # logs these at ERROR (Governance logs the same texts at WARN).
+    echo "No license key found. Place your key in" >> "$EXEMPT"
+    echo "requires a valid license key. Create the file" >> "$EXEMPT"
+  fi
   for pattern in "ERROR" "CRITICAL" "GUI layer DISABLED" "ESCROW CONSISTENCY" "SUPPLY INTEGRITY"; do
-    if grep -qF "$pattern" boot.log; then
+    hits=$(grep -nF "$pattern" boot.log | grep -vFf "$EXEMPT" || true)
+    if [ -n "$hits" ]; then
       echo "✗ FAIL: forbidden pattern in boot.log: $pattern"
-      grep -nF "$pattern" boot.log | head -5
+      printf '%s\n' "$hits" | head -5
       STATUS=1
     fi
   done
-  [ $STATUS -eq 0 ] && echo "✓ boot.log is clean (no ERROR/CRITICAL/degradation markers)"
+  rm -f "$EXEMPT"
+  [ $STATUS -eq 0 ] && echo "✓ boot.log is clean (no ERROR/CRITICAL/degradation markers beyond the ${MODE} exemptions)"
   exit $STATUS
   ;;
 
@@ -427,6 +471,11 @@ familyboot)
     || fail "RCON: solidus-admin compat unreachable"
   cat /tmp/r-compat-fam.txt; echo
   assert_core_compat_green /tmp/r-compat-fam.txt
+
+  rcon "enforcer compat" > /tmp/r-enc-compat.txt 2>&1 \
+    || fail "RCON: enforcer compat unreachable"
+  cat /tmp/r-enc-compat.txt; echo
+  assert_enforcer_compat_green /tmp/r-enc-compat.txt
 
   echo "── base economy scenario (identical expectations to boot1) ──"
   rcon "solidus-admin account create Alice 1000" > /dev/null 2>&1 \
@@ -464,10 +513,15 @@ familyboot)
   rcon "solidus-admin pay-as Alice Bob 20" > /dev/null 2>&1 \
     || fail "RCON: tax-scenario pay-as unreachable"
   sleep 6
-  # 0.10 x 20 = 2.00 S$ transfer tax on Alice, recorded in pending_taxes.
-  # NOTE: the sender balance is deliberately NOT asserted here — tax
-  # collection is an async retry queue, so the balance at read time depends
-  # on whether a collection attempt already ran.
+  # 0.10 x 20 = 2.00 S$ transfer tax on Alice. TaxEngine.collectTaxAsync
+  # tries the immediate debit FIRST and only parks a pending_taxes row when
+  # the collection FAILS (the anti-avoidance debt queue) — so the SUCCESS
+  # trail is the TAX_TRANSFER row in governance.db's audit_log, NOT the debt
+  # table. (First rehearsal run 41673532977 caught the old assertion checking
+  # the wrong artifact: the hook HAD collected, the debt table was empty.)
+  # NOTE: the sender balance is deliberately NOT asserted here — with no
+  # treasury configured the revenue is intentionally burned, and the
+  # subtraction settles asynchronously.
   assert_governance_tax_ledger 2.00 "governance-tax"
 
   echo "── Enforcer compass guard (informational probe) ──"
@@ -497,6 +551,14 @@ familyboot2)
   echo "── C-3أ: second boot — family reloads, funded escrow survives ──"
   assert_family_loaded
   assert_family_entrypoints
+  rcon "solidus-admin compat" > /tmp/r-compat-fam2.txt 2>&1 \
+    || fail "RCON: solidus-admin compat unreachable"
+  cat /tmp/r-compat-fam2.txt; echo
+  assert_core_compat_green /tmp/r-compat-fam2.txt
+  rcon "enforcer compat" > /tmp/r-enc-compat2.txt 2>&1 \
+    || fail "RCON: enforcer compat unreachable"
+  cat /tmp/r-enc-compat2.txt; echo
+  assert_enforcer_compat_green /tmp/r-enc-compat2.txt
   sleep 4
   assert_escrow 120 "after-restart"
   assert_bid_state 120 Bob "after-restart"
@@ -515,5 +577,5 @@ familyboot2)
   ;;
 
 *)
-  echo "usage: $0 <run-dir> <reset|boot1|boot2|familyboot|familyboot2|logcheck>"; exit 2 ;;
+  echo "usage: $0 <run-dir> <reset|boot1|boot2|familyboot|familyboot2|logcheck [core|family]>"; exit 2 ;;
 esac
