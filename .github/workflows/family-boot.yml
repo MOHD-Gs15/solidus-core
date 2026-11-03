@@ -1,0 +1,196 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Solidus Task C-3أ — FAMILY BOOT drill (the §WS-0.7 rehearsal, automated).
+#
+# live-boot.yml is Core's fast gate: Core alone on 26.3. This workflow is the
+# family rehearsal: it builds ALL FOUR family mods (Core + Analytics +
+# Governance + Enforcer), installs them together with fabric-api on the pinned
+# 26.3 / loader 0.20.1 environment, and drives the boot_and_drive.sh family
+# phases (familyboot / familyboot2) — asserting the four mods LOAD TOGETHER
+# (the check that fails before the C-1/C-2 lockstep), Core compat is green
+# (palette EXACT / drop THREE_ARG_PREDICTION), the Governance enforcement hook
+# is registered with Core and leaves a real tax ledger trace through Core's
+# pay-as path, and the funded escrow survives a restart with the family
+# present.
+#
+# GATE RULE (package §5.1): green COMPILATION is not "supported" — the family
+# 2.4.0 support claim may only be announced once THIS drill is green.
+#
+# Version pins MUST track gradle.properties across the four repos:
+# MC 26.3 · loader 0.20.1 · fabric-api 0.165.0+26.3 · family 2.4.0.
+#
+# Known scope note: the /hunter compass drop path requires an online player,
+# so its SERVER_ONLY behavioral pin (exactly one ground item entity) is staged
+# for the WS-8 two-server staging environment; familyboot carries the guard
+# probe (console must be refused) until then.
+# ─────────────────────────────────────────────────────────────────────────────
+name: family-boot
+
+on:
+  workflow_dispatch:
+  push:
+    branches: ["main"]
+    paths:
+      - "src/**"
+      - "build.gradle"
+      - "gradle.properties"
+      - "scripts/live-boot/**"
+      - ".github/workflows/family-boot.yml"
+
+concurrency:
+  group: family-boot-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  MC_VERSION: "26.3"
+  # Same pinned 26.3 server jar / fabric-api / installer as live-boot.yml —
+  # ONE family environment for both drills.
+  SERVER_JAR_URL: "https://piston-data.mojang.com/v1/objects/33680f5f2ac32864d6d7cf5e56a705fdb3e05f4c/server.jar"
+  FABRIC_API_URL: "https://maven.fabricmc.net/net/fabricmc/fabric-api/fabric-api/0.165.0+26.3/fabric-api-0.165.0+26.3.jar"
+  FABRIC_INSTALLER_URL: "https://maven.fabricmc.net/net/fabricmc/fabric-installer/1.1.2/fabric-installer-1.1.2.jar"
+
+jobs:
+  family-boot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout Core
+        uses: actions/checkout@v4
+        with:
+          path: core
+
+      - name: Checkout Analytics (family lockstep source of truth: main)
+        uses: actions/checkout@v4
+        with:
+          repository: MOHD-Gs15/solidus-analytics
+          ref: main
+          path: analytics
+
+      - name: Checkout Governance (family lockstep source of truth: main)
+        uses: actions/checkout@v4
+        with:
+          repository: MOHD-Gs15/Solidus-Governance
+          ref: main
+          path: governance
+
+      - name: Checkout Enforcer (family lockstep source of truth: main)
+        uses: actions/checkout@v4
+        with:
+          repository: MOHD-Gs15/Solidus-Enforcer
+          ref: main
+          path: enforcer
+
+      - name: Set up JDK 25
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "25"
+
+      - name: Setup Gradle (cache wrappers + dependencies)
+        uses: gradle/actions/setup-gradle@v4
+
+      # 4 mods in one job exceed Core's 2G build heap (package §7.3.4) — 3G each.
+      - name: Build Core (shaded jar)
+        run: |
+          cd core
+          ./gradlew build --no-daemon -Dorg.gradle.jvmargs="-Xmx3G"
+          unzip -l build/libs/solidus-*.jar | grep -q "META-INF/jars/solidus-api-.*\.jar" \
+            || { echo "::error::nested solidus-api jar missing from the shipped artifact"; exit 1; }
+
+      - name: Build Analytics
+        run: |
+          cd analytics
+          ./gradlew build --no-daemon -Dorg.gradle.jvmargs="-Xmx3G"
+
+      - name: Build Governance
+        run: |
+          cd governance
+          ./gradlew build --no-daemon -Dorg.gradle.jvmargs="-Xmx3G"
+
+      - name: Build Enforcer
+        run: |
+          cd enforcer
+          ./gradlew build --no-daemon -Dorg.gradle.jvmargs="-Xmx3G"
+
+      - name: Assert family version lockstep across the four builds
+        run: |
+          fail=0
+          for d in core analytics governance enforcer; do
+            v="$(grep -E '^mod_version' $d/gradle.properties | tr -d ' ' | cut -d= -f2)"
+            m="$(grep -E '^minecraft_version' $d/gradle.properties | tr -d ' ' | cut -d= -f2)"
+            echo "$d: mod_version=$v minecraft=$m"
+            [ "$v" = "2.4.0" ] || { echo "::error::$d mod_version=$v, expected 2.4.0 (family lockstep break)"; fail=1; }
+            [ "$m" = "26.3" ]  || { echo "::error::$d minecraft_version=$m, expected 26.3"; fail=1; }
+          done
+          exit $fail
+
+      - name: Restore live-server artifacts cache
+        uses: actions/cache@v4
+        with:
+          path: run-live-cache
+          key: live-server-${{ env.MC_VERSION }}-v1
+
+      - name: Prepare a real Fabric server with all four family jars
+        run: |
+          mkdir -p run-live/mods run-live-cache
+          cd run-live
+          [ -f ../run-live-cache/server.jar ]   || curl --retry 3 -fsSL -o ../run-live-cache/server.jar     "$SERVER_JAR_URL"
+          [ -f ../run-live-cache/fabric-api.jar ] || curl --retry 3 -fsSL -o ../run-live-cache/fabric-api.jar "$FABRIC_API_URL"
+          [ -f ../run-live-cache/fabric-installer.jar ] || curl --retry 3 -fsSL -o ../run-live-cache/fabric-installer.jar "$FABRIC_INSTALLER_URL"
+          cp ../run-live-cache/server.jar server.jar
+          cp ../run-live-cache/fabric-api.jar mods/fabric-api.jar
+          java -jar ../run-live-cache/fabric-installer.jar server -mc "$MC_VERSION" -loader 0.20.1 -downloadMinecraft \
+            || echo "::warning::installer re-download path — verifying launch jar exists"
+          test -f fabric-server-launch.jar
+          # the installer re-downloads the LATEST server jar — restore the pinned 26.3 one
+          cp ../run-live-cache/server.jar server.jar
+          # the family: exactly four Solidus jars + fabric-api
+          cp ../core/build/libs/solidus-*.jar            mods/
+          cp ../analytics/build/libs/solidus-analytics-*.jar   mods/
+          cp ../governance/build/libs/solidus-governance-*.jar mods/
+          cp ../enforcer/build/libs/solidus-enforcer-*.jar     mods/
+          ls -la mods/
+          test "$(ls mods/ | wc -l)" -eq 5 || { echo "::error::expected exactly 5 jars in mods/ (4 family + fabric-api)"; exit 1; }
+          echo "eula=true" > eula.txt
+          cat > server.properties <<'PROPS'
+          online-mode=false
+          enable-rcon=true
+          rcon.port=25575
+          rcon.password=solidus-test
+          level-type=minecraft\:flat
+          max-players=20
+          sync-chunk-writes=false
+          PROPS
+          # Governance tax switch ON with rate 0.0: the familyboot phase flips
+          # the rate at runtime so the base scenario numbers stay identical to
+          # boot1 while the hook's ledger path is exercised.
+          mkdir -p config/solidus-governance
+          cat > config/solidus-governance/governance.properties <<'GOV'
+          taxation.enabled=true
+          taxation.transfer.rate=0.0
+          taxation.auction.rate=0.0
+          taxation.shop.rate=0.0
+          GOV
+
+      - name: Family boot #1 + lockstep + tax-ledger scenario (C-3أ)
+        timeout-minutes: 15
+        run: bash core/scripts/live-boot/boot_and_drive.sh run-live familyboot
+
+      - name: Family boot #2 — reload + escrow survival
+        timeout-minutes: 15
+        run: bash core/scripts/live-boot/boot_and_drive.sh run-live familyboot2
+
+      - name: Boot-log hygiene (no ERROR / CRITICAL / degradation)
+        if: always()
+        run: bash core/scripts/live-boot/boot_and_drive.sh run-live logcheck
+
+      - name: Upload family boot logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: family-boot-logs
+          path: |
+            run-live/boot.log
+            run-live/logs/latest.log
+            run-live/config/solidus-governance/governance.properties
+          if-no-files-found: ignore
+          retention-days: 14
