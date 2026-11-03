@@ -108,7 +108,7 @@ After the first start you'll find `config/solidus/storage.json`. The keys that m
 
 **Money-supply integrity.** A periodic auditor compares the sum of all balances against a full ledger replay (all income sources, sinks, and admin operations) and verifies that the escrow total equals the sum of open winning bids. On a network, elect exactly one server with `integrity.elected: true`.
 
-**Versioning.** The ecosystem follows a documented family contract in [VERSIONING.md](VERSIONING.md): any `2.2.x` Solidus release works with any `2.1.x` release of the companion mods (Analytics / Governance / Enforcer).
+**Versioning.** The ecosystem follows a documented family contract in [VERSIONING.md](VERSIONING.md): the four mods (Core, Analytics, Governance, Enforcer) move in **strict lockstep** — the current family is `2.4.0` on Minecraft 26.3 (fabric-api `0.165.0+26.3`, loader `0.20.1`), and every mod declares mutual dependency floors `>=2.4.0 <3.0.0`, so a Core `2.4.0` boots only with `2.4.0` companions and vice versa.
 
 **Currency.** The internal unit is the Solidus, symbol `S$`, formatted `1,250.5 S$`; rounding rules are specified in [docs/MONEY_ROUNDING.md](docs/MONEY_ROUNDING.md).
 
