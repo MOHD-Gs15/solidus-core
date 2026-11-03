@@ -58,21 +58,21 @@ jobs:
         with:
           path: core
 
-      - name: Checkout Analytics (family lockstep source of truth: main)
+      - name: "Checkout Analytics (family lockstep source of truth: main)"
         uses: actions/checkout@v4
         with:
           repository: MOHD-Gs15/solidus-analytics
           ref: main
           path: analytics
 
-      - name: Checkout Governance (family lockstep source of truth: main)
+      - name: "Checkout Governance (family lockstep source of truth: main)"
         uses: actions/checkout@v4
         with:
           repository: MOHD-Gs15/Solidus-Governance
           ref: main
           path: governance
 
-      - name: Checkout Enforcer (family lockstep source of truth: main)
+      - name: "Checkout Enforcer (family lockstep source of truth: main)"
         uses: actions/checkout@v4
         with:
           repository: MOHD-Gs15/Solidus-Enforcer
@@ -171,11 +171,11 @@ jobs:
           taxation.shop.rate=0.0
           GOV
 
-      - name: Family boot #1 + lockstep + tax-ledger scenario (C-3أ)
+      - name: "Family boot #1 + lockstep + tax-ledger scenario (C-3أ)"
         timeout-minutes: 15
         run: bash core/scripts/live-boot/boot_and_drive.sh run-live familyboot
 
-      - name: Family boot #2 — reload + escrow survival
+      - name: "Family boot #2 — reload + escrow survival"
         timeout-minutes: 15
         run: bash core/scripts/live-boot/boot_and_drive.sh run-live familyboot2
 
