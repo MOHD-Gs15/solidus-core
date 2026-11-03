@@ -1,6 +1,6 @@
 # Solidus-Core Architecture Documentation
 
-> **Version**: 2.1.4 | **Minecraft**: 26.1.x | **Fabric**: 0.19.4+ | **Java**: 25  
+> **Version**: 2.4.0 | **Minecraft**: 26.3 | **Fabric**: 0.20.1+ | **Java**: 25  
 > **License**: MIT | **Environment**: 100% Server-Side Only
 
 ---
@@ -2041,12 +2041,11 @@ balance against the sum of open top bids on every boot.
 
 ## 18. Testing Strategy
 
-Solidus includes a comprehensive test suite using JUnit 5 and Mockito.
+Solidus includes a comprehensive test suite using JUnit 5 only — **47 test classes, 467 static `@Test` declarations** (12 of them inside abstract contract-harness classes). The counts are pinned to reality by `scripts/docs_lint.py`, which CI runs on every push and pull request: a version badge, jar filename or test count that drifts from `gradle.properties` / `src/test` fails the build.
 
 ### Test Files
 
-20 test classes, 309 `@Test` methods (all green on JDK 25). Storage/state-level
-tests run on plain SQLite or pure Java — no Minecraft bootstrap required:
+Storage/state-level tests run on plain SQLite or pure Java — no Minecraft bootstrap required. The table lists the founding classes and their focus; the roster has since grown to the lint-pinned totals above:
 
 | Test | Coverage |
 |------|----------|

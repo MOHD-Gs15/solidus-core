@@ -418,3 +418,92 @@ concurrent race.
 31 — 27 MySQL + 4 Redis). Verified locally against a real MariaDB 11.8.6:
 397 executed, 0 failed, 4 skips (Redis only — no local Redis); GitHub
 Actions is expected to run all 397 with zero gated skips.
+
+## 2.2.5 — Security audit closure (SOL-001..SOL-006)
+
+**Scope:** the storage/auction surface hardening round.
+
+- Closed audit findings SOL-001 through SOL-006 on the storage and auction
+  surfaces (`7b70300`).
+- Acceptance evidence: CI fully green — 2.2.4 closed at 794 passed /
+  0 failed / 0 skipped, and the 2.2.5 round at 870 passed / 0 failed / 0 skipped.
+
+## 2.3.0 — Update-resilience architecture (audit W-3) + the 2.2.6 reliability round
+
+**Scope:** the "green compile is not support" lesson, turned into architecture.
+
+- **W-3:** high-risk mixin injectors declare `require = 0`; `CompatProbes`
+  reflectively verify every Minecraft shape the GUI pipeline compiled against
+  at startup; `CompatState` turns the report into capability flags;
+  `SolidusMixinPlugin` (IMixinConfigPlugin) observes applies; the
+  first-connection cross-check downgrades a silently-missing apply loudly. A
+  reshaped Minecraft now disables the virtual-GUI layer with a clear banner
+  instead of crashing the server at startup.
+- **solidus-api:** the Minecraft-free companion contract becomes the enforced
+  integration seam (`506a732`).
+- The "**2.2.6**"-labeled full-audit reliability & accounting-integrity round
+  (`fc560d0`) shipped inside this release — there was never a separate 2.2.6
+  build, which is why no v2.2.6 tag exists (2.2.5 → 2.3.0 directly).
+- CI supply-chain hardening (SA2-027): every workflow action pinned to its
+  full commit SHA.
+- Professional README rewrite (facts re-verified against the code);
+  dependency bumps (HikariCP 7.1.0, mariadb-java-client 3.5.10).
+
+## 2.3.1 — Self-contained Redis runtime (audit W-2)
+
+- The Redis layer moved from Lettuce to Jedis and ships self-contained
+  (`0bac209`): the W-2 finding — a broken transitive runtime silently
+  skipping the Redis packaging smoke in CI — closed by making the runtime
+  verifiable in the build.
+
+## 2.3.2 — solidus-api contract extensions (W-5 closure)
+
+- The last reflective reach-ins from the companions into Core are closed
+  (`e692710`): the loader-enforced `solidus-api` contract (EconomyHooks /
+  SolidusTransactionHook / BalanceEntry) is the only integration seam, and
+  the whole family — Analytics, Governance, Enforcer — moved onto it in
+  lockstep.
+
+## 2.3.3 — CI builds the jar + the declaring-class probe fix
+
+- `test` now builds the jar: the W-2 packaging smoke was silently skipping in
+  CI (`e062af1`) — the smoke now actually runs and can fail.
+- Compat probe fix (`6ce5bd4`): `containerMenu` is declared on `Player` and
+  only inherited by `ServerPlayer`, so probing `ServerPlayer` with
+  `getDeclaredField` always failed and wrongly disabled the virtual-GUI layer
+  on every 2.3.0/2.3.1 server. The probe now targets the declaring class,
+  and the W-3 degradation paths are pinned with tests.
+
+## 2.4.0 — Minecraft 26.3 family jump (WS-1) + live-boot drills
+
+**Scope:** the family-wide version lockstep — Core and the three companions
+(Analytics, Governance, Enforcer) ship 2.4.0 together on Minecraft 26.3
+(loader 0.20.1, fabric-api 0.165.0+26.3).
+
+- **Family A (39 sites):** 26.3 removed the colored `Items.*` / `Blocks.*`
+  constants; `compat.Palette` now resolves all 17 GUI colors by registry id
+  (`Identifier.tryParse` + `BuiltInRegistries.ITEM`), version-free — and the
+  26.1.2 registry still resolves them, so the backward probe stays green.
+- **Family B (17 sites):** `Player.drop` folded behind
+  `ServerPlayer#drop(ItemStack, boolean, Prediction)`; `compat.CompatDrop` is
+  a dual-strategy MethodHandle (THREE_ARG_PREDICTION + `Prediction.SERVER_ONLY`
+  on 26.3, TWO_ARG fallback on 26.1.x), resolved once at startup and pinned
+  by probes.
+- Compat probes extended to the registry API / palette ids / drop strategy,
+  with the WS-1 gate tests (architecture guard, palette id spec, degradation
+  extensions) making the isolation rules build breakers.
+- Forward probes (26.4) idle green while the target is unreleased — a red X
+  before release is noise, not signal; the probe arms itself the day
+  piston-meta ships the version.
+- Palette clinit order fix (`28a4191`): resolution maps must precede the
+  item fields — caught by the first live boot.
+- **WS-0 live boot + RCON governor:** the game layer finally ran in CI
+  (`8ce0113`) — and it caught two real bugs; live-boot re-pinned to the 2.4.0
+  family environment.
+- **C-3أ family boot drill:** `family-boot.yml` builds all four 2.4.0 mods and
+  installs them together on a real 26.3 server (`f6fbe72`); the YAML parse
+  bug that kept the drill from ever executing (both recorded runs exited with
+  zero jobs) was fixed (PR #38), and the first real run proved the four mods
+  load together.
+- Mockito removed (dependency + property): zero usage across `src/test`,
+  matching the companions' C-1 cleanup.
