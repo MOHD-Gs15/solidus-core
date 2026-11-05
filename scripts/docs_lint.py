@@ -18,6 +18,19 @@ Checks (all pure Python — no Java, no Docker):
   4. "Mockito" must not appear in ARCHITECTURE.md at all (the suite is
      JUnit-5-only; a bare mention is how the last drift shipped)
   5. notes/CHANGES.md must cover a version >= mod_version
+  6. notes/RELEASES_DRAFT.md must stay RETIRED (absent) — its premises
+     (0 Releases, tags stop at v2.2.4, a v2.2.6 section) are all false now
+  7. notes/MODRINTH_PUBLISHING.md must agree with gradle.properties:
+     'Game versions' rows name exactly minecraft_version (probe-only
+     26.x versions from compat-matrix.yml are never publishable), the
+     'Dependencies' row names fabric_api_version, a 'Version number'
+     row names mod_version, and the retired RELEASES_DRAFT is not
+     referenced
+  8. README's '**Versioning.**' paragraph must carry the current-family
+     floor from VERSIONING.md (e.g. '>=2.4.0 <3.0.0') and must not
+     promise cross-family compatibility ('any 2.N.x works with any
+     2.M.x' with N != M — the stale 2.2.x/2.1.x promise shipped exactly
+     this way)
 
 Usage:  python3 scripts/docs_lint.py            # from anywhere
 Exit:   0 = green, 1 = drift found.
@@ -158,6 +171,110 @@ else:
         failures.append(
             f"  FAIL notes/CHANGES.md stops at {latest} but mod_version is "
             f"{mod_version} — write the release entry before bumping")
+
+# ── 6. notes/RELEASES_DRAFT.md must stay retired ────────────────────
+draft = REPO / 'notes' / 'RELEASES_DRAFT.md'
+if draft.exists():
+    failures.append(
+        "  FAIL notes/RELEASES_DRAFT.md exists — it was retired in the "
+        "ws-d docs-reality pass: its premises (0 Releases, tags stop at "
+        "v2.2.4, mod_version 2.3.3) are all false now, and its '## v2.2.6' "
+        "section contradicts CHANGES.md (no 2.2.6 build ever existed — the "
+        "'2.2.6' audit round shipped inside 2.3.0). Release bodies live on "
+        "GitHub Releases; the changelog source of truth is notes/CHANGES.md.")
+else:
+    notes.append("  OK   notes/RELEASES_DRAFT.md stays retired (absent)")
+
+# ── 7. MODRINTH_PUBLISHING.md vs gradle.properties ──────────────────
+modrinth = read('notes/MODRINTH_PUBLISHING.md')
+
+
+def table_value(row_line: str) -> str:
+    """Second cell of a markdown table row ('| A | B | ...' -> 'B')."""
+    cells = [c.strip() for c in row_line.split('|')]
+    return cells[2] if len(cells) > 2 else ''
+
+
+def mc_tokens(text: str):
+    return set(re.findall(r'\b26(?:\.\d+){0,2}\b', text))
+
+
+mc_m = re.search(r'^minecraft_version\s*=\s*(\S+)\s*$', gp, re.M)
+fapi_m = re.search(r'^fabric_api_version\s*=\s*(\S+)\s*$', gp, re.M)
+if not (mc_m and fapi_m):
+    failures.append("  FAIL gradle.properties: minecraft_version / fabric_api_version missing")
+else:
+    mc, fapi = mc_m.group(1), fapi_m.group(1)
+    game_rows = [ln for ln in modrinth.splitlines() if re.match(r'\|\s*Game versions\b', ln)]
+    if not game_rows:
+        failures.append(
+            "  FAIL MODRINTH_PUBLISHING.md: no '| Game versions |' row — "
+            "the published Minecraft target must be stated explicitly")
+    else:
+        bad = False
+        for ln in game_rows:
+            val = table_value(ln)
+            toks = mc_tokens(val)
+            if mc not in toks:
+                bad = True
+                failures.append(
+                    f"  FAIL MODRINTH 'Game versions' value {val!r} lacks the "
+                    f"required MC {mc} (gradle.properties minecraft_version)")
+            for t in sorted(toks - {mc}):
+                bad = True
+                failures.append(
+                    f"  FAIL MODRINTH 'Game versions' lists {t} — probe-only "
+                    "versions (see compat-matrix.yml) are never published game "
+                    "versions; the shipped jar declares '~" + mc + "' and refuses to load there")
+        if not bad:
+            notes.append(f"  OK   MODRINTH 'Game versions' == {mc} (required target, no probe-only versions)")
+    dep_rows = [ln for ln in modrinth.splitlines() if re.match(r'\|\s*Dependencies\b', ln)]
+    if not dep_rows:
+        failures.append("  FAIL MODRINTH_PUBLISHING.md: no '| Dependencies |' row")
+    elif not any(fapi in table_value(ln) for ln in dep_rows):
+        failures.append(
+            f"  FAIL MODRINTH 'Dependencies' row does not name fabric-api {fapi} "
+            "(gradle.properties fabric_api_version)")
+    else:
+        notes.append(f"  OK   MODRINTH 'Dependencies' names fabric-api {fapi}")
+    ver_rows = [ln for ln in modrinth.splitlines() if re.match(r'\|\s*Version number\b', ln)]
+    if ver_rows and not any(mod_version in table_value(ln) for ln in ver_rows):
+        failures.append(
+            f"  FAIL MODRINTH 'Version number' row does not mention {mod_version} "
+            "(gradle.properties mod_version)")
+    if 'RELEASES_DRAFT' in modrinth:
+        failures.append(
+            "  FAIL MODRINTH_PUBLISHING.md still references notes/RELEASES_DRAFT.md "
+            "— that file is retired; changelog source of truth is notes/CHANGES.md "
+            "and the GitHub Release bodies")
+    else:
+        notes.append("  OK   MODRINTH_PUBLISHING.md: no retired-RELEASES_DRAFT references")
+
+# ── 8. README 'Versioning.' promise vs VERSIONING.md ─────────────────
+ver_line = next((ln for ln in readme.splitlines() if '**Versioning.**' in ln), '')
+if not ver_line:
+    failures.append("  FAIL README.md: no '**Versioning.**' paragraph found")
+else:
+    cross = re.search(
+        r'any\s+`(\d+\.\d+)\.x`[^.\n]*works with any\s+`(\d+\.\d+)\.x`', ver_line)
+    if cross and cross.group(1) != cross.group(2):
+        failures.append(
+            f"  FAIL README 'Versioning.' promises cross-family compatibility "
+            f"({cross.group(1)}.x ↔ {cross.group(2)}.x) — VERSIONING.md defines "
+            "strict family lockstep; companion mods move together, never across "
+            "families")
+    verp_cur = read('VERSIONING.md').split('Current family:', 1)[-1]
+    floor = re.search(r'`>=(\d+\.\d+\.\d+)\s*<(\d+\.\d+\.\d+)`', verp_cur)
+    if not floor:
+        notes.append("  note  VERSIONING.md: no explicit '>=X.Y.Z <A.B.C' floor after 'Current family:' — floor check skipped")
+    elif f">={floor.group(1)} <{floor.group(2)}" not in ver_line:
+        failures.append(
+            f"  FAIL README 'Versioning.' paragraph does not carry the current "
+            f"family floor '>={floor.group(1)} <{floor.group(2)}' from VERSIONING.md")
+    else:
+        notes.append(
+            f"  OK   README 'Versioning.' carries the current-family floor "
+            f">={floor.group(1)} <{floor.group(2)} (lockstep, no cross-family promise)")
 
 # ── verdict ───────────────────────────────────────────────────────────
 print("docs_lint — documentation vs reality")
