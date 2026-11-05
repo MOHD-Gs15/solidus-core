@@ -50,7 +50,7 @@ jobs:
       SOLIDUS_TEST_REDIS_URI: redis://127.0.0.1:6379/0
 
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v4.4.0 (SA2-027)
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1 (SA2-027)
 
       # Docs-vs-reality lint (WS-7): version badges, jar filename and test
       # counts must match gradle.properties and src/test. Pure python3 —
@@ -65,7 +65,7 @@ jobs:
           distribution: 'temurin'
 
       - name: Cache Gradle packages
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v4.3.0 (SA2-027)
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0 (SA2-027)
         with:
           path: |
             ~/.gradle/caches
@@ -82,7 +82,7 @@ jobs:
         continue-on-error: true
 
       - name: Upload coverage report
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v4.6.2 (SA2-027)
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1 (SA2-027)
         if: always()
         continue-on-error: true
         with:
@@ -94,7 +94,7 @@ jobs:
         continue-on-error: true
 
       - name: Upload SpotBugs report
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v4.6.2 (SA2-027)
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1 (SA2-027)
         if: always()
         continue-on-error: true
         with:
@@ -102,7 +102,7 @@ jobs:
           path: build/reports/spotbugs/
 
       - name: Upload test results
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v4.6.2 (SA2-027)
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1 (SA2-027)
         if: always()
         with:
           name: test-results
