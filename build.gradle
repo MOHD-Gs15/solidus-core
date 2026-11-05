@@ -163,7 +163,7 @@ dependencies {
     // on the Java 25 toolchain (AGENT_NOTES §12), so these were dead weight
     // that kept pulling dependabot bumps (#28, #29 — closed as obsolete).
     testRuntimeOnly "org.junit.platform:junit-platform-launcher"
-    testRuntimeOnly "org.slf4j:slf4j-simple:2.0.12"
+    testRuntimeOnly "org.slf4j:slf4j-simple:2.0.20"
 }
 
 tasks.withType(Test).configureEach {
