@@ -50,7 +50,7 @@ jobs:
       SOLIDUS_TEST_REDIS_URI: redis://127.0.0.1:6379/0
 
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0 (SA2-027)
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v4.4.0 (SA2-027)
 
       # Docs-vs-reality lint (WS-7): version badges, jar filename and test
       # counts must match gradle.properties and src/test. Pure python3 —
