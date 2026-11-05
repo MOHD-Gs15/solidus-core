@@ -51,7 +51,7 @@ jobs:
           java-version: "25"
 
       - name: Setup Gradle (cache wrappers + dependencies)
-        uses: gradle/actions/setup-gradle@v4
+        uses: gradle/actions/setup-gradle@v6
 
       - name: Build shaded jar + run the JVM suite
         run: ./gradlew build --no-daemon -Dorg.gradle.jvmargs="-Xmx2G"

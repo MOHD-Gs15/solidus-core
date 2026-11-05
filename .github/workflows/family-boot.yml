@@ -134,7 +134,7 @@ jobs:
           java-version: "25"
 
       - name: Setup Gradle (cache wrappers + dependencies)
-        uses: gradle/actions/setup-gradle@v4
+        uses: gradle/actions/setup-gradle@v6
 
       # 4 mods in one job exceed Core's 2G build heap (package §7.3.4) — 3G each.
       - name: Build Core (shaded jar)
