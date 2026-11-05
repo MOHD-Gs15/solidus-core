@@ -12,6 +12,7 @@ updates:
       - dependency-name: "redis.clients:jedis"
       - dependency-name: "org.mariadb.jdbc:mariadb-java-client"
       - dependency-name: "gradle-wrapper"
+      - dependency-name: "org.xerial:sqlite-jdbc"
   - package-ecosystem: "github-actions"
     directory: "/"
     schedule:
